@@ -319,8 +319,8 @@ class JsonReviewStore(ReviewStore):
             comment = comments[index]
             if comment.author != MODEL:
                 raise ReviewError(
-                    "comment #%s is the human's; only your own callouts can be deleted, "
-                    "and a human's comment is resolved rather than removed" % comment_id
+                    "comment #%s is the product owner's; only your own callouts can be deleted, "
+                    "and the product owner's comment is resolved rather than removed" % comment_id
                 )
             del comments[index]
             # next_id is written back unchanged, which is what keeps the
@@ -378,7 +378,7 @@ def _count(comments, author):
 
 def _check_login(by):
     if by is not None and not (isinstance(by, str) and by):
-        raise ReviewError("by must be a human's login, or absent")
+        raise ReviewError("by must be a person's login, or absent")
 
 
 def _comment(

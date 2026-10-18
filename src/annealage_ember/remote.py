@@ -458,7 +458,7 @@ async def call(
         if blocked:
             return fail(
                 "%s on %s has an unresolved prior invocation (%s); it was not sent again. "
-                "Ask the human to inspect and explicitly reconcile action %s."
+                "Ask the product owner to inspect and explicitly reconcile action %s."
                 % (name, server.name, blocked["outcome"], blocked["id"])
             )
     sent = False

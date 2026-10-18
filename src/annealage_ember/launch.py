@@ -122,14 +122,17 @@ def build_session(
     # created session has no backend id to resume yet.
     resume = _resumable_sdk_id(state_project_dir, session_id) if resumed else None
 
-    # What the product says this run is about (Product.session_context), added
-    # to the backend's system prompt; None adds nothing. Followed by what each
-    # remote MCP server the tool server reached said about itself
-    # (ToolServer.remote_instructions), which every backend gets the same way.
+    # The system prompt's addition: product.OWNER_WORDING_RULE, then what the
+    # product says this run is about (Product.session_context; None adds
+    # nothing), then what each remote MCP server the tool server reached said
+    # about itself (ToolServer.remote_instructions). Every backend gets it the
+    # same way.
     context_hook = product.current().session_context
     context = context_hook(bus, serve_dir) if context_hook is not None else None
     remote_instructions = bus.tools.remote_instructions if bus.tools is not None else None
-    instructions = "\n\n".join(p for p in (context, remote_instructions) if p) or None
+    instructions = "\n\n".join(
+        p for p in (product.OWNER_WORDING_RULE, context, remote_instructions) if p
+    )
 
     if backend == "codex":
         # Imported only in this branch, per the module docstring's own

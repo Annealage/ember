@@ -96,7 +96,7 @@ def register_review_routes(app, *, store, auth, recorder=None):
         if not store.capabilities.human_adds_via_api:
             return {
                 "ok": False,
-                "error": "%s adds the human's comments its own way, not through this route"
+                "error": "%s adds the product owner's comments its own way, not through this route"
                 % product.current().title,
             }, 405
         data, error = await read_json_body(req)

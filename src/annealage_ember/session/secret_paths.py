@@ -198,7 +198,7 @@ def refusal(tool_name: str, tool_input: dict, cwd) -> Optional[str]:
                     "under it regardless of who asked. Nothing about the project "
                     "you are working on is in there, so do not look for another "
                     "way to reach it; if you genuinely believe you need it, say so "
-                    "to the human and let them fetch it themselves."
+                    "to the product owner and let them fetch it themselves."
                     % (tool_name, tool_input.get(name), root)
                 )
 
@@ -215,7 +215,7 @@ def refusal(tool_name: str, tool_input: dict, cwd) -> Optional[str]:
                             "Refused: that command names %s, which holds "
                             "credentials. This refusal is on the path, not on the "
                             "command, so rewriting the command to reach the same "
-                            "place is not an answer to it; tell the human what you "
+                            "place is not an answer to it; tell the product owner what you "
                             "were trying to do instead." % root
                         )
     return None
@@ -295,7 +295,7 @@ def protected_refusal(tool_name: str, tool_input: dict, cwd, patterns) -> Option
                 return (
                     "Refused: %s would change %s, and files matching %s are written "
                     "only through the tools this session provides for them, which "
-                    "check each change and ask the human where it is theirs to "
+                    "check each change and ask the product owner where it is theirs to "
                     "decide. Use those tools instead; reading the file with Read is "
                     "fine." % (tool_name, tool_input.get(name), pattern)
                 )

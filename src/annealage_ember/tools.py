@@ -295,7 +295,7 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
         except ViewerGone:
             return fail(
                 "the view this went to closed before it answered, so %s "
-                "did not happen; ask the human whether the page is still "
+                "did not happen; ask the product owner whether the page is still "
                 "open, then try again" % tool_def.name
             )
         except asyncio.TimeoutError:
@@ -319,7 +319,7 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
             sys.stderr.write("error: %s tool %s failed: %r\n" % (name, tool_def.name, exc))
             return fail(
                 "%s failed inside %s itself (%s), which is a bug rather "
-                "than anything you did; tell the human and carry on "
+                "than anything you did; tell the product owner and carry on "
                 "without it" % (tool_def.name, name, type(exc).__name__)
             )
         if isinstance(result, dict) and result.get("end_turn"):

@@ -45,7 +45,7 @@ FLUSH_INTERVAL = 0.03
 # ``url`` is the tokenless address (see ``ViewerBus``), so the message says
 # which link carries the token rather than repeating it.
 NO_VIEWER_MESSAGE = (
-    "no viewer connected; ask the human to open the viewer at {url} "
+    "no viewer connected; ask the product owner to open the viewer at {url} "
     "(the link printed when it started, which carries its access token)"
 )
 
@@ -58,7 +58,7 @@ CALL_TIMEOUT = 10.0
 # The markers ``ViewerBus.begin_turn`` wraps the product's notes in, and the
 # pattern that finds either inside a note's own text (any case, any spacing
 # after the bracket), which ``_neutralise_markers`` defuses.
-_NOTE_OPEN = "[System note from %s, not written by the human]"
+_NOTE_OPEN = "[System note from %s, not written by the product owner]"
 _NOTE_CLOSE = "[End of system note]"
 _MARKER_RE = re.compile(r"\[(\s*(?:end\s+of\s+system\s+note|system\s+note\s+from))", re.IGNORECASE)
 

@@ -436,7 +436,7 @@ async def run(
 
 def note(action, upload, human, failed, text):
     """What the agent is told, on its next turn, of an action that ran."""
-    who = "The human (%s)" % human.label if human.label else "The human"
+    who = "The product owner (%s)" % human.label if human.label else "The product owner"
     remote_name, tool_name = action.tool
     if len(text) > NOTE_RESULT_LIMIT:
         text = text[:NOTE_RESULT_LIMIT] + "\n(cut at %d characters)" % NOTE_RESULT_LIMIT

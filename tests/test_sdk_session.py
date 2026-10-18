@@ -1768,14 +1768,15 @@ def _session_with_context(backend, tmp_path, session_id):
 def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_product):
     """``Product.session_context`` is what the run is about (Loom: the design
     under review). ``launch.py`` calls it once and every backend is started
-    with it: Claude's system prompt, Codex's developer instructions (omp's,
-    which needs omp-rpc, is the next test). A product with none leaves
-    Claude's prompt at the SDK's empty default."""
+    with it, after the owner-wording rule: Claude's system prompt, Codex's
+    developer instructions (omp's, which needs omp-rpc, is the next test). A
+    product with none leaves the rule alone as the prompt."""
     import dataclasses
 
     from toy_product import TOY
 
     from annealage_ember import sessions
+    from annealage_ember.product import OWNER_WORDING_RULE
 
     seen = []
 
@@ -1783,14 +1784,15 @@ def test_the_product_s_session_context_reaches_each_backend(tmp_path, swap_produ
         seen.append(serve_dir)
         return "You are reviewing design demo."
 
+    expected = OWNER_WORDING_RULE + "\n\nYou are reviewing design demo."
     session_id = sessions.create_session(tmp_path)
     claude = _session_with_context("claude", tmp_path, session_id)
-    assert claude._build_options().system_prompt is None
+    assert claude._build_options().system_prompt == OWNER_WORDING_RULE
     swap_product(dataclasses.replace(TOY, session_context=context))
     claude = _session_with_context("claude", tmp_path, session_id)
-    assert claude._build_options().system_prompt == "You are reviewing design demo."
+    assert claude._build_options().system_prompt == expected
     codex = _session_with_context("codex", tmp_path, session_id)
-    assert codex._instructions == "You are reviewing design demo."
+    assert codex._instructions == expected
     assert seen == [tmp_path] * 2
 
 
@@ -1804,6 +1806,7 @@ def test_the_product_s_session_context_reaches_omp(tmp_path, swap_product):
     from toy_product import TOY
 
     from annealage_ember import sessions
+    from annealage_ember.product import OWNER_WORDING_RULE
 
     seen = []
 
@@ -1822,7 +1825,9 @@ def test_the_product_s_session_context_reaches_omp(tmp_path, swap_product):
     omp = _session_with_context("omp", tmp_path, session_id)
     omp._client_factory = omp_client
     asyncio.run(omp.start())
-    assert captured["append_system_prompt"] == "You are reviewing design demo."
+    assert captured["append_system_prompt"] == (
+        OWNER_WORDING_RULE + "\n\nYou are reviewing design demo."
+    )
     assert seen == [tmp_path]
 
 

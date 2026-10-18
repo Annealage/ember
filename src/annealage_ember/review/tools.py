@@ -76,8 +76,8 @@ def present_added(store, written):
 #: What a resolve the human approved on a card says, so the model does not go
 #: on to ask them for an approval they have already given.
 _APPROVED = (
-    "the human approved this resolve in the page, so it is done; there is nothing "
-    "left for them to approve"
+    "the product owner approved this resolve in the page, so it is done; there is "
+    "nothing left for them to approve"
 )
 
 
@@ -93,35 +93,35 @@ def present_deleted(store, written):
 
 
 _LIST_DESCRIPTION = (
-    "Read the comments on this review: the human's, pinned on the view, and "
+    "Read the comments on this review: the product owner's, pinned on the view, and "
     "your own callouts. Each has its id, where it is (anchor), what is there "
-    "(ref, when known), what it says and who wrote it (human or model). Read "
+    "(ref, when known), what it says and who wrote it (the product owner or you). Read "
     "them before acting on feedback, and before add_callout to avoid "
     "repeating a note."
 )
 _LIST_STATUS_SENTENCE = (
     " status picks open comments (the default), resolved ones, or all; a "
-    "resolved comment says how it was addressed, and a human's comment that "
-    "is open again after you resolved it was reopened by the human because "
-    "the change did not satisfy them."
+    "resolved comment says how it was addressed, and a product owner's comment "
+    "that is open again after you resolved it was reopened by the product owner "
+    "because the change did not satisfy them."
 )
 _ADD_DESCRIPTION = (
-    "Pin a note of your own at a point on the view, which the human sees as a "
+    "Pin a note of your own at a point on the view, which the product owner sees as a "
     "marker beside their own comments. This is how to point at a location "
     "instead of describing it: put the callout on the thing you are asking "
     "about or reporting on, and say what you mean in the text."
 )
 _RESOLVE_DESCRIPTION = (
     "Mark a comment resolved, with a note on what you changed. Resolving one "
-    "of the human's comments changes their review, so it waits for them to "
+    "of the product owner's comments changes their review, so it waits for them to "
     "approve it in the page and is refused if they decline or nobody is there "
     "to answer; a result that says they approved it needs nothing more from "
     "them. Resolve your own callouts once they have been answered."
 )
 _DELETE_DESCRIPTION = (
     "Remove one of your own callouts by its id once it has served its "
-    "purpose, so it stops cluttering the view. A human's comment cannot be "
-    "deleted."
+    "purpose, so it stops cluttering the view. The product owner's comment cannot "
+    "be deleted."
 )
 
 
@@ -333,7 +333,7 @@ def _add_tool(spec, store):
         )
     empty_text = (
         "%s must say what you mean about that point; a callout with no comment is "
-        "a marker the human cannot interpret" % spec.text_field
+        "a marker the product owner cannot interpret" % spec.text_field
     )
 
     @tool(spec.name, spec.description, schema)
@@ -376,7 +376,7 @@ def _resolve_tool(spec, store, bus, comments_list):
                 },
                 "note": {
                     "type": "string",
-                    "description": "what you changed to address it, which the human "
+                    "description": "what you changed to address it, which the product owner "
                     "reads before approving",
                 },
             },
@@ -420,9 +420,9 @@ async def _ask_human(tool_name, bus, comment, note):
     broker = getattr(bus, "broker", None)
     if broker is None:
         return (
-            "resolving the human's comment needs their approval, and this session has "
+            "resolving the product owner's comment needs their approval, and this session has "
             "no permission broker to ask them through, so it was not resolved; tell "
-            "the human what you changed instead"
+            "the product owner what you changed instead"
         )
     name = namespaced(product.current().mcp_server_name, tool_name)
     decision = await broker.ask(
@@ -430,7 +430,7 @@ async def _ask_human(tool_name, bus, comment, note):
     )
     if decision.allow:
         return None
-    return decision.message or "the human did not approve resolving their comment"
+    return decision.message or "the product owner did not approve resolving their comment"
 
 
 def _delete_tool(spec, store, callouts_list):

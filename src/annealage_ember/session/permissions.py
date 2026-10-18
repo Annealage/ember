@@ -135,24 +135,24 @@ NEVER_REMEMBERED = frozenset({"Bash"})
 # them at all, since the request is a question about one comment rather than
 # about a tool.
 
-DEFAULT_DENY_MESSAGE = "the human reviewing this session denied the request"
+DEFAULT_DENY_MESSAGE = "the product owner reviewing this session denied the request"
 
 # The three templates below name the product (``%(product)s``, its lowercase
 # name), because "reopen the viewer" alone does not say which one to a human
 # running more than one of these tools.
 _DENY_TIMEOUT_TEMPLATE = (
     "no decision was received within %(timeout)g seconds and the request has expired; "
-    "if this tool call is still needed, ask the human to reopen the %(product)s "
+    "if this tool call is still needed, ask the product owner to reopen the %(product)s "
     "viewer and try again"
 )
 
 _DENY_ALL_GONE_TEMPLATE = (
     "every browser viewer disconnected while this request was awaiting a "
-    "decision; ask the human to reopen the %(product)s viewer and try again"
+    "decision; ask the product owner to reopen the %(product)s viewer and try again"
 )
 
 _DENY_SHUTDOWN_TEMPLATE = (
-    "the %(product)s session is shutting down and cannot ask a human to decide "
+    "the %(product)s session is shutting down and cannot ask the product owner to decide "
     "this; the request was not approved"
 )
 
@@ -568,11 +568,11 @@ class PermissionBroker:
         if self._viewer_url:
             return (
                 "no browser viewer is connected to decide this permission request; "
-                "ask the human to open %s, then try again" % self._viewer_url
+                "ask the product owner to open %s, then try again" % self._viewer_url
             )
         return (
             "no browser viewer is connected to decide this permission request; "
-            "ask the human to open the %s viewer, then try again" % product.current().name
+            "ask the product owner to open the %s viewer, then try again" % product.current().name
         )
 
     # -- replay and shutdown -----------------------------------------------
@@ -656,7 +656,7 @@ class HeadlessBroker(PermissionBroker):
         return Decision(
             allow=False,
             message=(
-                "%s was not permitted: this is an unattended run with no human to approve "
+                "%s was not permitted: this is an unattended run with nobody to approve "
                 "it, so only the tools granted for the run can be used. Carry on without "
                 "it." % tool_name
             ),

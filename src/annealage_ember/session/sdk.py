@@ -1108,9 +1108,9 @@ class SdkSession:
                 "permissionDecision": "deny",
                 "permissionDecisionReason": (
                     "%s refuses this call: the Claude configuration in the served "
-                    "directory changed after the human accepted it, and configuration "
+                    "directory changed after the product owner accepted it, and configuration "
                     "there can grant tool permissions without asking. Do not attempt to "
-                    "modify .claude/ or .mcp.json. Tell the human what you were trying "
+                    "modify .claude/ or .mcp.json. Tell the product owner what you were trying "
                     "to do and that %s must be restarted to review the change."
                     % (product.current().title, product.current().name)
                 ),
@@ -1145,7 +1145,7 @@ class SdkSession:
             reason = (
                 "Refused: %s could not determine whether that call reaches a "
                 "credential path or a protected file, so it refused rather than "
-                "guessing. Tell the human; this is a bug in %s rather than anything "
+                "guessing. Tell the product owner; this is a bug in %s rather than anything "
                 "you did." % (product.current().name, product.current().name)
             )
         if reason is None:

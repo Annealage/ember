@@ -150,10 +150,12 @@ parentheses are Annealage Mesh's, as an example:
     agent's session is started with as an addition to its system prompt
     (what the run is about: Loom names the design under review and the skills
     to use). Called once per agent-mode session by ``launch.build_session``,
-    after the tool server exists (``bus.tools``, ``bus.review_store``). Every
+    after the tool server exists (``bus.tools``, ``bus.review_store``). It
+    follows ``OWNER_WORDING_RULE``, which every session starts with. Every
     backend takes it: Claude as its system prompt (the SDK's default one is
     empty), Codex as the thread's developer instructions, omp through
-    ``--append-system-prompt``. ``None`` (the default) adds nothing. The
+    ``--append-system-prompt``. ``None`` (the default) adds nothing beyond the
+    rule. The
     ``initialize`` instructions of each remote MCP server the tool server
     reached follow it, each under a heading naming the server.
 ``codex_bridge_module``
@@ -169,6 +171,15 @@ from typing import Any, Callable, Mapping, Optional, Tuple
 #: The agent layer's own stdio MCP bridge, the module Codex launches with
 #: ``python -m``.
 CODEX_BRIDGE_MODULE = "annealage_ember.session.codex_mcp_stdio_bridge"
+
+#: The first thing every agent session's system prompt says, whatever the
+#: product and backend (``launch.build_session`` puts it ahead of the product's
+#: ``session_context``). A product that composes a prompt of its own, outside
+#: that path, SHOULD begin it with this line too.
+OWNER_WORDING_RULE = (
+    'Never call the person you work with "the human"; say "you" when talking to '
+    'them and "the product owner" when talking about them.'
+)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

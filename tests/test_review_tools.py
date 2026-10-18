@@ -220,7 +220,7 @@ async def test_a_file_the_store_refuses_reaches_the_model_as_what_to_do(store):
 @pytest.mark.parametrize(
     "args, fragment",
     [
-        ({"id": 1}, "human's"),
+        ({"id": 1}, "product owner's"),
         ({"id": 9}, "no comment #9"),
         ({"id": True}, "id must be a callout id, as reported by list_comments"),
     ],
@@ -275,7 +275,7 @@ async def test_resolving_a_human_s_comment_asks_the_human_once(store, grade):
     assert _payload(result)["resolved"]["resolution"] == "made it 2 mm"
     # The result says the human already approved it, so the model does not
     # go on to ask them to approve it again.
-    assert "human approved" in _payload(result)["approved"]
+    assert "product owner approved" in _payload(result)["approved"]
     assert len(broker.calls) == 1
     name, card = broker.calls[0]
     assert name == RESOLVE

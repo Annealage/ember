@@ -656,7 +656,7 @@ async def test_a_tool_that_asks_the_human_is_refused_in_a_tool_set():
     async def resolve(args):
         return ok(text="resolved")
 
-    with pytest.raises(ValueError, match="resolve.*ask the human"):
+    with pytest.raises(ValueError, match="resolve.*ask the product owner"):
         ToolSet(tools=[resolve], grading=Grading(read=(), view=(), write=("resolve",)))
 
 

@@ -166,7 +166,7 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
     assert ended["upload"] == upload["upload"]
     assert not kept.exists(), "the document is removed once its action ends"
     (note,) = app.agent_bus._notes
-    assert note.startswith('The human used "Submit to Datum" on LM2596-datasheet.pdf')
+    assert note.startswith('The product owner used "Submit to Datum" on LM2596-datasheet.pdf')
     assert note.endswith("It answered:\njob 123")
 
 

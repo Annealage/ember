@@ -121,7 +121,7 @@ BACKEND_THINKING_LEVELS = {
 
 #: What a pause-gated tool answers while the view is paused. A headless run has
 #: no human to pause it, so it is never said; ``ToolServer`` requires it.
-_PAUSED_MESSAGE = "this run has no human and cannot be paused"
+_PAUSED_MESSAGE = "this run has no product owner watching and cannot be paused"
 
 #: Seconds each step of closing a session (``kill``, then ``close``) may take
 #: before ``run_prompt`` gives up waiting for it and returns anyway.
@@ -168,8 +168,8 @@ class ToolSet:
         asking = sorted(t.name for t in self.tools if getattr(t.handler, _ASKS_THE_HUMAN, False))
         if asking:
             raise ValueError(
-                "tool(s) %s ask the human themselves (tools.asks_the_human), and a headless "
-                "run has no human to ask; leave them out of the set" % ", ".join(asking)
+                "tool(s) %s ask the product owner themselves (tools.asks_the_human), and a "
+                "headless run has nobody to ask; leave them out of the set" % ", ".join(asking)
             )
         for name in self.grant:
             if name in self.grading.write:

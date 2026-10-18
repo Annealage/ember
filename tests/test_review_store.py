@@ -301,7 +301,7 @@ def test_resolving_records_the_resolution_and_resolving_again_changes_nothing(st
 def test_a_human_s_comment_is_never_deleted(store, tmp_path):
     _add(store, author="human")
     before = _file(tmp_path).read_bytes()
-    with pytest.raises(ReviewError, match="human's"):
+    with pytest.raises(ReviewError, match="product owner's"):
         store.delete_callout(1)
     assert _file(tmp_path).read_bytes() == before
 
