@@ -395,3 +395,37 @@ async def _until_logged(capsys, text):
             return
         await asyncio.sleep(0.01)
     raise AssertionError("%r was never written to stderr" % text)
+
+
+async def test_an_unmounted_app_is_stopped_gone_from_the_routes_and_its_id_free_again(
+    two, tmp_path
+):
+    front, apps, dirs, client = two
+    stopped = []
+    apps["a"].agent_on_stop.append(lambda: stopped.append("a"))
+    assert (await client.get("/p/a/")).status_code == 200
+
+    await front.unmount("a", moved_to="renamed")
+    assert stopped == ["a"] and "a" not in front.apps() and "b" in front.apps()
+    assert not any(entry[4] is apps["a"] for entry in front.app.url_map)
+
+    # What it served is gone; where it was, a link still lands (query kept).
+    assert (await client.get("/p/a/api/state?t=%s" % BROWSER_TOKEN)).status_code == 404
+    for path in ("/p/a", "/p/a/"):
+        res = await client.get(path + "?t=x")
+        assert res.status_code == 302 and res.headers["Location"] == "/p/renamed/?t=x"
+    assert (await client.get("/p/b/")).status_code == 200  # the others are untouched
+
+    with pytest.raises(ValueError, match="no app is mounted as 'a'"):
+        await front.unmount("a")
+    with pytest.raises(ValueError, match="one path segment"):
+        await front.unmount("b", moved_to="not/an id")
+    assert "b" in front.apps()
+
+    # The id is free again: mounting an app there removes the redirect.
+    fresh = _app(front, "a", dirs["a"])
+    front.mount("a", fresh)
+    res = await client.get("/p/a")
+    assert res.status_code == 302 and res.headers["Location"] == "/p/a/"
+    assert (await client.get("/p/a/")).status_code == 200
+    assert sum(1 for entry in front.app.url_map if entry[2] is not None and entry[1].url_pattern == "/p/a") == 1

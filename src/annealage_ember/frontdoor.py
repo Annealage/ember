@@ -124,6 +124,11 @@ class FrontDoor:
         self._apps = {}
         self._background = {}
         self._starts = {}
+        # The handler of each mounted app's bare-prefix redirect, and the
+        # handlers of the redirects left where an app was moved from, by id:
+        # what ``unmount`` takes back out of the route table.
+        self._prefix_routes = {}
+        self._moved = {}
         self._serving = False
         # Set once the apps are being stopped: an app mounted later would
         # never be stopped, so ``mount`` refuses it.
@@ -166,9 +171,10 @@ class FrontDoor:
         door's (a login the front page signs in must be the one the app takes).
         ``background`` is the
         product's own long-running coroutine functions for this app, started
-        with it (``app.agent_start``). An id already mounted is refused: there
-        is no unmounting, microdot copies an app's routes in when it is
-        mounted. Mounted while the front door serves, the app is started at
+        with it (``app.agent_start``). An id already mounted is refused;
+        ``unmount`` frees one (an id an app was moved away from is free again
+        too: its redirect goes). Mounted while the front door serves, the app
+        is started at
         once, as a task; ``await start_app(app_id)`` waits for it. Once the
         front door has begun stopping its apps (``serve``, after the
         ``before_stop`` hooks) a mount is refused with ``RuntimeError``, and
@@ -200,6 +206,7 @@ class FrontDoor:
                 "the app for %r must be built with the front door's identity, so the "
                 "logins that sign in to the front page are the ones it takes" % app_id
             )
+        self._drop_routes(handlers=self._moved.pop(app_id, ()))
         self.app.mount(app, prefix, local=True)
 
         async def to_directory(req):
@@ -211,6 +218,7 @@ class FrontDoor:
             return Response.redirect(location)
 
         self.app.get(prefix)(to_directory)
+        self._prefix_routes[app_id] = to_directory
         self._apps[app_id] = app
         self._background[app_id] = tuple(background)
         if self._serving:
@@ -218,6 +226,66 @@ class FrontDoor:
                 app.agent_start(self._background[app_id])
             )
             task.add_done_callback(lambda done: _report_start(app_id, done))
+
+    def _drop_routes(self, *, app=None, handlers=()):
+        """Take out of the route table what ``app`` mounted (microdot tags
+        each copied route with the sub-app it came from) and the routes
+        added with ``handlers``."""
+        self.app.url_map[:] = [
+            entry
+            for entry in self.app.url_map
+            if not (
+                (app is not None and entry[4] is app)
+                or any(entry[2] is handler for handler in handlers)
+            )
+        ]
+
+    async def unmount(self, app_id, *, moved_to=None):
+        """Stop serving the app mounted as ``app_id``: its routes leave the
+        table at once (so nothing new reaches it), a start still under way is
+        cancelled and the app is stopped (``app.agent_stop``, which runs its
+        ``agent_on_stop``), so what it held (a workspace lock, say) is released
+        when this returns. The id can then be mounted again.
+
+        With ``moved_to`` (the id of an app mounted, or about to be, in its
+        place), ``/p/<app_id>/`` and ``/p/<app_id>`` redirect to
+        ``/p/<moved_to>/``, query kept, so a bookmark or a login link keeps
+        working; the redirect goes when ``app_id`` is mounted again. Call on
+        the event loop. ``ValueError`` when no app is mounted as ``app_id``."""
+        app = self._apps.get(app_id)
+        if app is None:
+            raise ValueError("no app is mounted as %r" % (app_id,))
+        if moved_to is not None and (
+            not isinstance(moved_to, str) or not _APP_ID_RE.fullmatch(moved_to)
+        ):
+            raise ValueError(
+                "an app id is one path segment of letters, digits, '_' and '-': %r" % (moved_to,)
+            )
+        self._drop_routes(app=app, handlers=(self._prefix_routes.pop(app_id),))
+        del self._apps[app_id]
+        self._background.pop(app_id, None)
+        starting = self._starts.pop(app_id, None)
+        try:
+            if starting is not None and not starting.done():
+                starting.cancel()
+                await asyncio.gather(starting, return_exceptions=True)
+            await app.agent_stop()
+        finally:
+            if moved_to is not None:
+                self._redirect_moved(app_id, moved_to)
+
+    def _redirect_moved(self, app_id, moved_to):
+        target = mount_prefix(moved_to) + "/"
+
+        async def moved(req):
+            location = target
+            if req.query_string:
+                location += "?" + req.query_string
+            return Response.redirect(location)
+
+        self.app.get(mount_prefix(app_id))(moved)
+        self.app.get(mount_prefix(app_id) + "/")(moved)
+        self._moved[app_id] = (moved,)
 
     async def start_app(self, app_id):
         """Start the app mounted as ``app_id``, or wait for the start already
