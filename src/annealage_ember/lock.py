@@ -173,6 +173,12 @@ class Lock:
         self._fd: Optional[int] = fd
         self.path = path
 
+    def moved_to(self, path) -> None:
+        """The directory the lock file is in was renamed by its holder, and
+        the file is now at ``path``: ``release`` removes it there."""
+        self._path = Path(path)
+        self.path = self._path
+
     def release(self) -> None:
         """Close the descriptor and remove the file. Idempotent: a caller's
         explicit release racing a shutdown path's defensive one must not

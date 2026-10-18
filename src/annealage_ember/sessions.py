@@ -325,6 +325,89 @@ def record_last_session(project_dir, sid: str) -> None:
     _write_json_atomic(path, state)
 
 
+def _moved(value, old: str, new: str):
+    """``value`` with the directory ``old`` at its start replaced by ``new``,
+    or ``None`` when it does not start with it."""
+    if isinstance(value, str) and (value == old or value.startswith(old + os.sep)):
+        return new + value[len(old) :]
+    return None
+
+
+def _rehome_omp_file(path: Path, old: str, new: str) -> bool:
+    """Point the header of one omp conversation file at ``new``: omp keeps
+    the directory a conversation was held in as its ``session`` line's ``cwd``
+    and gives its tools that directory when the conversation is resumed. Only
+    the first lines are read and changed; the rest of the file is copied as it
+    is. ``True`` when the file changed."""
+    with path.open("rb") as source:
+        head = []
+        changed = False
+        for _ in range(10):
+            line = source.readline()
+            if not line:
+                break
+            if line.startswith(b'{"type":"session"'):
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    record = None
+                moved = _moved(record.get("cwd"), old, new) if isinstance(record, dict) else None
+                if moved is not None:
+                    record["cwd"] = moved
+                    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode(
+                        "utf-8"
+                    ) + (b"\n" if line.endswith(b"\n") else b"")
+                    changed = True
+            head.append(line)
+        if not changed:
+            return False
+        tmp = path.with_suffix(path.suffix + ".tmp-%d" % os.getpid())
+        with tmp.open("wb") as out:
+            out.writelines(head)
+            while True:
+                block = source.read(1 << 20)
+                if not block:
+                    break
+                out.write(block)
+    os.chmod(tmp, path.stat().st_mode & 0o7777)
+    os.replace(tmp, path)
+    return True
+
+
+def rehome(old_dir, new_dir) -> dict:
+    """Make what ``new_dir``'s state directory holds belong to ``new_dir``,
+    once the project directory has been moved there from ``old_dir``: every
+    session recorded against ``old_dir`` takes ``new_dir``'s project key (and
+    its recorded paths into the old directory follow the move), and the omp
+    conversation files under ``<state dir>/omp`` take ``new_dir`` as their
+    ``cwd``, so ``-c`` and a resume find the same conversations in the new
+    place. A session recorded against some other directory is left alone: it
+    was not this project's. Returns ``{"sessions": n, "omp_files": m}``, the
+    numbers changed. Calling it again changes nothing, and
+    ``rehome(new_dir, old_dir)`` undoes it."""
+    old, new = str(Path(old_dir).resolve()), str(Path(new_dir).resolve())
+    old_key, new_key = project_key_for_directory(old), project_key_for_directory(new)
+    done = {"sessions": 0, "omp_files": 0}
+    root = sessions_dir(new)
+    for directory in sorted(root.iterdir()) if root.is_dir() else ():
+        path = directory / META_FILENAME
+        meta = _read_json(path)
+        if not isinstance(meta, dict) or meta.get("project_key") != old_key:
+            continue
+        meta["project_key"] = new_key
+        for key, value in list(meta.items()):
+            moved = _moved(value, old, new)
+            if moved is not None:
+                meta[key] = moved
+        _write_json_atomic(path, meta)
+        done["sessions"] += 1
+    omp = state_dir(new) / "omp"
+    for path in sorted(omp.glob("*.jsonl")) if omp.is_dir() else ():
+        if _rehome_omp_file(path, old, new):
+            done["omp_files"] += 1
+    return done
+
+
 def resolve_continue(project_dir) -> Optional[str]:
     """The session id ``-c`` should resume, or ``None`` if this project has
     none.
