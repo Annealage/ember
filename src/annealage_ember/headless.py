@@ -1,11 +1,12 @@
-"""One prompt, one turn, no human: ``run_prompt``.
+"""One private conversation, no human: ``run_prompt``.
 
 A product that wants a sub-agent for a batch step (review a sheet, summarise
 a file) does not want a chat pane, a browser, a project directory of session
 state or an approval card. ``run_prompt`` gives it the rest of the agent layer
 without those: it starts a session on the Claude or omp backend, sends one
 user message, waits for the turn to end, and returns what the model said, what
-the turn cost and which tools it called.
+the run cost and which tools it called. Optional bounded follow-ups stay in
+that same live conversation; by default it still sends exactly one turn.
 
     result = await run_prompt(
         "Check the sheet against the datasheet.",
@@ -76,6 +77,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import math
 import os
 import secrets
@@ -195,17 +197,22 @@ class RunResult:
     A turn that ends on a tool call (``ended_by_tool``) has no text.
     ``stop_reason`` is the backend's (``end_turn``, ``max_tokens``, ...) or
     ``ended_by_tool``, ``rejected``, ``timeout`` or ``error``. ``cost_usd`` and
-    ``tokens`` are reported turn figures; unknown cost or token dimensions
-    remain ``None``, never a fabricated zero. ``error`` is ``None`` for a
-    clean run, else why not (``"timeout"`` for a timeout).
+    ``tokens`` sum reported turn figures across the run; a dimension unknown
+    in any turn remains ``None``, never a fabricated zero. The callback gets
+    only that turn's figures. ``error`` is ``None`` for a clean run, else why
+    not (``"timeout"`` for a timeout). Text and stop reason describe the last
+    turn, including any partial reply on failure.
 
     ``role_resolution_error`` is true only when OMP rejected the requested
     role before any provider request.
 
     ``calls`` is every tool the model called, in order, as ``(name, ok)``:
     the ``ToolSet``'s own name on both backends, and ``ok`` false for a call
-    that failed, was refused, or never returned. Neither arguments nor results
-    are kept, since they may be confidential.
+    that failed, was refused, or never returned. ``tool_errors`` contains
+    ``(name, text)`` for failed tool results, with the exact returned text,
+    including schema/permission failures. No arguments or successful results
+    are kept. Error text may be confidential: it is excluded from ``repr``
+    and must not be logged indiscriminately.
     """
 
     text: str
@@ -218,10 +225,12 @@ class RunResult:
     native_turns_supported: Optional[bool] = None
     error: Optional[str] = None
     role_resolution_error: bool = False
+    tool_errors: Tuple[Tuple[str, str], ...] = dataclasses.field(default=(), repr=False)
+
 
 class _Run:
-    """The events of one turn, collected. ``on_event`` is the session's sink and
-    only ever runs on the event loop."""
+    """The current turn and completed turns of one live run. The guard and
+    event sink remain attached to the same object throughout the run."""
 
     def __init__(self, server_prefix: str, on_runtime=None):
         self._prefix = server_prefix
@@ -235,6 +244,10 @@ class _Run:
         # [name, ok] per call in the order made, and where each call id is.
         self._calls: List[list] = []
         self._by_id: dict = {}
+        self._tool_errors: List[Tuple[str, str]] = []
+        self._completed: List[RunResult] = []
+        self._last_turn: Optional[int] = None
+        self._native_num_turns: Optional[int] = None
         # Set when the run is over, however it ended; a tool handler that starts
         # after that refuses (``guard``), and ``end`` cancels those running.
         self.over = False
@@ -283,6 +296,28 @@ class _Run:
         if pending:
             await asyncio.wait(pending, timeout=_DRAIN_TIMEOUT)
 
+    async def settle_tools(self) -> None:
+        """Do not inspect submission state while a tool can still change it.
+        The enclosing whole-run timeout bounds this wait, without cancelling
+        a successful write merely because the turn boundary arrived first."""
+        while self._inflight:
+            await asyncio.wait(self._inflight)
+
+    def next_turn(self) -> None:
+        """Reset only turn-local collection, never the live tool guard."""
+        self._completed.append(self.turn_result())
+        self.done.clear()
+        self.text.clear()
+        self.errors.clear()
+        self.stop_reason = None
+        self.cost_usd = None
+        self.tokens = None
+        self._calls.clear()
+        self._by_id.clear()
+        self._tool_errors.clear()
+        self.role_resolution_error = False
+        self._native_num_turns = None
+
     def error(self) -> Optional[str]:
         return "; ".join(self.errors) or None
 
@@ -290,7 +325,18 @@ class _Run:
         return tuple((name, ok) for name, ok in self._calls)
 
     def on_event(self, event) -> None:
-        if self.finished:
+        if self.over:
+            return
+        if self.finished and not isinstance(
+            event, (AgentRuntimeResolved, AgentError, AgentStatus, ToolResult)
+        ):
+            return
+        if (
+            self._completed
+            and isinstance(event, (TextDelta, ToolUse, TurnEnd))
+            and self._last_turn is not None
+            and event.turn <= self._last_turn
+        ):
             return
         if isinstance(event, AgentRuntimeResolved):
             if self._on_runtime is not None:
@@ -307,11 +353,17 @@ class _Run:
             self._by_id[event.tool_use_id] = len(self._calls)
             self._calls.append([name, False])
         elif isinstance(event, ToolResult):
+            index = self._by_id.get(event.tool_use_id)
+            if self._completed and index is None:
+                # ToolResult has no turn number. An old result must not clear
+                # this turn's text or be attached to a new call.
+                return
             # What was said so far was before the tool; the answer follows it.
             self.text.clear()
-            index = self._by_id.get(event.tool_use_id)
             if index is not None:
                 self._calls[index][1] = not event.is_error
+                if event.is_error:
+                    self._tool_errors.append((self._calls[index][0], event.text))
         elif isinstance(event, AgentError):
             if event.role_resolution_error is True:
                 self.role_resolution_error = True
@@ -328,8 +380,10 @@ class _Run:
                 # omp: another message redirected the turn; the real end follows.
                 return
             self.stop_reason = event.stop_reason
+            self._last_turn = event.turn
             self.cost_usd = event.cost_usd
             self.tokens = event.tokens
+            self._native_num_turns = getattr(self.session, "last_result_num_turns", None)
             # A Claude result that said it failed (an API error, say) ends with
             # a TurnEnd like any other; the session keeps why, read here. Its
             # AgentError has usually added the same text already.
@@ -349,7 +403,7 @@ class _Run:
             self.errors.append(why)
         self.done.set()
 
-    def result(self, *, stop_reason: Optional[str] = None, error: Optional[str] = None):
+    def turn_result(self, *, stop_reason: Optional[str] = None, error: Optional[str] = None):
         return RunResult(
             text="".join(self.text),
             stop_reason=stop_reason or self.stop_reason or "error",
@@ -357,11 +411,42 @@ class _Run:
             tokens=self.tokens,
             calls=self.calls(),
             native_max_turns=getattr(self.session, "_native_max_turns", None),
-            native_num_turns=getattr(self.session, "last_result_num_turns", None),
+            native_num_turns=self._native_num_turns,
             native_turns_supported=getattr(self.session, "_native_turns_supported", None),
             error=error if error is not None else self.error(),
             role_resolution_error=self.role_resolution_error,
+            tool_errors=tuple(self._tool_errors),
         )
+
+    def result(self, *, stop_reason: Optional[str] = None, error: Optional[str] = None):
+        current = self.turn_result(stop_reason=stop_reason, error=error)
+        if not self._completed:
+            return current
+        turns = [*self._completed, current]
+        token_keys = {key for turn in turns for key in (turn.tokens or {})}
+        tokens = {
+            key: (
+                sum(turn.tokens[key] for turn in turns)
+                if all(turn.tokens is not None and turn.tokens.get(key) is not None for turn in turns)
+                else None
+            )
+            for key in token_keys
+        } if token_keys else None
+        return dataclasses.replace(
+            current,
+            cost_usd=(
+                sum(turn.cost_usd for turn in turns)
+                if all(turn.cost_usd is not None for turn in turns) else None
+            ),
+            tokens=tokens,
+            calls=tuple(call for turn in turns for call in turn.calls),
+            tool_errors=tuple(item for turn in turns for item in turn.tool_errors),
+            native_num_turns=(
+                sum(turn.native_num_turns for turn in turns)
+                if all(turn.native_num_turns is not None for turn in turns) else None
+            ),
+        )
+
 def _check_arguments(
     prompt,
     tools,
@@ -379,6 +464,8 @@ def _check_arguments(
     max_budget_usd=None,
     native_max_turns=None,
     model_role=None,
+    on_turn_result=None,
+    max_followups=0,
 ):
     if backend == "codex":
         raise ValueError(
@@ -413,6 +500,10 @@ def _check_arguments(
 
     if on_runtime is not None and not callable(on_runtime):
         raise ValueError("on_runtime must be a callable taking one AgentRuntimeResolved event")
+    if on_turn_result is not None and not callable(on_turn_result):
+        raise ValueError("on_turn_result must be a callable taking one RunResult")
+    if isinstance(max_followups, bool) or not isinstance(max_followups, int) or max_followups < 0:
+        raise ValueError("max_followups must be a nonnegative integer")
     if not isinstance(tools, ToolSet):
         raise ValueError("tools must be a ToolSet, not %r" % (tools,))
     if not isinstance(prompt, str) or not prompt.strip():
@@ -567,28 +658,73 @@ def _build_session(
     )
 
 
-async def _drive(session, run: _Run, prompt: str) -> None:
-    """Start the session and send the one turn. Never raises for a backend
-    failure: that is left in ``run``, which the turn's end (or the failure)
-    completes."""
+async def _drive(session, run: _Run, prompt: str, on_turn_result, max_followups: int) -> None:
+    """Drive bounded turns without replacing the session or replaying tools."""
+    async def submit(text, *, start=False):
+        try:
+            if start:
+                await session.start()
+            if session.agent_status() != AGENT_READY:
+                run._stopped("the agent did not start" if start else "the agent stopped before follow-up")
+                return
+            await session.submit_turn([{"type": "text", "text": text}])
+        except Exception as exc:
+            run.errors.append("%s: %s" % (type(exc).__name__, exc))
+            run.stop_reason = "error"
+            run.done.set()
+
+    # Positive ordinary-end allowlist: unknown/native limit/rejection reasons
+    # fail closed. max_tokens is a clean provider completion, not a run cap.
+    ordinary = {"end", "end_turn", "success", "stop", "stop_sequence",
+                "max_tokens", "length", "ended_by_tool"}
+    submission = asyncio.ensure_future(submit(prompt, start=True))
+    followups = 0
     try:
-        await session.start()
-        if session.agent_status() != AGENT_READY:
-            run._stopped("the agent did not start")
-            return
-        await session.submit_turn([{"type": "text", "text": prompt}])
+        while True:
+            await run.done.wait()
+            if on_turn_result is None or run.error() or run.stop_reason not in ordinary:
+                return
+            # A boundary can precede the transport acknowledgement or a tool's
+            # final cleanup. Neither may race the callback or the next submit.
+            await submission
+            await run.settle_tools()
+            if run.over or run.error() or session.agent_status() != AGENT_READY:
+                return
+            correction = on_turn_result(run.turn_result())
+            if inspect.isawaitable(correction):
+                correction = await correction
+            if correction is not None and (
+                not isinstance(correction, str) or not correction.strip()
+            ):
+                raise ValueError("on_turn_result must return None or a non-empty string")
+            if correction is None or followups >= max_followups:
+                return
+            # Async callbacks may span a backend failure or ignore cancellation
+            # past the bounded cleanup wait. Neither may authorize a new turn.
+            if run.over or run.error() or session.agent_status() != AGENT_READY:
+                return
+            run.next_turn()
+            followups += 1
+            submission = asyncio.ensure_future(submit(correction))
     except Exception as exc:
         run.errors.append("%s: %s" % (type(exc).__name__, exc))
-        run._stopped()
+        run.stop_reason = "error"
+        run.done.set()
+    finally:
+        await _cancelled(submission)
 
 
 async def _cancelled(task: "asyncio.Future") -> None:
-    """Cancel ``task`` and wait for it to be gone."""
+    """Cancel ``task`` and wait boundedly, even for a misbehaving callback."""
     if task.done():
         return
     task.cancel()
-    with contextlib.suppress(asyncio.CancelledError, Exception):
-        await task
+    done, _ = await asyncio.wait({task}, timeout=_DRAIN_TIMEOUT)
+    if task in done:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    else:
+        sys.stderr.write("warning: headless task did not stop within %gs\n" % _DRAIN_TIMEOUT)
 
 
 async def _close(session, *, kill: bool) -> None:
@@ -629,9 +765,11 @@ async def run_prompt(
     native_max_turns=None,
     on_owner=None,
     owner_context=None,
+    on_turn_result=None,
+    max_followups=0,
 ):
-    """Run ``prompt`` as one turn of a fresh agent session with ``tools``, and
-    return its ``RunResult``. See the module docstring.
+    """Run ``prompt`` in a fresh agent session with ``tools`` and return its
+    ``RunResult``. One turn by default; see the module docstring.
 
     ``backend`` is ``"omp"`` or ``"claude"``; ``model`` optionally names omp's
     ``provider/model`` or a Claude model; ``None`` uses the backend default.
@@ -668,6 +806,22 @@ async def run_prompt(
     SDK's native ``max_turns`` option is consumed; this counts native model turns,
     not transport retries or invoices. ``RunResult`` exposes the configured cap,
     SDK capability and reported ``num_turns`` when the CLI supplies it.
+
+    ``on_turn_result(result: RunResult) -> str | None`` optionally inspects each
+    clean ordinary turn, including ``max_tokens`` and ``ended_by_tool``. It may
+    be async; returning a non-empty string submits that text as the next user
+    turn on the identical live session, preserving tools, conversation, runtime
+    and telemetry ownership. Returning ``None`` stops. ``max_followups`` is a
+    nonnegative integer, default 0: at most that many extra turns are submitted,
+    even if the callback keeps asking. The callback still observes the final
+    clean turn at the bound, but its requested correction is not submitted.
+    Backend errors, rejections, cancellations, timeouts and native turn/budget
+    limits never invoke it. Callback failures become an error result, never a
+    retry. The whole-run timeout includes callbacks and all follow-up turns.
+    The callback receives per-turn usage/calls/errors; the returned result sums
+    usage and calls across turns (any unknown dimension stays unknown) and
+    retains only the last turn's reply text and stop reason. Host code never
+    replays a tool, successful or not.
 
     ``builtin_tools`` (omp only, default none) names omp built-in tools to leave
     enabled for this run, from ``BUILTIN_TOOLS`` (``web_search`` only);
@@ -735,6 +889,8 @@ async def run_prompt(
         max_budget_usd,
         native_max_turns,
         model_role,
+        on_turn_result,
+        max_followups,
     )
 
     with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
@@ -793,20 +949,21 @@ async def run_prompt(
             run.session = session
             bus.end_turn_handler = getattr(session, "end_turn_after_tool", None)
 
-            task = asyncio.ensure_future(_drive(session, run, prompt))
-            waiter = asyncio.ensure_future(run.done.wait())
+            task = asyncio.ensure_future(
+                _drive(session, run, prompt, on_turn_result, max_followups)
+            )
             try:
-                await asyncio.wait({waiter}, timeout=timeout)
-                if not run.finished:
+                await asyncio.wait({task}, timeout=timeout)
+                if not task.done():
                     return run.result(stop_reason="timeout", error="timeout")
+                await task
                 return run.result()
             finally:
                 # Also when cancelled: nothing outlives the call. Late tool calls
                 # are refused first, then the backend is stopped.
-                unfinished = not run.finished
+                unfinished = not task.done()
                 run.end()
                 broker.shutdown()
-                await _cancelled(waiter)
                 await _cancelled(task)
                 await _close(session, kill=unfinished)
                 if backend != "claude" and on_owner is not None and owner_context is not None:

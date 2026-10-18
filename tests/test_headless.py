@@ -1,4 +1,4 @@
-"""Tests for ``headless.run_prompt``: one prompt, one turn, no human.
+"""Tests for ``headless.run_prompt``: one private conversation, no human.
 
 A scripted ``FakeSession`` (``session/fake.py``) replaces ``headless._build_session``,
 so a test chooses exactly which events a turn produces and when: the text and
@@ -25,6 +25,7 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny, Result
 import annealage_ember
 from annealage_ember import headless
 from annealage_ember.headless import RunResult, ToolSet, run_prompt
+from annealage_ember.hosted_state import usage_event
 from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
@@ -121,10 +122,10 @@ def script_session(monkeypatch, script, *, on_start=None):
     return built
 
 
-async def finish(session, *, text=("done",), stop="end_turn", cost=0.25, tokens=TOKENS):
+async def finish(session, *, text=("done",), stop="end_turn", cost=0.25, tokens=TOKENS, turn=1):
     for piece in text:
-        session.emit(TextDelta(turn=1, text=piece))
-    session.emit(TurnEnd(turn=1, stop_reason=stop, cost_usd=cost, tokens=tokens))
+        session.emit(TextDelta(turn=turn, text=piece))
+    session.emit(TurnEnd(turn=turn, stop_reason=stop, cost_usd=cost, tokens=tokens))
 
 
 # ---------------------------------------------------------------------------
@@ -807,3 +808,457 @@ async def test_model_role_rejects_unsupported_requests(
             "go",
             **make_args(tmp_path, backend=backend, model=model, model_role=model_role),
         )
+
+
+# ---------------------------------------------------------------------------
+# Bounded follow-ups retain the identical live conversation and tool state
+# ---------------------------------------------------------------------------
+
+
+async def test_followup_uses_same_live_session_and_never_replays_successful_tools(
+    monkeypatch, tmp_path
+):
+    saved, observed, sessions = [], [], []
+    tools = make_toolset(grant=("save",), saved=saved)
+
+    async def script(session):
+        sessions.append(session)
+        turn = len(session.submitted_turns)
+        if turn == 1:
+            session.emit(ToolUse(turn=turn, tool_use_id="saved", name="save", input={"v": "kept"}))
+            await built.kwargs["server"].host_tool_table()["save"].handler({"v": "kept"})
+            session.emit(ToolResult(tool_use_id="saved", is_error=False, text="saved"))
+            await finish(session, text=("forgot the submission",), turn=turn)
+        else:
+            assert saved == ["kept"]
+            # A duplicate old terminal event must not terminate the follow-up.
+            session.emit(TurnEnd(turn=1, stop_reason="end_turn", cost_usd=999))
+            session.emit(ToolUse(turn=turn, tool_use_id="lookup", name="lookup", input={}))
+            session.emit(ToolResult(tool_use_id="lookup", is_error=False, text="found"))
+            await finish(session, text=("submitted",), cost=0.5, turn=turn)
+
+    def on_turn(result):
+        observed.append(result)
+        return "Submit the missing result; keep the existing saved value." if len(observed) == 1 else None
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "review", **make_args(tmp_path, tools=tools, on_turn_result=on_turn, max_followups=2)
+    )
+
+    assert sessions == [built.session, built.session]
+    assert built.session.submitted_turns == [
+        ([{"type": "text", "text": "review"}], None),
+        ([{"type": "text", "text": "Submit the missing result; keep the existing saved value."}], None),
+    ]
+    assert built.session.started == 1 and built.session.closed == 1
+    assert built.session.set_model_calls == []
+    assert saved == ["kept"]
+    assert [turn.calls for turn in observed] == [(("save", True),), (("lookup", True),)]
+    assert [turn.cost_usd for turn in observed] == [0.25, 0.5]
+    assert result.calls == (("save", True), ("lookup", True))
+    assert result.cost_usd == 0.75
+    assert result.tokens == {key: 2 * value for key, value in TOKENS.items()}
+    assert (result.text, result.error) == ("submitted", None)
+
+
+@pytest.mark.parametrize("max_followups", [0, 1, 2])
+async def test_followup_bound_is_hard_even_if_callback_always_requests_more(
+    monkeypatch, tmp_path, max_followups
+):
+    observed = []
+
+    async def script(session):
+        await finish(session, turn=len(session.submitted_turns), stop="max_tokens")
+
+    async def on_turn(result):
+        await asyncio.sleep(0)
+        observed.append(result)
+        return "continue"
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=max_followups)
+    )
+    assert len(built.session.submitted_turns) == max_followups + 1
+    assert len(observed) == max_followups + 1
+    assert result.error is None
+
+
+@pytest.mark.parametrize(
+    "stop", ["rejected", "error", "backend_exited", "not_sent", "cancelled",
+             "error_max_turns", "max_turns", "error_max_budget_usd", "max_budget_usd"]
+)
+async def test_rejections_failures_and_native_limits_never_invoke_callback(
+    monkeypatch, tmp_path, stop
+):
+    observed = []
+
+    async def script(session):
+        await finish(session, stop=stop)
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=lambda r: observed.append(r) or "retry",
+                          max_followups=2)
+    )
+    assert observed == []
+    assert len(built.session.submitted_turns) == 1
+    assert result.stop_reason == stop
+
+
+@pytest.mark.parametrize("kind", ["agent_error", "sdk_result_error", "exception"])
+async def test_infrastructure_errors_never_invoke_callback(monkeypatch, tmp_path, kind):
+    observed = []
+
+    async def script(session):
+        if kind == "exception":
+            raise OSError("provider disconnected")
+        if kind == "sdk_result_error":
+            session.last_result_error = "native turn limit reached"
+        else:
+            session.emit(AgentError(stderr="provider disconnected"))
+        await finish(session)
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=observed.append, max_followups=2)
+    )
+    assert observed == []
+    assert len(built.session.submitted_turns) == 1
+    assert result.error
+
+
+async def test_tool_errors_are_exact_per_turn_and_aggregate_without_success_contents(
+    monkeypatch, tmp_path
+):
+    observed = []
+    failures = ["schema: missing required field 's3cret'\n  at $.value", "authority: write denied"]
+
+    async def script(session):
+        turn = len(session.submitted_turns)
+        # Tool IDs may be reused by the backend in a new turn.
+        session.emit(ToolUse(turn=turn, tool_use_id="same", name="mcp__toy__save", input={}))
+        session.emit(ToolResult(tool_use_id="same", is_error=True, text=failures[turn - 1]))
+        session.emit(ToolUse(turn=turn, tool_use_id="ok", name="lookup", input={}))
+        session.emit(ToolResult(tool_use_id="ok", is_error=False, text="successful secret"))
+        await finish(session, turn=turn, stop="ended_by_tool")
+
+    def on_turn(result):
+        observed.append(result)
+        return "Correct the exact error" if len(observed) == 1 else None
+
+    script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=1)
+    )
+    assert [r.tool_errors for r in observed] == [(("save", failures[0]),), (("save", failures[1]),)]
+    assert result.tool_errors == tuple(("save", text) for text in failures)
+    assert result.calls == (("save", False), ("lookup", True)) * 2
+    assert "s3cret" not in repr(result) and "successful secret" not in repr(result)
+
+
+@pytest.mark.parametrize("unknown_first", [True, False])
+async def test_aggregate_usage_preserves_unknown_dimensions(monkeypatch, tmp_path, unknown_first):
+    async def script(session):
+        turn = len(session.submitted_turns)
+        unknown = (turn == 1) == unknown_first
+        await finish(
+            session, turn=turn, cost=None if unknown else 0.25,
+            tokens={"input": None, "output": 3} if unknown else {"input": 2, "output": 7, "reasoning": 1},
+        )
+
+    script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=lambda _: "continue", max_followups=1)
+    )
+    assert result.cost_usd is None
+    assert result.tokens == {"input": None, "output": 10, "reasoning": None}
+
+
+async def test_request_usage_keeps_one_owner_and_positional_ids_across_followups(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    async def script(session):
+        turn = len(session.submitted_turns)
+        built.kwargs["on_request_usage"](usage_event(
+            session_id=built.kwargs["session_id"], conversation_id="same-conversation",
+            turn_index=turn, request_n=1, backend="omp", model="model", provider="provider",
+            provider_request_id="repeated-response-id", tokens=TOKENS, cost_usd=0.25,
+        ))
+        await finish(session, turn=turn)
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=lambda _: "continue", max_followups=1,
+                          usage_sink=events.append)
+    )
+    assert len(events) == 2
+    assert len({e["session_id"] for e in events}) == 1
+    assert len({e["event_id"] for e in events}) == 2
+    assert sorted((e["turn_index"], e["request_n"]) for e in events) == [(1, 1), (2, 1)]
+    # TurnEnd totals are summed once, not added again from per-request events.
+    assert result.cost_usd == 0.5
+
+
+@pytest.mark.parametrize("wait_in", ["callback", "followup"])
+async def test_whole_run_timeout_includes_callback_and_followup(monkeypatch, tmp_path, wait_in):
+    cleaned = []
+
+    async def script(session):
+        turn = len(session.submitted_turns)
+        if turn == 2:
+            session.emit(TextDelta(turn=turn, text="partial correction"))
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                cleaned.append("followup")
+        else:
+            await finish(session)
+
+    async def on_turn(_):
+        if wait_in == "callback":
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                cleaned.append("callback")
+        return "correct"
+
+    built = script_session(monkeypatch, script)
+    result = await asyncio.wait_for(run_prompt(
+        "go", **make_args(tmp_path, timeout=0.05, on_turn_result=on_turn, max_followups=2)
+    ), 2)
+    assert (result.stop_reason, result.error) == ("timeout", "timeout")
+    assert cleaned == [wait_in]
+    assert built.session.closed == 1
+    if wait_in == "followup":
+        assert result.text == "partial correction"
+        assert result.cost_usd is None
+        assert result.tokens == {key: None for key in TOKENS}
+
+
+@pytest.mark.parametrize("wait_in", ["callback", "followup"])
+async def test_cancellation_during_continuation_cleans_up_and_reraises(
+    monkeypatch, tmp_path, wait_in
+):
+    reached = asyncio.Event()
+    cleaned = []
+
+    async def wait_here():
+        reached.set()
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            cleaned.append(wait_in)
+
+    async def script(session):
+        if len(session.submitted_turns) == 2:
+            await wait_here()
+        else:
+            await finish(session)
+
+    async def on_turn(_):
+        if wait_in == "callback":
+            await wait_here()
+        return "correct"
+
+    built = script_session(monkeypatch, script)
+    task = asyncio.create_task(run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=2)
+    ))
+    await asyncio.wait_for(reached.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert cleaned == [wait_in]
+    assert built.session.closed == 1
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, None, "2"])
+async def test_invalid_followup_bounds_are_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match="max_followups must be a nonnegative integer"):
+        await run_prompt("go", **make_args(tmp_path, max_followups=value))
+
+
+async def test_noncallable_turn_callback_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="on_turn_result must be a callable"):
+        await run_prompt("go", **make_args(tmp_path, on_turn_result="retry"))
+
+
+@pytest.mark.parametrize("value", ["", "  ", 1])
+async def test_invalid_callback_result_stops_without_retry(monkeypatch, tmp_path, value):
+    async def script(session):
+        await finish(session)
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=lambda _: value, max_followups=2)
+    )
+    assert result.stop_reason == "error"
+    assert "on_turn_result must return None or a non-empty string" in result.error
+    assert len(built.session.submitted_turns) == 1
+
+
+async def test_inflight_tools_settle_before_callback_and_guard_remains_live(
+    monkeypatch, tmp_path
+):
+    saved, observed, workers = [], [], []
+
+    @tool("save", "save asynchronously", {"v": str})
+    async def save(args):
+        await asyncio.sleep(0.01)
+        saved.append(args["v"])
+        return ok(text="saved")
+
+    async def script(session):
+        turn = len(session.submitted_turns)
+        call_id = str(turn)
+        session.emit(ToolUse(turn=turn, tool_use_id=call_id, name="save", input={}))
+
+        async def work():
+            await built.kwargs["server"].host_tool_table()["save"].handler({"v": call_id})
+            session.emit(ToolResult(tool_use_id=call_id, is_error=False, text="saved"))
+
+        workers.append(asyncio.create_task(work()))
+        await asyncio.sleep(0)  # Enter the guarded handler before TurnEnd.
+        await finish(session, turn=turn)
+
+    def on_turn(result):
+        observed.append(result)
+        assert saved == [str(n) for n in range(1, len(observed) + 1)]
+        assert result.calls == (("save", True),)
+        return "finish" if len(observed) == 1 else None
+
+    built = script_session(monkeypatch, script)
+    tools = ToolSet(tools=[save], grading=Grading(read=(), view=(), write=("save",)), grant=("save",))
+    result = await run_prompt(
+        "go", **make_args(tmp_path, tools=tools, on_turn_result=on_turn, max_followups=1)
+    )
+    await asyncio.gather(*workers)
+    late = await built.kwargs["server"].host_tool_table()["save"].handler({"v": "late"})
+    assert late["is_error"] is True
+    assert saved == ["1", "2"]
+    assert result.calls == (("save", True), ("save", True))
+
+
+async def test_timeout_while_settling_tools_drains_cleanup_and_never_calls_callback(
+    monkeypatch, tmp_path
+):
+    cleaned, observed, workers = [], [], []
+
+    @tool("slow", "an in-flight write", {})
+    async def slow(args):
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            await asyncio.sleep(0.01)
+            cleaned.append("drained")
+
+    async def script(session):
+        workers.append(asyncio.create_task(
+            built.kwargs["server"].host_tool_table()["slow"].handler({})
+        ))
+        await asyncio.sleep(0)
+        await finish(session)
+
+    built = script_session(monkeypatch, script)
+    tools = ToolSet(tools=[slow], grading=Grading(read=(), view=(), write=("slow",)), grant=("slow",))
+    result = await asyncio.wait_for(run_prompt(
+        "go", **make_args(tmp_path, tools=tools, timeout=0.05,
+                          on_turn_result=observed.append, max_followups=2)
+    ), 2)
+    await asyncio.gather(*workers, return_exceptions=True)
+    assert result.error == "timeout"
+    assert observed == []
+    assert cleaned == ["drained"]
+    assert built.session.closed == 1
+
+
+async def test_callback_failure_ends_run_without_retry(monkeypatch, tmp_path):
+    async def script(session):
+        await finish(session)
+
+    def on_turn(_):
+        raise RuntimeError("submission observer failed")
+
+    built = script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=2)
+    )
+    assert result.error == "RuntimeError: submission observer failed"
+    assert result.stop_reason == "error"
+    assert len(built.session.submitted_turns) == 1
+
+
+async def test_incomplete_followup_does_not_reuse_previous_native_turn_count(
+    monkeypatch, tmp_path
+):
+    async def script(session):
+        if len(session.submitted_turns) == 1:
+            session.last_result_num_turns = 3
+            await finish(session)
+        else:
+            await asyncio.sleep(3600)
+
+    script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, timeout=0.05, on_turn_result=lambda _: "correct",
+                          max_followups=1)
+    )
+    assert result.error == "timeout"
+    assert result.native_num_turns is None
+
+
+async def test_native_turn_counts_are_per_turn_in_callback_and_summed_at_return(
+    monkeypatch, tmp_path
+):
+    observed = []
+
+    async def script(session):
+        turn = len(session.submitted_turns)
+        session.last_result_num_turns = turn + 1
+        await finish(session, turn=turn)
+
+    def on_turn(result):
+        observed.append(result.native_num_turns)
+        return "correct"
+
+    script_session(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=1)
+    )
+    assert observed == [2, 3]
+    assert result.native_num_turns == 5
+
+
+async def test_callback_ignoring_cancellation_cannot_hold_timeout_or_submit_after_close(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(headless, "_DRAIN_TIMEOUT", 0.01)
+    release = asyncio.Event()
+    ended = asyncio.Event()
+
+    async def script(session):
+        await finish(session)
+
+    async def on_turn(_):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await release.wait()
+        ended.set()
+        return "must not be submitted"
+
+    built = script_session(monkeypatch, script)
+    try:
+        result = await asyncio.wait_for(run_prompt(
+            "go", **make_args(tmp_path, timeout=0.05, on_turn_result=on_turn, max_followups=2)
+        ), 2)
+        assert result.error == "timeout"
+        assert built.session.closed == 1
+    finally:
+        release.set()
+        await asyncio.wait_for(ended.wait(), 2)
+    assert len(built.session.submitted_turns) == 1
