@@ -17,10 +17,10 @@ that same live conversation; by default it still sends exactly one turn.
 
 What is private to the run. It builds its own ``ViewerBus`` (over a registry
 nobody connects to) and its own ``ToolServer`` from the ``ToolSet``; it touches
-no viewer registry, event log, ``sessions`` state or ``permissions.toml``. The
-session's state is a temporary directory, removed when the run ends. ``cwd``
-is the caller's scratch directory and is used only as the backend's working
-directory; the caller should make it empty, since the model is told nothing
+no viewer registry, event log, ``sessions`` state or ``permissions.toml``. By
+default session state is temporary and removed at return; ``state_dir`` opts
+into durable OMP native state and explicit resume. ``cwd`` is the caller's
+scratch working directory; make it empty, since the model is told nothing
 about it and, on the Claude backend, cannot read it either (see below).
 
 How permission works with nobody to ask. ``session.permissions.HeadlessBroker``
@@ -50,8 +50,8 @@ back as ``RunResult.error``, with whatever text arrived first; ``run_prompt``
 raises only for a bad argument (``ValueError``) or because the caller
 cancelled it (``CancelledError``, after the session is closed).
 
-When a run ends early. A timeout or a cancel ends the run: the broker refuses
-any further call, each tool handler starts refusing ("this run has ended") and
+When a run ends early. An unrecovered timeout or a cancel ends the run: the
+broker refuses any further call, each tool handler starts refusing ("this run has ended") and
 those running are cancelled and waited for (up to ``_DRAIN_TIMEOUT``, so their
 cleanup is done before ``run_prompt`` returns), the backend process is killed
 (omp's ``kill``, so a start still waiting on the process cannot hold the close
@@ -59,17 +59,17 @@ up), and the close itself is bounded by ``_CLOSE_TIMEOUT``. A handler that
 is blocked inside a synchronous call, or past its last ``await``, cannot be
 stopped and finishes on its own thread; keep per-run handlers free of that.
 
-What a run leaves behind. Nothing of its own: the session state is under the
-temporary directory. On Claude the CLI is also started with
-``--no-session-persistence``, so the conversation (prompts, replies, tool
-arguments and results) is not written under ``~/.claude/projects``.
+What a run leaves behind. By default, nothing of its own: session state is
+temporary. An explicit ``state_dir`` retains OMP conversation state on every
+exit. On Claude the CLI always uses ``--no-session-persistence``; durable
+headless resume is not supported there.
 
 Tools that ask the human themselves (``tools.asks_the_human``) are refused by
 ``ToolSet``: with no human they could never be answered, and the tool server
 would otherwise file them under read.
 
-Imported on demand (``annealage_ember.run_prompt`` and the other two names
-resolve lazily), because it imports the Claude SDK through ``tools``.
+Imported on demand (the package's headless API names resolve lazily), because
+it imports the Claude SDK through ``tools``.
 """
 
 from __future__ import annotations
@@ -78,14 +78,18 @@ import asyncio
 import contextlib
 import dataclasses
 import inspect
+import json
 import math
 import os
 import secrets
+import stat
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from . import product
+from .files import atomic_replace, read_fixed_file, safe_fixed_file
 from .hosted_state import UsageRecorder
 from .session.base import (
     AGENT_READY,
@@ -186,6 +190,41 @@ class ToolSet:
                 "in the set are granted" % name
             )
 
+@dataclasses.dataclass(frozen=True)
+class RecoveryInfo:
+    """Observed recovery capability, never a promise that a file is complete.
+
+    ``resume_supported`` describes native backend support; ``conversation_file``
+    is populated only after the backend reports it. Explicit resume still
+    verifies the file and native switch before sending any new input.
+    """
+
+    backend: str
+    session_id: str
+    state_dir: Optional[str]
+    conversation_file: Optional[str]
+    resume_supported: bool
+    live_recovery_supported: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class TimeoutContext:
+    """One timeout observation. Only a safe work interval permits continuation.
+
+    ``result`` can contain confidential partial text and tool errors. Do not
+    log it indiscriminately. ``remaining`` is the hard deadline's remaining
+    seconds; elapsed includes startup, diagnostics and callbacks.
+    """
+
+    kind: str
+    result: RunResult
+    elapsed: float
+    remaining: float
+    interruption: str
+    recovery: RecoveryInfo
+    rpc_operation: Optional[str] = None
+
+
 
 @dataclasses.dataclass(frozen=True)
 class RunResult:
@@ -226,6 +265,8 @@ class RunResult:
     error: Optional[str] = None
     role_resolution_error: bool = False
     tool_errors: Tuple[Tuple[str, str], ...] = dataclasses.field(default=(), repr=False)
+    timeout_kind: Optional[str] = None
+    recovery: Optional[RecoveryInfo] = None
 
 
 class _Run:
@@ -253,6 +294,12 @@ class _Run:
         self.over = False
         self._inflight: set = set()
         self.role_resolution_error = False
+        self.timeout_kind = None
+        self.paused = False
+        self._pending_calls = set()
+        self._tool_results_changed = asyncio.Event()
+        self.recovery = None
+        self.reserve_turn = None
         # The session, for what only it knows about how its turn ended.
         self.session: Any = None
 
@@ -272,6 +319,8 @@ class _Run:
         async def handler(args):
             if self.over:
                 return fail("this run has ended, so %s did not run" % tool_def.name)
+            if self.paused:
+                return fail("this run is interrupted, so %s did not run" % tool_def.name)
             task = asyncio.current_task()
             self._inflight.add(task)
             try:
@@ -303,6 +352,13 @@ class _Run:
         while self._inflight:
             await asyncio.wait(self._inflight)
 
+    async def settle_tool_results(self) -> None:
+        """Wait until native tool results have caught up with host handlers."""
+        await self.settle_tools()
+        while self._pending_calls:
+            self._tool_results_changed.clear()
+            await self._tool_results_changed.wait()
+
     def next_turn(self) -> None:
         """Reset only turn-local collection, never the live tool guard."""
         self._completed.append(self.turn_result())
@@ -316,6 +372,8 @@ class _Run:
         self._by_id.clear()
         self._tool_errors.clear()
         self.role_resolution_error = False
+        self._pending_calls.clear()
+        self.timeout_kind = None
         self._native_num_turns = None
 
     def error(self) -> Optional[str]:
@@ -352,7 +410,10 @@ class _Run:
                 name = name[len(self._prefix) :]
             self._by_id[event.tool_use_id] = len(self._calls)
             self._calls.append([name, False])
+            self._pending_calls.add(event.tool_use_id)
         elif isinstance(event, ToolResult):
+            self._pending_calls.discard(event.tool_use_id)
+            self._tool_results_changed.set()
             index = self._by_id.get(event.tool_use_id)
             if self._completed and index is None:
                 # ToolResult has no turn number. An old result must not clear
@@ -416,6 +477,8 @@ class _Run:
             error=error if error is not None else self.error(),
             role_resolution_error=self.role_resolution_error,
             tool_errors=tuple(self._tool_errors),
+            timeout_kind=self.timeout_kind,
+            recovery=self.recovery() if self.recovery is not None else None,
         )
 
     def result(self, *, stop_reason: Optional[str] = None, error: Optional[str] = None):
@@ -546,8 +609,9 @@ def _check_arguments(
                 )
         if len(set(builtin_tools)) != len(builtin_tools):
             raise ValueError("builtin_tools names a tool twice")
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
-        raise ValueError("timeout must be a number of seconds greater than 0, not %r" % (timeout,))
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("timeout must be a finite number of seconds greater than 0, not %r" % (timeout,))
     if omp_request_timeout is not None:
         if backend != "omp":
             raise ValueError("omp_request_timeout is only supported with backend='omp'")
@@ -601,6 +665,9 @@ def _build_session(
     owner_context,
     provider_session_id=None,
     cache_retention=None,
+    resume=None,
+    resume_turn=0,
+    on_session_file=None,
 ):
     """The session ``backend`` names, built and not started. ``launch.build_session``
     is the app's: it is made of the served directory (the working directory and
@@ -627,6 +694,10 @@ def _build_session(
             # The conversation file goes under the run's own state, and goes
             # with it.
             session_dir=os.path.join(state_dir, "omp"),
+            resume=resume,
+            turn=resume_turn,
+            strict_resume=resume is not None,
+            on_session_file=on_session_file,
             provider_session_id=provider_session_id,
             cache_retention=cache_retention,
             on_request_usage=on_request_usage,
@@ -658,60 +729,257 @@ def _build_session(
     )
 
 
-async def _drive(session, run: _Run, prompt: str, on_turn_result, max_followups: int) -> None:
+async def _timeout_callback(callback, context):
+    if callback is None:
+        return None
+    text = callback(context)
+    if inspect.isawaitable(text):
+        text = await text
+    if text is not None and (not isinstance(text, str) or not text.strip()):
+        raise ValueError("on_timeout must return None or a non-empty string")
+    return text
+
+
+async def _drive(
+    session, run: _Run, prompt: str, on_turn_result, max_followups: int, *,
+    work_timeout=None, interrupt_timeout=10, on_timeout=None,
+    max_timeout_recoveries=0, timeout_context=None, deadline=float("inf"),
+) -> None:
     """Drive bounded turns without replacing the session or replaying tools."""
+    async def deadline_gate():
+        if asyncio.get_running_loop().time() >= deadline:
+            # Let the outer deadline owner classify and stop the run. An
+            # overdue synchronous callback must never admit another turn
+            # merely because the event loop has not serviced its timer yet.
+            await asyncio.Future()
+
     async def submit(text, *, start=False):
         try:
+            await deadline_gate()
             if start:
                 await session.start()
-            if session.agent_status() != AGENT_READY:
+            await deadline_gate()
+            if run.over or session.agent_status() != AGENT_READY:
                 run._stopped("the agent did not start" if start else "the agent stopped before follow-up")
                 return
+            if run.reserve_turn is not None:
+                run.reserve_turn()
             await session.submit_turn([{"type": "text", "text": text}])
         except Exception as exc:
             run.errors.append("%s: %s" % (type(exc).__name__, exc))
             run.stop_reason = "error"
             run.done.set()
 
-    # Positive ordinary-end allowlist: unknown/native limit/rejection reasons
-    # fail closed. max_tokens is a clean provider completion, not a run cap.
+    async def boundary():
+        await run.done.wait()
+        await submission
+        if run.error() or getattr(session, "last_request_timeout", None) is not None:
+            return
+        await run.settle_tools()
+
     ordinary = {"end", "end_turn", "success", "stop", "stop_sequence",
                 "max_tokens", "length", "ended_by_tool"}
     submission = asyncio.ensure_future(submit(prompt, start=True))
-    followups = 0
+    settled = None
+    followups = recoveries = 0
+    diagnostic_turn = False
     try:
         while True:
-            await run.done.wait()
+            settled = asyncio.ensure_future(boundary())
+            await asyncio.wait({settled}, timeout=work_timeout)
+            if not settled.done():
+                # Refuse new host calls while allowing successful writes already
+                # running to finish. Never cancel/replay them to recover time.
+                run.paused = True
+                if run.error():
+                    return
+                interrupt = getattr(session, "interrupt_for_timeout", None)
+                outcome = "unsupported" if interrupt is None else "unsafe"
+                if interrupt is not None:
+                    async def stop_and_settle():
+                        # A host write may already have committed. Let its
+                        # result enter the native conversation BEFORE abort,
+                        # not merely before the next user turn.
+                        await run.settle_tool_results()
+                        await deadline_gate()
+                        if await interrupt() is not True:
+                            return False
+                        await settled
+                        return (
+                            not run.over and not run.error() and not run._pending_calls
+                            and session.agent_status() == AGENT_READY
+                            and run.stop_reason in ordinary | {"interrupted", "aborted"}
+                        )
+
+                    stopping = asyncio.ensure_future(stop_and_settle())
+                    try:
+                        await asyncio.wait({stopping}, timeout=interrupt_timeout)
+                        if stopping.done() and not stopping.cancelled():
+                            try:
+                                if stopping.result() is True:
+                                    outcome = "safe"
+                            except Exception:
+                                pass
+                    finally:
+                        await _cancelled(stopping)
+                if (run.error() or (
+                    run.finished and run.stop_reason not in ordinary | {"interrupted", "aborted"}
+                )):
+                    return
+                await deadline_gate()
+                run.timeout_kind = "work_interval"
+                diagnostic = await _timeout_callback(
+                    on_timeout, timeout_context("work_interval", outcome)
+                )
+                await deadline_gate()
+                if (outcome != "safe" or diagnostic is None
+                        or recoveries >= max_timeout_recoveries or run.over or run.error()
+                        or session.agent_status() != AGENT_READY):
+                    run.stop_reason = "timeout"
+                    if not run.error():
+                        run.errors.append("timeout")
+                    return
+                # The old turn has a real terminal boundary and no pending
+                # tool/result/submission. Only now may another user turn exist.
+                run.next_turn()
+                run.paused = False
+                recoveries += 1
+                diagnostic_turn = True
+                submission = asyncio.ensure_future(submit(diagnostic))
+                continue
+            await settled
+            if getattr(session, "last_request_timeout", None) is not None:
+                run.timeout_kind = "rpc_request_timeout"
+                run.paused = True
+                await deadline_gate()
+                await _timeout_callback(
+                    on_timeout, timeout_context("rpc_request_timeout", "not_attempted")
+                )
+                return
             if on_turn_result is None or run.error() or run.stop_reason not in ordinary:
                 return
-            # A boundary can precede the transport acknowledgement or a tool's
-            # final cleanup. Neither may race the callback or the next submit.
-            await submission
-            await run.settle_tools()
-            if run.over or run.error() or session.agent_status() != AGENT_READY:
+            if run.over or session.agent_status() != AGENT_READY:
                 return
+            await deadline_gate()
             correction = on_turn_result(run.turn_result())
             if inspect.isawaitable(correction):
                 correction = await correction
+            await deadline_gate()
             if correction is not None and (
                 not isinstance(correction, str) or not correction.strip()
             ):
                 raise ValueError("on_turn_result must return None or a non-empty string")
-            if correction is None or followups >= max_followups:
+            if correction is None or (not diagnostic_turn and followups >= max_followups):
                 return
-            # Async callbacks may span a backend failure or ignore cancellation
-            # past the bounded cleanup wait. Neither may authorize a new turn.
             if run.over or run.error() or session.agent_status() != AGENT_READY:
                 return
             run.next_turn()
-            followups += 1
+            if not diagnostic_turn:
+                followups += 1
+            diagnostic_turn = False
             submission = asyncio.ensure_future(submit(correction))
     except Exception as exc:
         run.errors.append("%s: %s" % (type(exc).__name__, exc))
         run.stop_reason = "error"
         run.done.set()
     finally:
+        if settled is not None:
+            await _cancelled(settled)
         await _cancelled(submission)
+
+
+class _ConversationState:
+    """One locked durable native conversation; no prompts or tools are replayed."""
+
+    def __init__(self, path, *, durable, resume, backend, cwd):
+        self.path = Path(path)
+        self.durable = durable
+        self.manifest = self.path / "headless.json"
+        if durable and safe_fixed_file(self.path, self.manifest.name) is None:
+            raise ValueError("headless manifest must be a regular file with one link")
+        self.error = None
+        if resume:
+            try:
+                self.data = json.loads(read_fixed_file(self.path, self.manifest.name))
+                if (self.data["version"] != 1 or self.data["backend"] != backend
+                        or self.data["cwd"] != os.path.realpath(cwd)
+                        or type(self.data["turn"]) is not int or self.data["turn"] < 0
+                        or not isinstance(self.data["session_id"], str)
+                        or not self.data["session_id"].startswith("headless-")
+                        or not isinstance(self.data["conversation_file"], str)):
+                    raise ValueError("incompatible headless state")
+                conversation = Path(self.data["conversation_file"])
+                conversation.resolve().relative_to((self.path / "omp").resolve())
+                if not conversation.is_file():
+                    raise ValueError("native conversation file is missing")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ValueError("cannot resume headless state: %s" % exc) from exc
+        else:
+            if durable and self.manifest.exists():
+                raise ValueError("state_dir already contains a run; use resume=True explicitly")
+            self.data = {
+                "version": 1, "backend": backend, "cwd": os.path.realpath(cwd),
+                "session_id": "headless-%s" % secrets.token_hex(8),
+                "turn": 0, "conversation_file": None,
+            }
+            self.save()
+
+    def save(self):
+        if self.durable:
+            try:
+                atomic_replace(self.manifest, json.dumps(self.data).encode(), default_mode=0o600)
+                directory = os.open(self.path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError as exc:
+                self.error = exc
+                raise
+
+    def record_file(self, path):
+        self.data["conversation_file"] = os.path.abspath(path)
+        self.save()
+
+    def reserve_turn(self):
+        if self.error is not None:
+            raise RuntimeError("conversation state could not be persisted") from self.error
+        # Reserve BEFORE submitting, so a crash or uncertain acknowledgement
+        # cannot reuse any provider usage event identity after explicit resume.
+        self.data["turn"] += 1
+        self.save()
+
+
+@contextlib.contextmanager
+def _conversation_state(state_dir, *, resume, backend, cwd):
+    with contextlib.ExitStack() as stack:
+        durable = state_dir is not None
+        if durable:
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise ValueError("durable headless state requires POSIX file locking") from exc
+
+            path = Path(state_dir).absolute()
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock_path = safe_fixed_file(path, "headless.lock")
+            if lock_path is None:
+                raise ValueError("headless lock must be a regular file with one link")
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
+            fd = os.open(lock_path, flags, 0o600)
+            lock = stack.enter_context(os.fdopen(fd, "a+b"))
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()):
+                raise ValueError("headless lock is not privately owned")
+            os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("state_dir is already in use") from exc
+        else:
+            path = stack.enter_context(tempfile.TemporaryDirectory(prefix="annealage-headless-"))
+        yield _ConversationState(path, durable=durable, resume=resume, backend=backend, cwd=cwd)
 
 
 async def _cancelled(task: "asyncio.Future") -> None:
@@ -767,6 +1035,12 @@ async def run_prompt(
     owner_context=None,
     on_turn_result=None,
     max_followups=0,
+    work_timeout=None,
+    interrupt_timeout=10,
+    on_timeout=None,
+    max_timeout_recoveries=0,
+    state_dir=None,
+    resume=False,
 ):
     """Run ``prompt`` in a fresh agent session with ``tools`` and return its
     ``RunResult``. One turn by default; see the module docstring.
@@ -786,6 +1060,37 @@ async def run_prompt(
     ``omp_request_timeout`` is an optional per-request wait for OMP RPC calls,
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
+
+    ``work_timeout`` optionally bounds each active turn (startup, prompt
+    acknowledgement and tool settlement included). It never extends ``timeout``,
+    the hard total deadline. OMP alone currently supports safe live recovery:
+    abort must acknowledge, a real terminal boundary must arrive, the original
+    submission must settle and all host tools/results must finish, within
+    ``interrupt_timeout`` seconds. New tool calls are refused during settlement.
+    Unknown/failed interruption fails closed. Claude reports unsupported.
+
+    ``on_timeout(TimeoutContext) -> str | None`` may return a diagnostic user
+    prompt ONLY after a ``work_interval`` with ``interruption="safe"``. At most
+    ``max_timeout_recoveries`` such prompts are sent, on the identical live
+    child. No original prompt or successful write is replayed. Its immediate
+    clean ``on_turn_result`` continuation does not consume ``max_followups``.
+    Hard-deadline and prompt-RPC timeouts are observational callbacks only;
+    returned prompts are ignored. Callback failures are errors, never retries.
+    Cancellation propagates and never invokes this callback. Auth, infra,
+    provider/native limits and ordinary failures do not invoke it either.
+
+    ``state_dir`` opts into durable OMP conversation files plus a private
+    ``headless.json`` identity/turn manifest. On POSIX, an exclusive nonblocking
+    file lock prevents concurrent use. Nothing there is deleted by this API,
+    including on timeout/cancellation. ``resume=True`` explicitly opens that
+    native conversation and sends ``prompt`` as a NEW user turn; it never
+    replays the old task. Missing files, failed/mismatched native resumes and
+    incompatible state fail closed before any input. The same SDK session id
+    and reserved increasing turn numbers preserve usage event identities.
+    Results aggregate this invocation's turns, not earlier invocations.
+    Claude durable state/resume is not supported by this API. Without
+    ``state_dir`` the default remains temporary state, deleted at return.
+    Recovery metadata reports capability, not proof of native file integrity.
     ``system`` is appended to the backend's system prompt. ``thinking`` is
     ``low``, ``medium`` or ``high``; OMP also accepts ``xhigh``. ``None`` leaves
     the backend's own default unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
@@ -892,10 +1197,58 @@ async def run_prompt(
         on_turn_result,
         max_followups,
     )
+    for name, value in (("work_timeout", work_timeout), ("interrupt_timeout", interrupt_timeout)):
+        if value is None and name == "work_timeout":
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise ValueError("%s must be a finite positive number of seconds" % name)
+    if on_timeout is not None and not callable(on_timeout):
+        raise ValueError("on_timeout must be a callable taking one TimeoutContext")
+    if (isinstance(max_timeout_recoveries, bool) or not isinstance(max_timeout_recoveries, int)
+            or max_timeout_recoveries < 0):
+        raise ValueError("max_timeout_recoveries must be a nonnegative integer")
+    if not isinstance(resume, bool):
+        raise ValueError("resume must be a bool")
+    if state_dir is not None:
+        if not isinstance(state_dir, (str, os.PathLike)) or not os.fspath(state_dir):
+            raise ValueError("state_dir must be a non-empty directory path")
+        if backend != "omp":
+            raise ValueError("durable headless state is only supported with backend='omp'")
+    if resume and state_dir is None:
+        raise ValueError("resume requires state_dir")
+    started = asyncio.get_running_loop().time()
 
-    with tempfile.TemporaryDirectory(prefix="annealage-headless-") as state_dir:
+    with _conversation_state(state_dir, resume=resume, backend=backend, cwd=cwd) as state:
         bus = ViewerBus(ViewerRegistry(), url="")
         run = _Run(namespaced(product.current().mcp_server_name, ""), on_runtime=on_runtime)
+        def recovery_info():
+            return RecoveryInfo(
+                backend=backend,
+                session_id=state.data["session_id"],
+                state_dir=str(state.path) if state.durable else None,
+                conversation_file=state.data["conversation_file"] if state.durable else None,
+                resume_supported=backend == "omp" and state.durable,
+                live_recovery_supported=backend == "omp",
+            )
+
+        def timeout_context(kind, interruption):
+            elapsed = asyncio.get_running_loop().time() - started
+            return TimeoutContext(
+                kind=kind,
+                result=(
+                    run.turn_result() if kind == "rpc_request_timeout"
+                    else run.turn_result(stop_reason="timeout", error="timeout")
+                ),
+                elapsed=elapsed,
+                remaining=max(0, timeout - elapsed), interruption=interruption,
+                recovery=recovery_info(),
+                rpc_operation=getattr(run.session, "last_request_timeout", None),
+            )
+
+        if state.durable or work_timeout is not None or on_timeout is not None:
+            run.recovery = recovery_info
+        run.reserve_turn = state.reserve_turn
         server = ToolServer(
             [run.guard(t) for t in tools.tools],
             grading=tools.grading,
@@ -912,9 +1265,9 @@ async def run_prompt(
         # caller gave a sink, and then omp registers nothing extra.
         usage = UsageRecorder(usage_sink)
         bus.request_usage = usage.report
-        # Unique to this run: the usage event ids are built from it, and two
-        # runs in one process (or one meter) must not share them.
-        session_id = "headless-%s" % secrets.token_hex(8)
+        # Fresh runs have unique identities; explicit durable resumes retain
+        # that identity and reserve new turn indices before any submission.
+        session_id = state.data["session_id"]
         try:
             try:
                 session = _build_session(
@@ -927,7 +1280,7 @@ async def run_prompt(
                     model_role=model_role,
                     thinking=thinking,
                     cwd=cwd,
-                    state_dir=state_dir,
+                    state_dir=str(state.path),
                     instructions=system or None,
                     omp_agent_dir=omp_agent_dir,
                     omp_binary=omp_binary,
@@ -942,6 +1295,9 @@ async def run_prompt(
                     native_max_turns=native_max_turns,
                     on_owner=on_owner,
                     owner_context=owner_context,
+                    resume=state.data["conversation_file"] if resume else None,
+                    resume_turn=state.data["turn"],
+                    on_session_file=state.record_file,
                 )
             except Exception as exc:
                 # The backend's package missing (omp_rpc is installed apart), say.
@@ -950,11 +1306,33 @@ async def run_prompt(
             bus.end_turn_handler = getattr(session, "end_turn_after_tool", None)
 
             task = asyncio.ensure_future(
-                _drive(session, run, prompt, on_turn_result, max_followups)
+                _drive(
+                    session, run, prompt, on_turn_result, max_followups,
+                    work_timeout=work_timeout, interrupt_timeout=interrupt_timeout,
+                    on_timeout=on_timeout, max_timeout_recoveries=max_timeout_recoveries,
+                    timeout_context=timeout_context,
+                    deadline=started + timeout,
+                )
             )
             try:
-                await asyncio.wait({task}, timeout=timeout)
-                if not task.done():
+                remaining = max(0, timeout - (asyncio.get_running_loop().time() - started))
+                await asyncio.wait({task}, timeout=remaining)
+                if not task.done() or asyncio.get_running_loop().time() >= started + timeout:
+                    run.timeout_kind = "hard_deadline"
+                    run.end()
+                    broker.shutdown()
+                    await _cancelled(task)
+                    if on_timeout is not None and task.done():
+                        observer = asyncio.ensure_future(
+                            _timeout_callback(on_timeout, timeout_context("hard_deadline", "not_attempted"))
+                        )
+                        try:
+                            await asyncio.wait({observer}, timeout=interrupt_timeout)
+                            if observer.done():
+                                with contextlib.suppress(Exception):
+                                    observer.result()
+                        finally:
+                            await _cancelled(observer)
                     return run.result(stop_reason="timeout", error="timeout")
                 await task
                 return run.result()
@@ -965,7 +1343,9 @@ async def run_prompt(
                 run.end()
                 broker.shutdown()
                 await _cancelled(task)
-                await _close(session, kill=unfinished)
+                await _close(
+                    session, kill=unfinished or run.timeout_kind is not None or run.paused
+                )
                 if backend != "claude" and on_owner is not None and owner_context is not None:
                     try:
                         on_owner({"event": "native_termination", "outcome": "unverified"})

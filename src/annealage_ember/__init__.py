@@ -50,11 +50,11 @@ commit 59036ba). Comments that cite "plan section N", a ``planning/`` file or
 ``docs/agent-chat-plan.md`` refer to that repository's design records.
 """
 
-# ``run_prompt``, ``RunResult`` and ``ToolSet`` (``headless.py``) are the
-# package's one public import path for a headless run. They resolve on first
+# The headless API (``headless.py``) is the package's public import path for
+# batch runs and their timeout/recovery observations. Names resolve on first
 # use, because ``headless`` imports the Claude SDK and a viewer-only run, or
 # anything else that only imports a submodule, must not pay for that.
-_HEADLESS = ("run_prompt", "RunResult", "ToolSet")
+_HEADLESS = ("run_prompt", "RunResult", "ToolSet", "TimeoutContext", "RecoveryInfo")
 
 
 def __getattr__(name):

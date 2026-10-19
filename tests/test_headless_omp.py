@@ -660,3 +660,143 @@ async def test_a_builtin_tool_call_is_reported_by_omp_s_name(omp_client, tmp_pat
 
     assert result.calls == (("web_search", True),)
     assert result.text == "found"
+
+
+class DurableRpcClient(FakeRpcClient):
+    """Native persistence/switch seam, not an SDK-level replacement session."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.messages = []
+        self.switches = []
+        self.aborts = 0
+        self.session_file = str(
+            Path(kwargs["session_dir"]) / ("native-%s.jsonl" % len(self.instances))
+        )
+
+    def get_state(self):
+        state = super().get_state()
+        state.session_file = self.session_file
+        return state
+
+    def switch_session(self, path):
+        self.switches.append(path)
+        self.session_file = str(path)
+        return SimpleNamespace(cancelled=False)
+
+    def prompt(self, message, **kwargs):
+        Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.session_file, "a", encoding="utf-8") as output:
+            output.write(message + "\n")
+        self.messages.append(message)
+        return super().prompt(message, **kwargs)
+
+    def abort(self):
+        self.aborts += 1
+        self.end()
+
+
+async def test_native_timeout_recovery_uses_one_client_and_conversation(
+    omp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    contexts = []
+
+    def script(client):
+        if len(client.messages) == 1:
+            client.secret = "original conversation"
+            client.say("still working")
+        else:
+            assert client.secret == "original conversation"
+            client.say("clear_path" if len(client.messages) == 2 else "finished")
+            client.end()
+
+    omp_client.script = script
+    result = await run_prompt("original", **make_args(
+        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.05,
+        interrupt_timeout=1, max_timeout_recoveries=1,
+        on_timeout=lambda context: contexts.append(context) or "diagnose",
+        on_turn_result=lambda turn: "continue" if turn.text == "clear_path" else None,
+    ))
+    client, = omp_client.instances
+    assert client.messages == ["original", "diagnose", "continue"]
+    assert client.aborts == 1 and client.switches == []
+    assert contexts[0].interruption == "safe" and result.text == "finished"
+    assert result.error is None and Path(result.recovery.conversation_file).is_file()
+
+
+async def test_native_explicit_resume_switches_before_new_input_and_keeps_usage_identity(
+    omp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    reports = []
+
+    def script(client):
+        client._listeners["message_end"](SimpleNamespace(message={
+            "role": "assistant", "model": "model", "provider": "provider",
+            "responseId": "possibly-repeated-id",
+            "usage": {"input": 5, "output": 3, "cost": {"total": 0.01}},
+        }))
+        client.end()
+
+    omp_client.script = script
+    state_dir = tmp_path / "conversation"
+    first = await run_prompt("original", **make_args(
+        tmp_path, state_dir=state_dir, usage_sink=reports.append,
+    ))
+    second = await run_prompt(
+        "explicit new turn", **make_args(
+            tmp_path, state_dir=state_dir, resume=True, usage_sink=reports.append,
+        )
+    )
+    original, resumed = omp_client.instances
+    assert resumed.switches == [first.recovery.conversation_file]
+    assert resumed.messages == ["explicit new turn"] and original.messages == ["original"]
+    assert first.recovery.session_id == second.recovery.session_id
+    assert second.error is None
+    assert [report["turn_index"] for report in reports] == [1, 2]
+    assert len({report["session_id"] for report in reports}) == 1
+    assert len({report["event_id"] for report in reports}) == 2
+
+
+@pytest.mark.parametrize("failure", ("cancelled", "mismatched", "rpc_error"))
+async def test_native_resume_failure_never_submits_into_fresh_conversation(
+    omp_client, monkeypatch, tmp_path, failure
+):
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    omp_client.script = lambda client: client.end()
+    state_dir = tmp_path / "conversation"
+    first = await run_prompt("original", **make_args(tmp_path, state_dir=state_dir))
+
+    def refuse(self, path):
+        if failure == "rpc_error":
+            raise RuntimeError("native switch failed")
+        return SimpleNamespace(cancelled=failure == "cancelled")
+
+    monkeypatch.setattr(DurableRpcClient, "switch_session", refuse)
+    second = await run_prompt("must not run", **make_args(
+        tmp_path, state_dir=state_dir, resume=True,
+    ))
+    assert second.error is not None
+    assert omp_client.instances[-1].messages == []
+    assert Path(first.recovery.conversation_file).read_text() == "original\n"
+    assert second.recovery.session_id == first.recovery.session_id
+
+
+async def test_native_prompt_rpc_timeout_is_not_provider_work_timeout(
+    omp_client, monkeypatch, tmp_path
+):
+    from omp_rpc.client import RpcTimeoutError
+
+    def prompt(self, message, **kwargs):
+        raise RpcTimeoutError("prompt acknowledgement expired")
+
+    monkeypatch.setattr(FakeRpcClient, "prompt", prompt)
+    contexts = []
+    result = await run_prompt("original", **make_args(
+        tmp_path, on_timeout=lambda context: contexts.append(context) or "never retry",
+        work_timeout=1, max_timeout_recoveries=2,
+    ))
+    assert result.timeout_kind == "rpc_request_timeout"
+    assert contexts[0].kind == "rpc_request_timeout" and contexts[0].rpc_operation == "prompt"
+    assert result.error is not None and len(omp_client.instances) == 1

@@ -207,6 +207,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from omp_rpc import RpcClient, host_tool
+from omp_rpc.client import RpcTimeoutError
 
 from .. import hosted_state, product
 from ..tools import host_tool_name
@@ -296,6 +297,10 @@ class OmpSession:
     conversation directory, conversation file to resume, and the callback
     that records the conversation file `omp` reports. Without
     ``session_dir`` the conversation is not kept (``--no-session``).
+    ``strict_resume=True`` refuses missing/cancelled/failed switches or a
+    mismatched native conversation instead of falling back to a fresh one.
+    Headless durable resume uses it; interactive resume keeps its existing
+    best-effort default.
     ``login_command`` is the shell command, shown verbatim, that logs the
     profile in when a start fails for want of a model login; without it the
     session names `omp`'s own.
@@ -334,6 +339,7 @@ class OmpSession:
         binary: Optional[str] = None,
         session_dir=None,
         resume: Optional[str] = None,
+        strict_resume: bool = False,
         on_session_file=None,
         turn: int = 0,
         login_command: Optional[str] = None,
@@ -377,6 +383,8 @@ class OmpSession:
         self._binary = os.path.expanduser(binary) if binary else None
         self._session_dir = Path(session_dir) if session_dir is not None else None
         self._resume = resume or None
+        self._strict_resume = strict_resume
+        self.last_request_timeout = None
         self._on_session_file = on_session_file
         self._thinking = thinking
         self._provider_session_id = provider_session_id
@@ -573,6 +581,7 @@ class OmpSession:
                 AgentError(stderr="", remediation=turn_not_sent(self._status), viewer=viewer)
             )
             return
+        self.last_request_timeout = None
         self._next_input_turn += 1
         input_id = uuid.uuid4().hex
         turn = self._next_input_turn
@@ -606,6 +615,8 @@ class OmpSession:
             await self._run_blocking(self._client.prompt, message, images=images)
             self._emit(InputState(input_id, turn, "provider_ack"))
         except Exception as exc:
+            if isinstance(exc, (TimeoutError, RpcTimeoutError)):
+                self.last_request_timeout = "prompt"
             if self._automation_attempt_id is not None:
                 self._set_status(AGENT_UNAVAILABLE)
                 raise
@@ -690,6 +701,17 @@ class OmpSession:
             )
 
     async def interrupt(self) -> None:
+        await self._interrupt()
+
+    async def interrupt_for_timeout(self) -> bool:
+        """Acknowledge abort or fail closed; the host must still await TurnEnd.
+
+        Unlike the UI's best-effort interrupt, a failed RPC never authorizes
+        another headless turn. This does not certify tool/result settlement.
+        """
+        return await self._interrupt()
+
+    async def _interrupt(self) -> bool:
         """Deny every pending permission request before sending `omp`'s own
         ``abort``, not after -- the same ordering ``CodexSession.interrupt``
         uses and for the identical reason: a pending write-class approval or
@@ -702,7 +724,7 @@ class OmpSession:
         if self._automation_attempt_id is not None:
             self._automation_interrupted = True
         if self._client is None:
-            return
+            return False
         self._settle_queued_inputs("turn interrupted before provider submission")
         if self._broker is not None:
             # The agent's own requests: a card the human raised from the page
@@ -725,8 +747,10 @@ class OmpSession:
                     self._emit(InputState(self._active_input_id, self._turn, "uncertain", str(exc)))
                 self._fail(exc)
                 self._settle_queued_inputs("backend exited before queued input was sent")
-                return
+                return False
             sys.stderr.write("warning: interrupt failed: %r\n" % (exc,))
+            return False
+        return True
 
     async def set_model(self, model: str) -> None:
         """Switch `omp`'s live session model via the RPC `set_model` command.
@@ -884,10 +908,19 @@ class OmpSession:
             self._fail(exc, remediation=self._no_login_remediation(exc, env))
             return
         if self._resume:
-            await self._switch_to(self._resume)
+            try:
+                await self._switch_to(self._resume)
+            except Exception as exc:
+                self._fail(exc)
+                return
         state = None
         try:
             state = await self._run_blocking(self._client.get_state)
+            if self._strict_resume and (
+                not state.session_file
+                or os.path.realpath(state.session_file) != os.path.realpath(self._resume)
+            ):
+                raise RuntimeError("OMP did not retain the requested conversation file")
             self._remember_sdk_session(state.session_id)
             model = getattr(state, "model", None)
             actual_provider = _nonempty_string(getattr(model, "provider", None))
@@ -912,6 +945,9 @@ class OmpSession:
                 self._record_resolved_runtime(runtime)
             self._remember_session_file(state.session_file)
         except Exception as exc:
+            if self._strict_resume:
+                self._fail(exc)
+                return
             # A session that cannot read this still works; what it costs is
             # the hello frame's session id and a later -c resuming it.
             sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
@@ -997,6 +1033,8 @@ class OmpSession:
         writes it with the first message, so a session that never had one
         leaves no file behind."""
         if not await self._run_blocking(os.path.isfile, session_file):
+            if self._strict_resume:
+                raise RuntimeError("the requested OMP conversation file does not exist")
             return
         reason = None
         try:
@@ -1006,6 +1044,8 @@ class OmpSession:
         except Exception as exc:
             reason = "omp could not open %s (%s)" % (session_file, exc)
         if reason is not None:
+            if self._strict_resume:
+                raise RuntimeError(reason)
             self._start_usage_epoch()
             self._emit(
                 SessionReset(

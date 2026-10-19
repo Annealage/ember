@@ -476,7 +476,7 @@ result: RunResult = await run_prompt(
     model_role="smol",         # optional OMP role: smol, default or slow; cannot combine with model
     cwd=scratch_dir,           # an empty directory you own; only the backend's working directory
     timeout=300,              # seconds for the whole run
-    omp_request_timeout=180,   # optional OMP RPC wait, separate from the whole-run timeout
+    omp_request_timeout=30,    # optional RPC acknowledgement wait, NOT model generation time
     provider_session_id="request-affinity",  # optional opaque OMP affinity ID
     cache_retention="long",   # optional OMP cache policy: short, long or none
     system="Be terse.",       # optional, appended to the backend's system prompt
@@ -499,6 +499,79 @@ SDK backend rejects `xhigh` rather than silently translating it.
 On timeout or cancellation, the callback/turn task is cancelled and waited for up to 5 seconds, separately from the existing bounded tool drain and native-process close. A callback that suppresses cancellation can outlive this wait, but cannot authorize another submission after the run ends; like synchronous blocking tool code, its own external side effects cannot be forcibly stopped. Keep callbacks short and cancellation-cooperative.
 
 The final result aggregates `calls` and `tool_errors` in order and sums reported per-turn cost/token dimensions. A dimension unknown in any turn remains unknown (`None`), not zero; per-request usage is not counted again. Native turn counts are summed when reported for every turn. Text and stop reason describe the last turn, including a partial correction on failure. The callback always receives a **per-turn**, not cumulative, result. The per-request usage sink retains one run/session identity with distinct positional turn/request event IDs across corrections.
+
+Timeout recovery is separately opt-in:
+
+```python
+result = await run_prompt(
+    prompt, tools=tools, backend="omp", model=None, cwd=scratch_dir,
+    timeout=1800,                  # hard total: startup, all turns and callbacks
+    work_timeout=600,              # optional active-turn interval; default None
+    interrupt_timeout=10,          # bounded tool/result drain + native abort
+    on_timeout=diagnose_timeout,   # TimeoutContext -> diagnostic str | None; async allowed
+    max_timeout_recoveries=2,      # default 0: no diagnostic submissions
+    on_turn_result=inspect_turn, max_followups=2,
+    state_dir=conversation_dir,    # optional; retain native conversation on every exit
+)
+```
+
+The OMP recovery path refuses new host tool calls, lets existing handlers
+**and their native tool results** settle before aborting, then requires an
+acknowledged abort, the original submission to settle and a true terminal turn
+boundary. All this must fit within `interrupt_timeout`; a failed, missing or
+unknown acknowledgement/boundary fails closed. It never cancels a successful
+write just to resume the child, replays an original prompt or tool call, retries
+a provider failure, replaces the live session, or renews the hard deadline.
+An interval longer than the hard deadline is valid: the hard deadline wins.
+Hard termination still cancels unfinished handlers; synchronous blocking code
+cannot be forcibly stopped. Cleanup has its existing bounded grace outside
+the execution deadline.
+
+`TimeoutContext` and `RecoveryInfo` are public package-root imports. A context
+contains `kind` (`work_interval`, `hard_deadline`, `rpc_request_timeout`),
+`result` (the partial per-turn result), `elapsed`, `remaining`,
+`interruption` (`safe`, `unsafe`, `unsupported`, `not_attempted`), `recovery`,
+and nullable `rpc_operation` (currently `prompt`). Context results can contain
+confidential text and tool errors; journal only the metadata you need.
+`on_timeout` can authorize a diagnostic **only** for a safe work interval and
+within `max_timeout_recoveries`. Other invocations are observational; returned
+text is ignored. Cancellation propagates without invoking it; authentication,
+infrastructure/provider failures, native limits and ordinary errors are not
+timeout recovery candidates. Prompt-RPC timeout means an uncertain
+acknowledgement, not model generation taking too long: it is never retried.
+
+The diagnostic's immediate clean `on_turn_result` continuation does not charge
+the ordinary `max_followups` correction budget. Both budgets and the hard
+deadline bound the total conversation. The host still decides whether a
+diagnostic actually demonstrates progress and whether a final submission is
+valid; Ember adds no progress, source-authority or submission-validation policy.
+`RunResult.timeout_kind` distinguishes terminal timeouts; `None` on a successful
+recovery is not a claim that no interval elapsed. Record timeout observations
+in the callback when that history matters. `RunResult.recovery` is populated
+when durable state, intervals or the timeout callback are requested.
+
+Durable state is OMP-only and POSIX-only here. `state_dir` contains a private
+`headless.json` manifest and OMP's native conversation files; an exclusive
+nonblocking file lock prevents concurrent SDK use. No state there is removed
+on success, timeout, unsafe interruption or cancellation. A later
+`run_prompt(new_input, ..., state_dir=the_same_dir, resume=True)` explicitly
+switches the backend to that native conversation **before** sending new input.
+It does not replay an interrupted task, and it is not an automatic crash-retry
+mechanism. A missing/corrupt/incompatible manifest, missing native file,
+cancelled native switch or mismatched native conversation fails closed;
+without `resume=True` an existing manifest is never overwritten. Native files
+are backend-managed: retained state is not proof of a complete transcript or
+committed tool result. Reconcile host state before an explicit resume.
+
+`RecoveryInfo` reports `backend`, stable SDK `session_id`, nullable `state_dir`
+and `conversation_file`, `resume_supported` and `live_recovery_supported`.
+Explicit durable resumes retain SDK telemetry identity and reserve increasing
+turn numbers before submission, preventing usage-event ID reuse even after an
+uncertain acknowledgement. Returned usage totals cover this invocation only.
+Claude retains its temporary/no-persistence default: safe timeout interruption
+and durable headless resume are reported unsupported, not emulated through a
+replacement child.
+
 
 `run_prompt(..., model_role="smol")`, or `"default"` / `"slow"`, asks OMP to resolve that role using its configured role settings, including profile and environment overrides. The alias is passed to OMP's own model resolver; Ember doesn't map role names to model IDs. Missing or unusable role configuration returns as a backend error, not the ordinary model default. Use a separate `model_role="default"` call if that's the fallback you want. `model_role` can't be combined with `model` and isn't supported with Claude because Ember has no Claude role mapping.
 `RunResult.role_resolution_error` is true only for OMP's explicit `Model "@<role>" not found` startup failure, before a provider request; auth, network, provider and tool failures leave it false. A caller can use that typed flag for a deliberate fallback call without retrying ordinary failed work.
