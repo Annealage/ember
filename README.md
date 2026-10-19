@@ -421,6 +421,45 @@ A packaged static tree (the agent layer's and a product's own `/static/`) serves
 
 The product can move comments itself: `store.update_anchors(move)` calls `move(comment)` for each comment, which returns its new anchor or `None` to leave it, and writes every move at once under the file's lock, announcing the change once. The anchors are stored as `move` gives them, not validated again. Loom uses it to keep a pin on the part it was placed on when a build moves the part. `JsonReviewStore` supports it (`Capabilities.can_update_anchors`); a store over a product's own format refuses it.
 
+Saving a comment does **not** notify the coordinator. In agent mode,
+`POST /review/notify` explicitly requests notification for saved human comments:
+`{"comment_ids":[1,2]}` (1–100 unique positive integer IDs). It uses browser
+authentication, and hosted callers need both `project.comment` and `project.exec`.
+Success is `{"ok":true,"status":"queued"|"sent","notification_ids":[...],"comment_ids":[...]}`.
+Failures return non-2xx with `{"ok":false,"error":"..."}`; keep the saved IDs and
+retry only notification, never save another copy of the comment.
+
+Notification identity is durable per project/review and saved comment, across
+batches, reconnects and session resumes. A delivered comment is not sent again,
+even after resolving/reopening it. An active coordinator is never interrupted:
+pending comments from the same sender coalesce for its next idle boundary, using
+the ordinary human-turn lock, admission checks and turn-start callbacks. The
+message records sender, IDs, current anchors and review revision and asks the
+agent to fetch current text/state with `list_comments`. Entries deleted or
+resolved while queued are skipped; no stale text is delivered. A resolved entry
+that was never delivered can be explicitly retried after reopening.
+
+The outbox lives beside project session state in
+`review-notifications-<review-scope>.json`, not in the review file, and runs with
+the existing app lifecycle. `UserTurn.review_notification_ids` retains the
+delivery identity in conversation replay. Intent is durably fenced before
+dispatch: uncertain delivery (including a crash during submission) is never
+automatically replayed; the error asks the human to inspect the conversation.
+Saving, moving, resolving and watching comments or adding agent callouts never
+create notification intent. Notifications are ordinary user requests, not stage
+acceptance, authority or budget grants. Products can supply
+`bus.review_notification_refusal()` for their existing recovery/stop gates.
+
+`GET /review` adds optional `notification: {id, status, error?}` to comments
+with durable notification history. Status is `queued`, `sent`, `skipped`,
+`uncertain`, or `error` (a definitive preadmission failure awaiting explicit
+retry). It exposes no stored sender claims. Reading this state never wakes the
+agent or changes the review file. Intent/outcome changes publish `review_changed`
+so existing clients refetch, including when a queued delivery later fails.
+Reconnects read the same durable state. An unreadable notification ledger adds
+an actionable notification error to saved human comments without hiding their
+text; the review store's own unreadable-file behavior is unchanged.
+
 ## Guides
 
 `annealage_ember.guides` serves a product's long-form guidance to the agent on demand, so the system prompt only has to name it. `GuideSet(skills_dir, names=(...), extra={name: (description, loader)})` is the product's set: each of `names` is a skill at `<skills_dir>/<name>/SKILL.md` (its description is the `description` key of the file's YAML front matter, folded to one line), and each extra is a guide that isn't a file of that shape, a rules document or a module's docstring, with its one-line description and a `loader()` that returns the text. The text is read from the product's own install, never from the served directory, so a project can't plant its own.

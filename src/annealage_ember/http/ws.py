@@ -686,7 +686,26 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
         await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
 
 
-async def _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records=None):
+def turn_refusal(session, bus=None):
+    """The ordinary human-turn gate, shared with explicit review notifications."""
+    refusal_reader = getattr(bus, "manual_turn_refusal", None)
+    blocked_reason = refusal_reader() if callable(refusal_reader) else None
+    automation_reader = getattr(session, "automation_metadata", None)
+    if blocked_reason is None and callable(automation_reader):
+        automation = automation_reader()
+        if isinstance(automation, dict) and automation.get("inflight") is True:
+            blocked_reason = "Automatic continuation is active; pause it or wait before sending a message."
+    admission_reader = getattr(session, "turn_refusal", None)
+    if blocked_reason is None and callable(admission_reader):
+        blocked_reason = admission_reader()
+    if blocked_reason is None and session.agent_status() != AGENT_READY:
+        blocked_reason = "the agent is %s, so this message was not sent" % session.agent_status()
+    return blocked_reason
+
+
+async def _submit_turn_locked(
+    ws, conn, registry, event_log, frame, session, bus, records=None, *, on_admitted=None
+):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
     Counted, and the product's queued notes put in front of it, here in front
@@ -716,29 +735,12 @@ async def _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus
     """
     blocks = frame["blocks"]
     client_id = frame.get("client_id")
-    refusal_reader = getattr(bus, "manual_turn_refusal", None) if bus is not None else None
-    blocked_reason = refusal_reader() if callable(refusal_reader) else None
-    automation_reader = getattr(session, "automation_metadata", None)
-    if blocked_reason is None and callable(automation_reader):
-        automation = automation_reader()
-        if isinstance(automation, dict) and automation.get("inflight") is True:
-            blocked_reason = "Automatic continuation is active; pause it or wait before sending a message."
-    admission_reader = getattr(session, "turn_refusal", None)
-    if blocked_reason is None and callable(admission_reader):
-        blocked_reason = admission_reader()
+    blocked_reason = turn_refusal(session, bus)
     if blocked_reason is not None:
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
-    status = session.agent_status()
-    if status != AGENT_READY:
-        await ws.send(
-            json.dumps(
-                protocol.build_refused(
-                    "the agent is %s, so this message was not sent" % status, client_id
-                )
-            )
-        )
-        return
+    if on_admitted is not None:
+        on_admitted()
     turn = None
     if bus is not None:
         blocks_to_send = bus.begin_turn(blocks, by=conn.human)
@@ -755,6 +757,7 @@ async def _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus
                 by=_login(conn),
                 principal_id=who[0] if who else None,
                 display=who[1] if who else None,
+                review_notification_ids=frame.get("review_notification_ids"),
             ),
         )
         bus.mark_turn_submitted(turn)

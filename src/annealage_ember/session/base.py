@@ -543,6 +543,8 @@ class ReviewChanged(AgentEvent):
     in the page to one writer; putting the changed content here would give it
     a second. Generic rather than a product's own event, so every product's
     page reacts to the same kind and none hand-rolls its own.
+    Explicit notification intent/outcome changes also publish this event, so
+    the refetch shows durable delivery state without editing the review file.
     """
 
     kind: ClassVar[str] = "review_changed"
@@ -591,6 +593,10 @@ class UserTurn(AgentEvent):
     ``automation_source`` is the explicit, product-originated source for
     automatic turns; it is absent on human turns and is never inferred from
     ``by=None``.
+
+    ``review_notification_ids`` identifies an explicit human request about saved
+    comments. It is retained through replay; it is not an automatic turn source
+    or any workflow authority.
     """
 
     kind: ClassVar[str] = "user_turn"
@@ -602,6 +608,7 @@ class UserTurn(AgentEvent):
     principal_id: Optional[str] = None
     display: Optional[str] = None
     automation_source: Optional[str] = None
+    review_notification_ids: Optional[list[str]] = None
 
 
 #: Every event kind the agent layer emits itself. A product's own event

@@ -799,6 +799,16 @@ def create_app(
     else:
         session = _make_session(build_session)
         holder.install(session)
+    app.agent_review_notifications = None
+    if review_store is not None and session_id is not None:
+        from .review.notifications import ReviewNotifications
+
+        scope = str(Path(getattr(review_store, "path", serve_dir)).resolve())
+        scope_key = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+        app.agent_review_notifications = ReviewNotifications(
+            app, store=review_store, auth=auth, recorder=recorder, scope=scope,
+            path=sessions.state_dir(state_project_dir) / ("review-notifications-%s.json" % scope_key),
+        )
     # A tool result's end_turn (tools.ok) reaches whichever session is live
     # then; a session that cannot stop a turn has nothing to call.
     bus.end_turn_handler = holder.end_turn
@@ -1627,6 +1637,9 @@ class AgentHolder:
         tasks.append(asyncio.ensure_future(ping_forever(self._registry)))
         if self._review_watcher is not None:
             tasks.append(asyncio.ensure_future(self._review_watcher.run()))
+        notifications = getattr(self._app, "agent_review_notifications", None)
+        if notifications is not None:
+            tasks.append(asyncio.ensure_future(notifications.run()))
         if (
             (self.session is not None or self.closed)
             and self._tools is not None

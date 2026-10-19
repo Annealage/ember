@@ -12,8 +12,10 @@ Registers, whether or not the product keeps a review:
                          to reopen it or ``{"status": "resolved"}`` to
                          resolve it, when the capabilities say the page does
                          (``human_sets_status``)
+    POST /review/notify  explicitly send saved human comment ids to the coordinator;
+                         ``{"comment_ids": [1, 2]}``, idempotent per saved comment
 
-All three go through the app's ``identity.BrowserAuth`` (a permitted
+All four go through the app's ``identity.BrowserAuth`` (a permitted
 ``Origin``, then a tailnet login or the browser token) and refuse with the same
 opaque response ``/ws`` returns, so none tells an unauthenticated caller which
 check it failed. The review is the human's words about their project, so it is
@@ -30,7 +32,7 @@ A product with no review store still has the routes, answering 404: the
 route list is the agent layer's own, the same for every product, which is also
 what lets the page client name ``/review`` without naming a product route.
 
-A POST changes nothing but the store: the store notifies its listeners, the
+A comment/status POST changes nothing but the store: the store notifies its listeners, the
 app's ``ReviewWatcher`` publishes ``review_changed``, and every page, the one
 that posted included, refetches through ``GET``. The POST's own answer carries
 the comment as it now stands so the page that posted it can show it before
@@ -79,12 +81,59 @@ def register_review_routes(app, *, store, auth, recorder=None):
             # hand, reported as such rather than as an empty review, which a
             # page would render as "no comments" over the top of theirs.
             return {"ok": False, "error": str(exc)}, 409
+        delivery = {}
+        notifications = getattr(app, "agent_review_notifications", None)
+        if notifications is not None:
+            try:
+                delivery = await loop.run_in_executor(None, notifications.annotations)
+            except (ReviewError, OSError) as exc:
+                # Notification state is secondary. A bad outbox must never hide
+                # the saved human review or turn it into an empty collection.
+                delivery = {
+                    comment.id: {
+                        "id": notifications.ledger.identity(comment.id),
+                        "status": "error",
+                        "error": "Notification status unavailable; saved comment is intact. " + str(exc),
+                    }
+                    for comment in listing.comments
+                    if comment.author == HUMAN and comment.id is not None
+                }
         return {
             "ok": True,
             "anchor_space": store.anchor_space.name,
             "capabilities": store.capabilities.to_wire(),
-            "comments": [comment.to_wire() for comment in listing.comments],
+            "comments": [
+                {**comment.to_wire(), **(
+                    {"notification": delivery[comment.id]} if comment.id in delivery else {}
+                )}
+                for comment in listing.comments
+            ],
         }, 200
+
+    @app.post("/review/notify")
+    async def notify_review_comments(req):
+        human = auth.authenticate(req, "project.comment")
+        if human is None or not auth.permits(human, "project.exec"):
+            return refusal()
+        if store is None:
+            return _no_review()
+        data, error = await read_json_body(req)
+        if error is not None:
+            return error
+        if not isinstance(data, dict) or set(data) != {"comment_ids"}:
+            return {"ok": False, "error": 'body must be {"comment_ids": [saved comment id, ...]}'}, 400
+        ids = data["comment_ids"]
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 100
+                or any(type(value) is not int or value < 1 for value in ids)
+                or len(set(ids)) != len(ids)):
+            return {"ok": False, "error": "comment_ids must contain 1 to 100 unique positive integer ids"}, 400
+        notifications = getattr(app, "agent_review_notifications", None)
+        if notifications is None:
+            return {"ok": False, "error": "No coordinator is attached; start an agent session, then retry notification."}, 409
+        try:
+            return await notifications.notify(sorted(ids), human), 200
+        except (ReviewError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}, 409
 
     @app.post("/review")
     async def add_review_comment(req):
