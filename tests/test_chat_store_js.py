@@ -48,7 +48,7 @@ store.queueChatUserTurn("c-mine", text("second try"));
 store.setChatUserTurn(2, text("second try"), "c-mine");
 out.pendingAfterEcho = chat().pendingUser.length;
 store.appendChatTextDelta(2, "On it.");
-out.turn2 = { user: turn(2).user, text: turn(2).text };
+out.turn2 = { user: turn(2).user, segments: turn(2).segments };
 
 // A turn with no user_turn (a history from before the server logged them)
 // shows no human side, rather than borrowing a pending message.
@@ -60,6 +60,31 @@ out.turn3User = turn(3).user;
 // handed back once, and nothing is left pending.
 out.lateHandedBack = store.dropChatUserTurn("c-late");
 out.pendingAfterSettling = chat().pendingUser.length;
+
+// Canonical chronology: results are updates, not newly appended activity.
+store.appendChatTextDelta(4, "Alpha");
+store.appendChatTextDelta(4, ".");
+store.addChatToolUse(4, "a1", "read", { file: "first" });
+store.setChatToolResult("a1", false, "early");
+store.appendChatTextDelta(4, "");
+store.addChatToolUse(4, "a2", "read", { file: "second" });
+store.appendChatTextDelta(4, "Beta.");
+store.addChatToolUse(4, "b1", "write", { file: "third" });
+store.appendChatTextDelta(4, "Gamma.");
+store.addChatToolUse(5, "next-turn", "read", {});
+const before = turn(4).segments;
+const otherTurn = turn(5);
+store.setChatToolResult("a1", true, "late earlier result");
+store.addChatToolUse(4, "a1", "read", { file: "duplicate must not move" });
+const after = turn(4).segments;
+out.orderedSegments = after;
+out.originalResultUnchanged = before[1].tools[0].result;
+out.onlyOriginalRunUpdated = after.map((s, i) => s === before[i]);
+out.otherTurnUnchanged = turn(5) === otherTurn;
+out.frozenSegments = Object.isFrozen(after) && after.every((s) => (
+  Object.isFrozen(s) && (s.kind !== "tools" || Object.isFrozen(s.tools)
+    && s.tools.every((t) => Object.isFrozen(t) && (!t.result || Object.isFrozen(t.result))))
+));
 
 console.log(JSON.stringify(out));
 """
@@ -91,7 +116,7 @@ def test_the_server_s_echo_retires_this_tab_s_pending_copy(observed):
     assert observed["pendingAfterEcho"] == 0
     assert observed["turn2"] == {
         "user": [{"type": "text", "text": "second try"}],
-        "text": "On it.",
+        "segments": [{"kind": "text", "text": "On it."}],
     }
 
 
@@ -102,3 +127,22 @@ def test_a_turn_without_a_user_turn_borrows_no_pending_message(observed):
 def test_a_message_that_never_arrived_is_handed_back(observed):
     assert observed["lateHandedBack"] == [{"type": "text", "text": "never answered"}]
     assert observed["pendingAfterSettling"] == 0
+
+
+def test_segments_keep_text_and_contiguous_tool_runs_in_event_order(observed):
+    segments = observed["orderedSegments"]
+    assert [s["kind"] for s in segments] == ["text", "tools", "text", "tools", "text"]
+    assert [s["text"] for s in segments if s["kind"] == "text"] == [
+        "Alpha.", "Beta.", "Gamma.",
+    ]
+    assert [[t["tool_use_id"] for t in s["tools"]] for s in segments if s["kind"] == "tools"] == [
+        ["a1", "a2"], ["b1"],
+    ]
+    assert segments[1]["tools"][0]["input"] == {"file": "first"}
+    assert segments[1]["tools"][0]["result"] == {
+        "isError": True, "text": "late earlier result",
+    }
+    assert observed["originalResultUnchanged"] == {"isError": False, "text": "early"}
+    assert observed["onlyOriginalRunUpdated"] == [True, False, True, True, True]
+    assert observed["otherTurnUnchanged"] is True
+    assert observed["frozenSegments"] is True

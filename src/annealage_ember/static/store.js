@@ -54,11 +54,13 @@
  *   chat          {turns, pendingUser, pending, agentStatus, model, models,
  *                  banner, attachments, usage}
  *                 the whole chat pane's state.
- *                 `{turn, user, text, tools, errors, stopReason, costUsd, complete,
+ *                 `{turn, user, segments, errors, stopReason, costUsd, complete,
  *                 inputState, inputDetail}`, built by conversation and
- *                 input_state events; `tools` is `[{tool_use_id, name, input,
- *                 result}]` with `result` null until a tool_result names
- *                 that tool_use_id. `user` is the blocks the human sent as
+ *                 input_state events. `segments` is the ordered transcript:
+ *                 `{kind: "text", text}` or `{kind: "tools", tools}`, grouping
+ *                 only adjacent activity. Each tool has `{tool_use_id, name,
+ *                 input, result}`; a result updates that original tool without
+ *                 changing segment order. `user` is the blocks the human sent as
  *                 that turn, from its `user_turn` event: the one source of
  *                 a turn's human side, in the tab that sent it, every
  *                 other tab and every replay alike, so it shows once
@@ -317,8 +319,7 @@ function ensureTurn(chat, turn) {
   const record = Object.freeze({
     turn,
     user: null,
-    text: "",
-    tools: Object.freeze([]),
+    segments: Object.freeze([]),
     errors: Object.freeze([]),
     stopReason: null,
     costUsd: null,
@@ -370,12 +371,28 @@ function setChatUserTurn(turn, blocks, clientId = null, automationSource = null)
   }, ["chat"]);
 }
 
+// Adjacent activity of the same kind extends its existing segment. Results
+// never enter this stream: they update the original tool at its original slot.
+function appendSegment(segments, segment) {
+  const last = segments[segments.length - 1];
+  if (last?.kind !== segment.kind) {
+    return Object.freeze([...segments, Object.freeze(segment)]);
+  }
+  const merged = segment.kind === "text"
+    ? { kind: "text", text: last.text + segment.text }
+    : { kind: "tools", tools: Object.freeze([...last.tools, ...segment.tools]) };
+  return Object.freeze([...segments.slice(0, -1), Object.freeze(merged)]);
+}
+
 function appendChatTextDelta(turn, text) {
+  if (!text) return;
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
-      turns.map((t, i) => (i === idx ? Object.freeze({ ...t, text: t.text + text }) : t)),
+      turns.map((t, i) => (i === idx ? Object.freeze({
+        ...t, segments: appendSegment(t.segments, { kind: "text", text }),
+      }) : t)),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
   }, ["chat"]);
@@ -401,34 +418,41 @@ function addChatToolUse(turn, toolUseId, name, input) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
+    if (turns[idx].segments.some((segment) => segment.kind === "tools"
+        && segment.tools.some((tool) => tool.tool_use_id === toolUseId))) return;
     const tool = Object.freeze({ tool_use_id: toolUseId, name, input, result: null });
     const nextTurns = Object.freeze(
       turns.map((t, i) =>
-        i === idx ? Object.freeze({ ...t, tools: Object.freeze([...t.tools, tool]) }) : t,
+        i === idx ? Object.freeze({
+          ...t,
+          segments: appendSegment(t.segments, { kind: "tools", tools: Object.freeze([tool]) }),
+        }) : t,
       ),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
   }, ["chat"]);
 }
 
-// Attaches a tool's result to the tool_use record it belongs to, wherever in
-// `turns` that record is; a tool_result's frame carries only the
-// tool_use_id, not the turn number, so every turn is searched rather than
-// assuming the result lands in the same turn its tool_use did.
+// A result updates only the segment that owns its tool_use_id, even after
+// later text, another tool run, or a newer turn has arrived.
 function setChatToolResult(toolUseId, isError, text) {
   commit(() => {
     const chat = state.chat;
     const turns = Object.freeze(
       chat.turns.map((t) => {
-        if (!t.tools.some((tool) => tool.tool_use_id === toolUseId)) return t;
-        const tools = Object.freeze(
-          t.tools.map((tool) =>
+        let changed = false;
+        const segments = t.segments.map((segment) => {
+          if (segment.kind !== "tools"
+              || !segment.tools.some((tool) => tool.tool_use_id === toolUseId)) return segment;
+          changed = true;
+          const tools = Object.freeze(segment.tools.map((tool) => (
             tool.tool_use_id === toolUseId
               ? Object.freeze({ ...tool, result: Object.freeze({ isError: !!isError, text }) })
-              : tool,
-          ),
-        );
-        return Object.freeze({ ...t, tools });
+              : tool
+          )));
+          return Object.freeze({ ...segment, tools });
+        });
+        return changed ? Object.freeze({ ...t, segments: Object.freeze(segments) }) : t;
       }),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns }) };

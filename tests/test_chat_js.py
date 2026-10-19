@@ -349,7 +349,7 @@ chat.handleEvent({ kind: "input_state", turn: 2, state: "provider_ack" });
 out.errorAfterAck = store.getState().chat.banner;
 out.errorHistory = store.getState().chat.turns.find((t) => t.turn === 1).errors;
 const recoveryRow = (n) => [...el("chatLog").children].reverse().find((r) => r.dataset.turn === String(n));
-out.errorHistoryVisible = recoveryRow(1).children[1].children[2].children[0].children.map((n) => n.textContent);
+out.errorHistoryVisible = recoveryRow(1).children[1].children[1].children[0].children.map((n) => n.textContent);
 
 out.activityRecovery = [];
 for (const event of [
@@ -386,12 +386,13 @@ for (let i = 0; i < 120; i++) {
   chat.handleEvent({ kind: "tool_use", turn: 2, tool_use_id: "long-" + i, name: "read", input: { i } });
   chat.handleEvent({ kind: "tool_result", tool_use_id: "long-" + i, is_error: i === 4, text: "result " + i });
 }
-const group = recoveryRow(2).children[1].children[1];
+const segmentContainer = (n) => recoveryRow(n).children[1].children[0];
+const group = segmentContainer(2).children[0];
 const tools = group.children[1];
 out.toolGroup = {
   tag: group.tagName, className: group.className, collapsed: !group.open,
   summary: group.children[0].textContent, count: tools.children.length,
-  nextTurnTools: recoveryRow(3).children[1].children[1].children[1].children.length,
+  nextTurnTools: segmentContainer(3).children.length,
 };
 group.open = true;
 group.listeners.toggle[0]();
@@ -422,6 +423,67 @@ log.scrollTop = 1800;
 log.listeners.scroll[0]();
 chat.handleEvent({ kind: "text_delta", turn: 2, text: " Following." });
 out.followingScrollTop = log.scrollTop;
+
+// Two tool runs must stay BETWEEN their surrounding prose, not collected at
+// the bottom. Empty text and result events do not split adjacent calls.
+chat.handleHello({ id: "inline", agent: "ready", agent_error: null });
+chat.handleEvent(user(9));
+chat.handleEvent({ kind: "text_delta", turn: 9, text: "Alpha" });
+chat.handleEvent({ kind: "text_delta", turn: 9, text: "." });
+chat.handleEvent({ kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: { a: 1 } });
+chat.handleEvent({ kind: "tool_result", tool_use_id: "a1", is_error: false, text: "early" });
+chat.handleEvent({ kind: "text_delta", turn: 9, text: "" });
+chat.handleEvent({ kind: "tool_use", turn: 9, tool_use_id: "a2", name: "read", input: { a: 2 } });
+chat.handleEvent({ kind: "text_delta", turn: 9, text: "Beta." });
+chat.handleEvent({ kind: "tool_use", turn: 9, tool_use_id: "b1", name: "write", input: { b: 1 } });
+chat.handleEvent({ kind: "text_delta", turn: 9, text: "Gamma." });
+const orderedNodes = [...segmentContainer(9).children];
+const runA = orderedNodes[1];
+const runB = orderedNodes[3];
+const cardA = runA.children[1].children[0];
+runA.open = true; cardA.open = true;
+runA.listeners.toggle[0]();
+runA.children[1].scrollTop = 42;
+cardA.children[2].scrollTop = 17;
+chat.handleEvent(user(10));
+chat.handleEvent({ kind: "tool_use", turn: 10, tool_use_id: "next", name: "read", input: {} });
+chat.handleEvent({ kind: "tool_result", tool_use_id: "a1", is_error: true, text: "late earlier result" });
+chat.handleEvent({ kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: {} }, { replayed: true });
+chat.handleEvent({ kind: "tool_result", tool_use_id: "a2", is_error: false, text: "second result" });
+out.inlineOrder = segmentContainer(9).children.map((n) => n.className === "text"
+  ? "text:" + n.innerHTML
+  : "tools:" + n.children[1].children.map((c) => c.dataset.toolId).join(","));
+out.inlineLateResult = {
+  sameNodes: segmentContainer(9).children.length === orderedNodes.length
+    && orderedNodes.every((n, i) => segmentContainer(9).children[i] === n),
+  sameCard: runA.children[1].children[0] === cardA,
+  result: cardA.children[2].textContent,
+  summaryA: runA.children[0].textContent,
+  summaryB: runB.children[0].textContent,
+  inspector: [runA.open, cardA.open, runA.children[1].scrollTop, cardA.children[2].scrollTop],
+  nextTurn: segmentContainer(10).children[0].children[1].children.map((c) => c.dataset.toolId),
+};
+
+chat.handleHello({ id: "inline-replay", agent: "ready", agent_error: null });
+for (const event of [
+  user(9),
+  { kind: "text_delta", turn: 9, text: "Alpha." },
+  { kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: {} },
+  { kind: "text_delta", turn: 9, text: "" },
+  { kind: "tool_result", tool_use_id: "a1", is_error: false, text: "early" },
+  { kind: "tool_use", turn: 9, tool_use_id: "a2", name: "read", input: {} },
+  { kind: "text_delta", turn: 9, text: "Beta." },
+  { kind: "tool_use", turn: 9, tool_use_id: "b1", name: "write", input: {} },
+  { kind: "text_delta", turn: 9, text: "Gamma." },
+  user(10),
+  { kind: "tool_use", turn: 10, tool_use_id: "next", name: "read", input: {} },
+  { kind: "tool_result", tool_use_id: "a1", is_error: true, text: "late earlier result" },
+  { kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: {} },
+]) chat.handleEvent(event, { replayed: true });
+out.inlineReplayOrder = segmentContainer(9).children.map((n) => n.className === "text"
+  ? "text:" + n.innerHTML
+  : "tools:" + n.children[1].children.map((c) => c.dataset.toolId).join(","));
+out.inlineReplayResult = segmentContainer(9).children[1].children[1].children[0].children[2].textContent;
 
 sent.length = 0;
 const modelLessRoot = {
@@ -640,3 +702,20 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
     assert observed["inspectionPreserved"] == [True, True, 92, 37, 240]
     assert observed["anchoredScrollTop"] == 300
     assert observed["followingScrollTop"] == 2000
+
+
+def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
+    assert observed["inlineOrder"] == [
+        "text:Alpha.", "tools:a1,a2", "text:Beta.", "tools:b1", "text:Gamma.",
+    ]
+    assert observed["inlineLateResult"] == {
+        "sameNodes": True,
+        "sameCard": True,
+        "result": "late earlier result",
+        "summaryA": "2 tool calls · 1 failed",
+        "summaryB": "1 tool call · 1 running",
+        "inspector": [True, True, 42, 17],
+        "nextTurn": ["next"],
+    }
+    assert observed["inlineReplayOrder"] == observed["inlineOrder"]
+    assert observed["inlineReplayResult"] == "late earlier result"

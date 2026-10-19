@@ -92,8 +92,8 @@
 .msg .text pre.code { background: #0d1013; border: 1px solid #262b33; border-radius: 5px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; }
 .msg .text code { background: #0d1013; border-radius: 3px; padding: 1px 4px; font-size: 12px; }
 
-.toolgroup { margin-top: 6px; border: 1px solid #2f343d; border-radius: 6px; }
-.toolgroup[hidden] { display: none; }
+.segments > * + * { margin-top: 6px; }
+.toolgroup { border: 1px solid #2f343d; border-radius: 6px; }
 .toolgroup > summary { cursor: pointer; padding: 6px 9px; font-size: 12px; color: #9cd; }
 .tools { display: flex; flex-direction: column; gap: 6px; max-height: min(24rem, 45vh); overflow-y: auto; overscroll-behavior: contain; padding: 6px; }
 .toolcard { flex: none; border: 1px solid #2f343d; border-radius: 6px; background: #161a20; }

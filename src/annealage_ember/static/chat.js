@@ -791,23 +791,13 @@ export function initChat({
 
     const assistantEl = document.createElement("div");
     assistantEl.className = "msg assistant";
-    const textEl = document.createElement("div");
-    textEl.className = "text";
-    const toolGroup = document.createElement("details");
-    toolGroup.className = "toolgroup";
-    toolGroup.hidden = true;
-    const toolSummary = document.createElement("summary");
-    toolGroup.appendChild(toolSummary);
-    inspectDisclosure(toolGroup);
-    const toolsEl = document.createElement("div");
-    toolsEl.className = "tools";
-    toolGroup.appendChild(toolsEl);
+    const segmentsEl = document.createElement("div");
+    segmentsEl.className = "segments";
     const errorsEl = document.createElement("div");
     errorsEl.className = "turnerrors";
     const metaEl = document.createElement("div");
     metaEl.className = "turnmeta";
-    assistantEl.appendChild(textEl);
-    assistantEl.appendChild(toolGroup);
+    assistantEl.appendChild(segmentsEl);
     assistantEl.appendChild(errorsEl);
     assistantEl.appendChild(metaEl);
 
@@ -815,8 +805,8 @@ export function initChat({
     row.appendChild(assistantEl);
 
     return {
-      row, userEl, userAuthor, userText, userAttachmentsEl, textEl,
-      toolGroup, toolSummary, toolsEl, errorsEl, metaEl, tools: new Map(),
+      row, userEl, userAuthor, userText, userAttachmentsEl, segmentsEl,
+      errorsEl, metaEl, segments: [],
     };
   }
 
@@ -831,35 +821,49 @@ export function initChat({
       rec.userText.textContent = blocksToText(t.user);
       renderUserAttachments(rec.userAttachmentsEl, t.user);
     }
-    if (rec.text !== t.text) {
-      rec.text = t.text;
-      rec.textEl.innerHTML = renderModelText(t.text);
-    }
-
-    const seenTools = new Set();
-    t.tools.forEach((tool) => {
-      seenTools.add(tool.tool_use_id);
-      let toolRec = rec.tools.get(tool.tool_use_id);
-      if (!toolRec) {
-        toolRec = buildToolCard(tool, rec.toolGroup);
-        rec.tools.set(tool.tool_use_id, toolRec);
-        rec.toolsEl.appendChild(toolRec.card);
+    // Segment slots never move: adjacent text extends its text node, adjacent
+    // calls extend their inline run, and late results update the original card.
+    t.segments.forEach((segment, index) => {
+      let segmentRec = rec.segments[index];
+      if (!segmentRec) {
+        const el = document.createElement(segment.kind === "text" ? "div" : "details");
+        el.className = segment.kind === "text" ? "text" : "toolgroup";
+        segmentRec = { el, tools: new Map() };
+        if (segment.kind === "tools") {
+          segmentRec.summary = document.createElement("summary");
+          segmentRec.toolsEl = document.createElement("div");
+          segmentRec.toolsEl.className = "tools";
+          el.appendChild(segmentRec.summary);
+          el.appendChild(segmentRec.toolsEl);
+          inspectDisclosure(el);
+        }
+        rec.segments[index] = segmentRec;
+        rec.segmentsEl.appendChild(el);
       }
-      updateToolCard(toolRec, tool);
+      if (segmentRec.value === segment) return;
+      segmentRec.value = segment;
+      if (segment.kind === "text") {
+        segmentRec.el.innerHTML = renderModelText(segment.text);
+        return;
+      }
+      let pending = 0;
+      let failed = 0;
+      for (const tool of segment.tools) {
+        let toolRec = segmentRec.tools.get(tool.tool_use_id);
+        if (!toolRec) {
+          toolRec = buildToolCard(tool, segmentRec.el);
+          segmentRec.tools.set(tool.tool_use_id, toolRec);
+          segmentRec.toolsEl.appendChild(toolRec.card);
+        }
+        updateToolCard(toolRec, tool);
+        if (!tool.result) pending++;
+        else if (tool.result.isError) failed++;
+      }
+      const count = segment.tools.length;
+      segmentRec.summary.textContent = `${count} tool call${count === 1 ? "" : "s"}`
+        + (pending ? ` · ${pending} running` : "")
+        + (failed ? ` · ${failed} failed` : "");
     });
-    for (const [id, toolRec] of rec.tools) {
-      if (!seenTools.has(id)) {
-        toolRec.card.remove();
-        rec.tools.delete(id);
-      }
-    }
-
-    rec.toolGroup.hidden = !t.tools.length;
-    const pending = t.tools.filter((tool) => !tool.result).length;
-    const failed = t.tools.filter((tool) => tool.result?.isError).length;
-    rec.toolSummary.textContent = `${t.tools.length} tool call${t.tools.length === 1 ? "" : "s"}`
-      + (pending ? ` · ${pending} running` : "")
-      + (failed ? ` · ${failed} failed` : "");
 
     // Append only: live recovery removes the banner, never these original
     // turn records or a reader's open error details.
@@ -903,7 +907,7 @@ export function initChat({
     // very tall turn. Changes above it must not move the text being read.
     const top = chatLogEl.getBoundingClientRect().top;
     const anchor = following ? null : Array.from(chatLogEl.querySelectorAll(
-      ".msg.user, .msg.assistant > .text, .toolgroup > summary, .toolcard, .turnerror, .turnmeta",
+      ".msg.user, .segments > .text, .toolgroup > summary, .toolcard, .turnerror, .turnmeta",
     )).find((node) => node.getBoundingClientRect().bottom > top);
     const anchorTop = anchor?.getBoundingClientRect().top;
     const seen = new Set();
