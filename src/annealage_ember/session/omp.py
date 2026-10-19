@@ -221,14 +221,14 @@ from .base import (
     AgentModelsAvailable,
     AgentRuntimeResolved,
     AgentStatus,
+    InputState,
+    RequestUsage,
     SandboxStatus,
     SessionReset,
-    InputState,
     TextDelta,
     ToolResult,
     ToolUse,
     TurnEnd,
-    RequestUsage,
     UnknownRequest,
     Usage,
     context_figures,
@@ -385,6 +385,7 @@ class OmpSession:
         self._resume = resume or None
         self._strict_resume = strict_resume
         self.last_request_timeout = None
+        self._timeout_interrupt_turn = None
         self._on_session_file = on_session_file
         self._thinking = thinking
         self._provider_session_id = provider_session_id
@@ -709,6 +710,7 @@ class OmpSession:
         Unlike the UI's best-effort interrupt, a failed RPC never authorizes
         another headless turn. This does not certify tool/result settlement.
         """
+        self._timeout_interrupt_turn = self._turn if self._running else None
         return await self._interrupt()
 
     async def _interrupt(self) -> bool:
@@ -918,7 +920,7 @@ class OmpSession:
             state = await self._run_blocking(self._client.get_state)
             if self._strict_resume and (
                 not state.session_file
-                or os.path.realpath(state.session_file) != os.path.realpath(self._resume)
+                or not await self._run_blocking(os.path.samefile, state.session_file, self._resume)
             ):
                 raise RuntimeError("OMP did not retain the requested conversation file")
             self._remember_sdk_session(state.session_id)
@@ -1246,6 +1248,12 @@ class OmpSession:
                     stderr=error,
                     remediation="the model reported an error during this turn; "
                     "the session otherwise remains ready",
+                    interruption_reason=(
+                        "host_timeout_abort"
+                        if self._timeout_interrupt_turn == turn
+                        and message.get("stopReason") == "aborted"
+                        else None
+                    ),
                 ),
             )
 
@@ -1304,6 +1312,13 @@ class OmpSession:
                     stderr=message,
                     remediation="the model reported an error during this turn; "
                     "the session otherwise remains ready",
+                    interruption_reason=(
+                        "host_timeout_abort"
+                        if self._timeout_interrupt_turn == self._turn
+                        and assistant_event.get("reason") == "aborted"
+                        and isinstance(error, dict) and error.get("stopReason") == "aborted"
+                        else None
+                    ),
                 ),
             )
 
@@ -1390,6 +1405,7 @@ class OmpSession:
         self._running = False
         self._settling_turn = None
         self._active_input_id = None
+        self._timeout_interrupt_turn = None
         self._emit(
             TurnEnd(
                 turn=turn,

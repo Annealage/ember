@@ -277,9 +277,9 @@ async def test_write_result_is_in_native_history_before_abort(monkeypatch, tmp_p
     result_recorded = asyncio.Event()
     workers, saved = [], []
 
-    from claude_agent_sdk import tool
     from annealage_ember.headless import ToolSet
     from annealage_ember.tools import Grading, ok
+    from claude_agent_sdk import tool
 
     @tool("commit_value", "Write once", {})
     async def commit_value(args):

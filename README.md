@@ -526,6 +526,14 @@ boundary. All this must fit within `interrupt_timeout`; a failed, missing or
 unknown acknowledgement/boundary fails closed. It never cancels a successful
 write just to resume the child, replays an original prompt or tool call, retries
 a provider failure, replaces the live session, or renews the hard deadline.
+OMP's native `stopReason="aborted"` messages are tagged
+`AgentError.interruption_reason="host_timeout_abort"` only while that same
+turn's host timeout abort owns them; streaming error updates must additionally
+report `reason="aborted"`. These remain errors until the abort acknowledges.
+Only then are those typed control messages excluded from the recovery error
+gate. Error text is never used as a classifier: ordinary aborts, unknown shapes,
+authentication/infrastructure/provider errors and failed acknowledgements do
+not become successful recoveries. The terminal-boundary requirement remains.
 An interval longer than the hard deadline is valid: the hard deadline wins.
 Hard termination still cancels unfinished handlers; synchronous blocking code
 cannot be forcibly stopped. Cleanup has its existing bounded grace outside

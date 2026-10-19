@@ -296,6 +296,8 @@ class _Run:
         self.role_resolution_error = False
         self.timeout_kind = None
         self.paused = False
+        self._timeout_interrupt_errors = []
+        self._timeout_interrupt_acknowledged = False
         self._pending_calls = set()
         self._tool_results_changed = asyncio.Event()
         self.recovery = None
@@ -367,6 +369,8 @@ class _Run:
         self.done.clear()
         self.text.clear()
         self.errors.clear()
+        self._timeout_interrupt_errors.clear()
+        self._timeout_interrupt_acknowledged = False
         self.stop_reason = None
         self.cost_usd = None
         self.tokens = None
@@ -379,7 +383,10 @@ class _Run:
         self._native_num_turns = None
 
     def error(self) -> Optional[str]:
-        return "; ".join(self.errors) or None
+        errors = self.errors
+        if not self._timeout_interrupt_acknowledged and self._timeout_interrupt_errors:
+            errors = [*errors, *self._timeout_interrupt_errors]
+        return "; ".join(errors) or None
 
     def calls(self) -> Tuple[Tuple[str, bool], ...]:
         return tuple((name, ok) for name, ok in self._calls)
@@ -431,8 +438,12 @@ class _Run:
             if event.role_resolution_error is True:
                 self.role_resolution_error = True
             message = (event.stderr or event.remediation or "").strip()
-            if message and message not in self.errors:
-                self.errors.append(message)
+            errors = (
+                self._timeout_interrupt_errors
+                if event.interruption_reason == "host_timeout_abort" else self.errors
+            )
+            if message and message not in errors:
+                errors.append(message)
         elif isinstance(event, AgentStatus):
             if event.status == AGENT_UNAVAILABLE:
                 # After this call returns: the session emits its AgentError
@@ -804,7 +815,9 @@ async def _drive(
                 interrupt = getattr(session, "interrupt_for_timeout", None)
                 outcome = "unsupported" if interrupt is None else "unsafe"
                 if interrupt is not None:
-                    async def stop_and_settle(interrupt=interrupt, settled=settled):
+                    async def stop_and_settle(
+                        interrupt=interrupt, settled=settled, submission=submission,
+                    ):
                         # A host write may already have committed. Let its
                         # result enter the native conversation BEFORE abort,
                         # not merely before the next user turn.
@@ -812,6 +825,11 @@ async def _drive(
                         await deadline_gate()
                         if await interrupt() is not True:
                             return False
+                        # Native abort errors may precede the RPC response.
+                        # Only its positive acknowledgement makes the typed
+                        # host-owned interruption expected rather than fatal.
+                        run._timeout_interrupt_acknowledged = True
+                        await asyncio.shield(submission)
                         await asyncio.shield(settled)
                         return (
                             not run.over and not run.error() and not run._pending_calls
@@ -830,7 +848,7 @@ async def _drive(
                                 pass
                     finally:
                         await _cancelled(stopping)
-                if (run.error() or (
+                if (run.errors or (
                     run.finished and run.stop_reason not in ordinary | {"interrupted", "aborted"}
                 )):
                     return

@@ -693,7 +693,22 @@ class DurableRpcClient(FakeRpcClient):
 
     def abort(self):
         self.aborts += 1
-        self.end()
+        self.abort_message()
+
+    def abort_message(
+        self, *, stop_reason="aborted", reason="aborted",
+        error="Interrupted by user", terminal=True,
+    ):
+        message = {
+            "role": "assistant", "stopReason": stop_reason, "errorMessage": error,
+            "provider": "anthropic", "model": "claude-sonnet-5-5",
+        }
+        self._listeners["message_update"](SimpleNamespace(assistant_message_event={
+            "type": "error", "reason": reason, "error": message,
+        }))
+        self._listeners["message_end"](SimpleNamespace(message=message))
+        if terminal:
+            self.end()
 
 
 async def test_native_timeout_recovery_uses_one_client_and_conversation(
@@ -800,3 +815,94 @@ async def test_native_prompt_rpc_timeout_is_not_provider_work_timeout(
     assert result.timeout_kind == "rpc_request_timeout"
     assert contexts[0].kind == "rpc_request_timeout" and contexts[0].rpc_operation == "prompt"
     assert result.error is not None and len(omp_client.instances) == 1
+
+
+@pytest.mark.parametrize("ordering", ("native_terminal_first", "ack_first"))
+async def test_owned_native_abort_errors_are_expected_only_after_acknowledgement(
+    omp_client, monkeypatch, tmp_path, ordering
+):
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    contexts = []
+    native_interrupt = omp_module.OmpSession.interrupt_for_timeout
+
+    def abort(client):
+        client.aborts += 1
+        if ordering == "native_terminal_first":
+            client.abort_message()
+
+    async def interrupt(session):
+        acknowledged = await native_interrupt(session)
+        if ordering == "ack_first":
+            session._client.abort_message()
+        return acknowledged
+
+    def script(client):
+        if len(client.messages) > 1:
+            client.say("original context retained")
+            client.end()
+
+    monkeypatch.setattr(DurableRpcClient, "abort", abort)
+    monkeypatch.setattr(omp_module.OmpSession, "interrupt_for_timeout", interrupt)
+    omp_client.script = script
+    result = await run_prompt("original", **make_args(
+        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.03,
+        interrupt_timeout=1, max_timeout_recoveries=1,
+        on_timeout=lambda context: contexts.append(context) or "diagnose",
+    ))
+    client, = omp_client.instances
+    assert result.error is None and result.text == "original context retained"
+    assert client.messages == ["original", "diagnose"] and client.aborts == 1
+    assert contexts[0].interruption == "safe"
+
+
+@pytest.mark.parametrize("failure", ("abort_rpc", "no_boundary", "provider_error", "unknown_shape"))
+async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_error(
+    omp_client, monkeypatch, tmp_path, failure
+):
+    from omp_rpc.client import RpcTimeoutError
+
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    contexts = []
+    omp_client.script = lambda client: None
+
+    def abort(client):
+        client.aborts += 1
+        client.abort_message(
+            stop_reason="error" if failure == "provider_error" else (
+                None if failure == "unknown_shape" else "aborted"
+            ),
+            reason="error" if failure == "provider_error" else "aborted",
+            error="Authentication failed" if failure == "provider_error" else "Interrupted by user",
+            terminal=failure != "no_boundary",
+        )
+        if failure == "abort_rpc":
+            raise RpcTimeoutError("abort acknowledgement expired")
+
+    monkeypatch.setattr(DurableRpcClient, "abort", abort)
+    result = await run_prompt("original", **make_args(
+        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.03,
+        interrupt_timeout=0.1, max_timeout_recoveries=1,
+        on_timeout=lambda context: contexts.append(context) or "must not submit",
+    ))
+    client, = omp_client.instances
+    assert result.error is not None and client.messages == ["original"]
+    assert Path(result.recovery.conversation_file).is_file()
+    if failure in ("provider_error", "unknown_shape"):
+        assert contexts == [] and result.timeout_kind is None
+    else:
+        assert contexts[0].interruption == "unsafe" and result.timeout_kind == "work_interval"
+
+
+async def test_native_abort_without_timeout_ownership_remains_an_error(
+    omp_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
+    omp_client.script = lambda client: client.abort_message()
+    contexts = []
+    result = await run_prompt("original", **make_args(
+        tmp_path, on_timeout=lambda context: contexts.append(context) or "never retry",
+        max_timeout_recoveries=1,
+    ))
+    assert "Interrupted by user" in result.error
+    assert result.timeout_kind is None and contexts == []
+    assert len(omp_client.instances[0].messages) == 1

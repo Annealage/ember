@@ -516,13 +516,20 @@ class SessionReset(AgentEvent):
 
 @dataclasses.dataclass(frozen=True)
 class AgentError(AgentEvent):
-    """A backend failure, with optional typed evidence for safe role fallback."""
+    """A backend failure with optional typed role/host-interruption evidence.
+
+    ``interruption_reason="host_timeout_abort"`` identifies a native aborted
+    message belonging to the active host timeout interrupt, not a successful
+    interrupt acknowledgement. Consumers must still require that acknowledgement
+    and a terminal boundary before treating it as an expected interruption.
+    """
 
     kind: ClassVar[str] = "agent_error"
     stderr: str
     remediation: str
     viewer: Optional[str] = None
     role_resolution_error: Optional[bool] = None
+    interruption_reason: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
