@@ -360,10 +360,9 @@ function dollars(cost) {
 function turnMeta(t) {
   const parts = [];
   if (t.stopReason) parts.push(["turnstop", t.stopReason]);
-  parts.push([
-    "turncost",
-    typeof t.costUsd === "number" ? "$" + t.costUsd.toFixed(4) : "cost unknown",
-  ]);
+  if (typeof t.costUsd === "number") {
+    parts.push(["turncost", "$" + t.costUsd.toFixed(4)]);
+  }
   const tokens = t.tokens;
   if (tokens) {
     const counts = [
@@ -377,7 +376,6 @@ function turnMeta(t) {
   const labels = {
     received: "Pending backend delivery",
     queued: "Queued until the current turn ends",
-    provider_ack: "Accepted by backend",
     rejected: "Not sent",
     uncertain: "Delivery uncertain; do not resend until checked",
   };
@@ -386,7 +384,7 @@ function turnMeta(t) {
   } else if (t.usageSource === "epoch_baseline") {
     parts.push(["turnaccounting", "Usage baseline only; this turn's cumulative usage is unknown"]);
   }
-  if (t.inputState) {
+  if (t.inputState && t.inputState !== "provider_ack") {
     const detail = t.inputDetail ? ": " + t.inputDetail : "";
     parts.push([
       "turninputstate turninputstate-" + t.inputState,

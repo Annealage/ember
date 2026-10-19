@@ -649,7 +649,8 @@ def test_delivery_outcomes_are_rendered_on_their_own_turn_without_inventing_spen
     assert [(turn["turn"], turn["state"]) for turn in final] == [
         (1, "provider_ack"), (2, "uncertain"), (3, "rejected")
     ]
-    assert all(turn["deliveryVisible"] and turn["detailVisible"] for turn in final)
+    assert not final[0]["deliveryVisible"]
+    assert all(turn["deliveryVisible"] and turn["detailVisible"] for turn in final[1:])
     assert all(turn["cost"] is None for turn in final)
     assert final[0]["source"] == "counter_regression"
 
