@@ -190,7 +190,6 @@ not fighting it.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 import contextvars
 import functools
 import hashlib
@@ -202,6 +201,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence

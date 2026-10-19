@@ -804,7 +804,7 @@ async def _drive(
                 interrupt = getattr(session, "interrupt_for_timeout", None)
                 outcome = "unsupported" if interrupt is None else "unsafe"
                 if interrupt is not None:
-                    async def stop_and_settle():
+                    async def stop_and_settle(interrupt=interrupt, settled=settled):
                         # A host write may already have committed. Let its
                         # result enter the native conversation BEFORE abort,
                         # not merely before the next user turn.
