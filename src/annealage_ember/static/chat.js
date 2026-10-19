@@ -354,45 +354,6 @@ function dollars(cost) {
   return "$" + cost.toFixed(cost < 1 ? 3 : 2);
 }
 
-// A finished turn's meta line as `[class, text]` parts, each only when known:
-// how it stopped (`turnstop`), what it cost (`turncost`) and its tokens
-// (`turntokens`). Drawn as one span per part, joined by ", ".
-function turnMeta(t) {
-  const parts = [];
-  if (t.stopReason) parts.push(["turnstop", t.stopReason]);
-  if (typeof t.costUsd === "number") {
-    parts.push(["turncost", "$" + t.costUsd.toFixed(4)]);
-  }
-  const tokens = t.tokens;
-  if (tokens) {
-    const counts = [
-      typeof tokens.input === "number" ? tokenCount(tokens.input) + " in" : "unknown in",
-      typeof tokens.output === "number" ? tokenCount(tokens.output) + " out" : "unknown out",
-    ];
-    parts.push(["turntokens", counts.join(", ")]);
-  } else if (t.complete) {
-    parts.push(["turntokens", "tokens unknown"]);
-  }
-  const labels = {
-    received: "Pending backend delivery",
-    queued: "Queued until the current turn ends",
-    rejected: "Not sent",
-    uncertain: "Delivery uncertain; do not resend until checked",
-  };
-  if (t.usageSource === "counter_regression") {
-    parts.push(["turnaccounting", "Counter reset: this turn's cumulative usage is unknown"]);
-  } else if (t.usageSource === "epoch_baseline") {
-    parts.push(["turnaccounting", "Usage baseline only; this turn's cumulative usage is unknown"]);
-  }
-  if (t.inputState && t.inputState !== "provider_ack") {
-    const detail = t.inputDetail ? ": " + t.inputDetail : "";
-    parts.push([
-      "turninputstate turninputstate-" + t.inputState,
-      (labels[t.inputState] || t.inputState) + detail,
-    ]);
-  }
-  return parts;
-}
 
 /**
  * The conversation's usage (the hello's `session.usage`, or a live `usage`
@@ -793,18 +754,15 @@ export function initChat({
     segmentsEl.className = "segments";
     const errorsEl = document.createElement("div");
     errorsEl.className = "turnerrors";
-    const metaEl = document.createElement("div");
-    metaEl.className = "turnmeta";
     assistantEl.appendChild(segmentsEl);
     assistantEl.appendChild(errorsEl);
-    assistantEl.appendChild(metaEl);
 
     row.appendChild(userEl);
     row.appendChild(assistantEl);
 
     return {
       row, userEl, userAuthor, userText, userAttachmentsEl, segmentsEl,
-      errorsEl, metaEl, segments: [],
+      errorsEl, segments: [],
     };
   }
 
@@ -881,21 +839,6 @@ export function initChat({
       rec.errorsEl.appendChild(details);
     }
 
-    // Rebuilt only when it changes, since every render passes every turn.
-    const meta = t.complete || t.inputState ? turnMeta(t) : [];
-    const metaKey = meta.map(([cls, text]) => cls + ":" + text).join("\n");
-    if (rec.metaKey !== metaKey) {
-      rec.metaKey = metaKey;
-      const nodes = [];
-      meta.forEach(([cls, text], i) => {
-        if (i) nodes.push(", ");
-        const span = document.createElement("span");
-        span.className = cls;
-        span.textContent = text;
-        nodes.push(span);
-      });
-      rec.metaEl.replaceChildren(...nodes);
-    }
   }
 
   function renderTurns(chat) {
@@ -905,7 +848,7 @@ export function initChat({
     // very tall turn. Changes above it must not move the text being read.
     const top = chatLogEl.getBoundingClientRect().top;
     const anchor = following ? null : Array.from(chatLogEl.querySelectorAll(
-      ".msg.user, .segments > .text, .toolgroup > summary, .toolcard, .turnerror, .turnmeta",
+      ".msg.user, .segments > .text, .toolgroup > summary, .toolcard, .turnerror",
     )).find((node) => node.getBoundingClientRect().bottom > top);
     const anchorTop = anchor?.getBoundingClientRect().top;
     const seen = new Set();

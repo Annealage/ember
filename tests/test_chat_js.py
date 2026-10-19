@@ -9,8 +9,8 @@ appear, refused or lost in a dropped connection, going back into the
 composer in front of whatever was typed since, with a toast saying so. And the
 state a stylesheet reads off the pane element (``data-working``,
 ``data-turn-started``, ``data-pending``) through a turn, its permission
-requests, a reconnect, a steer and a mid-turn connect; and a finished turn's
-meta line. The same harness shape as ``test_review_js.py``.
+requests, a reconnect, a steer and a mid-turn connect. Turn accounting and
+delivery state stay out of the transcript. Same harness as ``test_review_js.py``.
 """
 
 import json
@@ -636,7 +636,7 @@ def test_the_pane_root_says_whether_a_turn_runs_since_when_and_what_waits(observ
 
 
 
-def test_delivery_outcomes_are_rendered_on_their_own_turn_without_inventing_spend(observed):
+def test_delivery_tracking_does_not_add_metadata_to_the_transcript(observed):
     queued = observed["queuedDelivery"]
     assert [(turn["turn"], turn["state"], turn["complete"]) for turn in queued] == [
         (1, "queued", False)
@@ -649,8 +649,7 @@ def test_delivery_outcomes_are_rendered_on_their_own_turn_without_inventing_spen
     assert [(turn["turn"], turn["state"]) for turn in final] == [
         (1, "provider_ack"), (2, "uncertain"), (3, "rejected")
     ]
-    assert not final[0]["deliveryVisible"]
-    assert all(turn["deliveryVisible"] and turn["detailVisible"] for turn in final[1:])
+    assert all(not turn["deliveryVisible"] for turn in final)
     assert all(turn["cost"] is None for turn in final)
     assert final[0]["source"] == "counter_regression"
 
