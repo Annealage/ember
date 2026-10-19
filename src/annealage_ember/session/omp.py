@@ -1198,6 +1198,16 @@ class OmpSession:
                 ),
             )
         self._loop.call_soon_threadsafe(self._emit_request_usage, report)
+        error = _nonempty_string(message.get("errorMessage"))
+        if error is not None:
+            self._loop.call_soon_threadsafe(
+                self._emit,
+                AgentError(
+                    stderr=error,
+                    remediation="the model reported an error during this turn; "
+                    "the session otherwise remains ready",
+                ),
+            )
 
     def _record_resolved_runtime(self, event: AgentRuntimeResolved) -> None:
         previous = self.resolved_runtime or {}

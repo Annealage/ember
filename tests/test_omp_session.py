@@ -1649,6 +1649,31 @@ async def test_request_usage_is_published_without_an_optional_sink():
 
 
 @pytest.mark.asyncio
+async def test_terminal_assistant_error_message_emits_agent_error_and_keeps_usage():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(
+            _assistant(
+                {"input": 5, "output": 0, "cost": {"total": 0.001}},
+                errorMessage="Codex error event: Invalid schema for function create_footprint",
+            )
+        )
+
+        usage = await _next_of(recorder, RequestUsage)
+        error = await _next_of(recorder, AgentError)
+        assert error.stderr == (
+            "Codex error event: Invalid schema for function create_footprint"
+        )
+        assert usage.tokens_input == 5
+        assert usage.cost_usd == pytest.approx(0.001)
+        assert session.agent_status() == AGENT_READY
+        assert fake.prompt_calls and len(fake.prompt_calls) == 1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_through_each_turn(
     tmp_path, monkeypatch
 ):

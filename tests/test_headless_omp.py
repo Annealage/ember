@@ -557,6 +557,33 @@ async def test_every_provider_request_of_a_run_reaches_the_usage_sink_before_it_
     assert events[1]["provider_request_id"] is None
 
 
+async def test_terminal_assistant_error_message_reaches_headless_result(omp_client, tmp_path):
+    usage = []
+
+    def script(client):
+        client._listeners["message_end"](
+            SimpleNamespace(
+                message={
+                    "role": "assistant",
+                    "errorMessage": "Codex error event: Invalid schema for function create_footprint",
+                    "usage": {
+                        "input": 5,
+                        "output": 0,
+                        "cost": {"total": 0.001},
+                    },
+                }
+            )
+        )
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt("go", **make_args(tmp_path, usage_sink=usage.append))
+
+    assert result.error == "Codex error event: Invalid schema for function create_footprint"
+    assert result.stop_reason == "end"
+    assert [(event["tokens_input"], event["cost_usd"]) for event in usage] == [(5, 0.001)]
+
+
 async def test_concurrent_runs_never_share_an_event_id(omp_client, tmp_path):
     events = []
     lock = threading.Lock()
