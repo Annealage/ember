@@ -497,6 +497,10 @@ SDK backend rejects `xhigh` rather than silently translating it.
 `max_followups` is a nonnegative integer, default **0**, so the default remains one turn. It is a hard upper bound on extra submissions, even if the callback always requests another. The callback observes every clean ordinary turn, including the last at the bound, but its returned text is ignored once the bound is exhausted. Clean `max_tokens` and `ended_by_tool` completions are eligible; errors, rejected input, native turn/budget limits, cancellation and timeout are not. Unknown stop reasons fail closed. The single whole-run `timeout` covers startup, every turn and the callbacks; it is not renewed per correction. Callbacks must yield normally to remain cancellable.
 
 On timeout or cancellation, the callback/turn task is cancelled and waited for up to 5 seconds, separately from the existing bounded tool drain and native-process close. A callback that suppresses cancellation can outlive this wait, but cannot authorize another submission after the run ends; like synchronous blocking tool code, its own external side effects cannot be forcibly stopped. Keep callbacks short and cancellation-cooperative.
+Teardown does not reissue cancellation while a handler or callback is cleaning
+up: awaited `finally` blocks retain their bounded drain opportunity. A terminal
+backend error also ends the run without waiting for a hung prompt acknowledgement
+to turn that error into a whole-run timeout.
 
 The final result aggregates `calls` and `tool_errors` in order and sums reported per-turn cost/token dimensions. A dimension unknown in any turn remains unknown (`None`), not zero; per-request usage is not counted again. Native turn counts are summed when reported for every turn. Text and stop reason describe the last turn, including a partial correction on failure. The callback always receives a **per-turn**, not cumulative, result. The per-request usage sink retains one run/session identity with distinct positional turn/request event IDs across corrections.
 

@@ -387,3 +387,32 @@ async def test_expired_callback_cannot_admit_turn_before_timer_is_serviced(monke
     assert result.timeout_kind == "hard_deadline" and result.error == "timeout"
     assert len(built.session.submitted_turns) == 1
     assert contexts[0].kind == "hard_deadline"
+
+
+async def test_repeated_end_does_not_interrupt_awaited_handler_cleanup():
+    from claude_agent_sdk import tool
+
+    entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cleaned = []
+
+    @tool("slow_write", "Exercise awaited teardown", {})
+    async def slow_write(args):
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+            cleaned.append("once")
+
+    run = headless._Run("test__")
+    worker = asyncio.create_task(run.guard(slow_write).handler({}))
+    await entered.wait()
+    run.end()
+    await cleaning.wait()
+    run.end()
+    release.set()
+    await run.drain()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    assert cleaned == ["once"]

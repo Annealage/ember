@@ -333,6 +333,8 @@ class _Run:
     def end(self) -> None:
         """The run is over: refuse new tool calls and cancel the running ones.
         Idempotent; ``drain`` waits for the cancellations to finish."""
+        if self.over:
+            return
         self.over = True
         for task in list(self._inflight):
             task.cancel()
@@ -747,6 +749,8 @@ async def _drive(
 ) -> None:
     """Drive bounded turns without replacing the session or replaying tools."""
     async def deadline_gate():
+        if run.over:
+            raise asyncio.CancelledError
         if asyncio.get_running_loop().time() >= deadline:
             # Let the outer deadline owner classify and stop the run. An
             # overdue synchronous callback must never admit another turn
@@ -772,7 +776,11 @@ async def _drive(
 
     async def boundary():
         await run.done.wait()
-        await submission
+        # Backend death is already a terminal boundary. Its prompt/transport
+        # coroutine may never acknowledge; do not let it mask the real error.
+        if run.error() or session.agent_status() != AGENT_READY:
+            return
+        await asyncio.shield(submission)
         if run.error() or getattr(session, "last_request_timeout", None) is not None:
             return
         await run.settle_tools()
@@ -804,7 +812,7 @@ async def _drive(
                         await deadline_gate()
                         if await interrupt() is not True:
                             return False
-                        await settled
+                        await asyncio.shield(settled)
                         return (
                             not run.over and not run.error() and not run._pending_calls
                             and session.agent_status() == AGENT_READY
@@ -1314,13 +1322,20 @@ async def run_prompt(
                     deadline=started + timeout,
                 )
             )
+            driver_cancelled = False
             try:
                 remaining = max(0, timeout - (asyncio.get_running_loop().time() - started))
                 await asyncio.wait({task}, timeout=remaining)
                 if not task.done() or asyncio.get_running_loop().time() >= started + timeout:
+                    # A known terminal backend failure is no longer active
+                    # work. Bounded transport cleanup must not relabel it as
+                    # a generation deadline or invoke timeout diagnostics.
+                    if run.finished and run.error() and run.timeout_kind is None:
+                        return run.result()
                     run.timeout_kind = "hard_deadline"
                     run.end()
                     broker.shutdown()
+                    driver_cancelled = True
                     await _cancelled(task)
                     if on_timeout is not None and task.done():
                         observer = asyncio.ensure_future(
@@ -1342,7 +1357,11 @@ async def run_prompt(
                 unfinished = not task.done()
                 run.end()
                 broker.shutdown()
-                await _cancelled(task)
+                # A hard deadline already issued the driver's one cancellation.
+                # Reissuing it would interrupt cancellation-cooperative cleanup
+                # or a callback's deliberately bounded cancellation handler.
+                if not driver_cancelled:
+                    await _cancelled(task)
                 await _close(
                     session, kill=unfinished or run.timeout_kind is not None or run.paused
                 )
