@@ -54,7 +54,7 @@
  *   chat          {turns, pendingUser, pending, agentStatus, model, models,
  *                  banner, attachments, usage}
  *                 the whole chat pane's state.
- *                 `{turn, user, text, tools, stopReason, costUsd, complete,
+ *                 `{turn, user, text, tools, errors, stopReason, costUsd, complete,
  *                 inputState, inputDetail}`, built by conversation and
  *                 input_state events; `tools` is `[{tool_use_id, name, input,
  *                 result}]` with `result` null until a tool_result names
@@ -64,6 +64,8 @@
  *                 other tab and every replay alike, so it shows once
  *                 wherever it is seen. Null for a turn with no such event
  *                 (a history from before the server logged them).
+ *                 `errors` retains `{remediation, stderr}` records on their
+ *                 original turn, including replay, independently of the banner.
  *                 `pendingUser` is `[{clientId, blocks}]`, the turns this
  *                 tab has sent that the server has neither logged (a
  *                 `user_turn` with the same `client_id`) nor refused (a
@@ -82,9 +84,11 @@
  *                 ('connecting' | 'ready' | 'unavailable'). `banner` is the most
  *                 recent `session_reset`, `agent_error` or `attention` event
  *                 (or an info line the pane raised itself) as
- *                 `{kind, text, detail}`, or null once dismissed; an
- *                 `attention` one also clears when the human's next turn
- *                 arrives. `detail` is
+ *                 `{kind, text, detail, source}`, or null once dismissed; an
+ *                 agent error (`source: "agent"`) clears on live readiness,
+ *                 input acknowledgement or model activity, not a user send.
+ *                 An `attention` clears when the human's next turn arrives.
+ *                 `detail` is
  *                 the backend's own text under the message (an
  *                 `agent_error`'s stderr), or null. A `session_reset`
  *                 also clears `turns` (`resetChatTurns`), because the new
@@ -315,11 +319,12 @@ function ensureTurn(chat, turn) {
     user: null,
     text: "",
     tools: Object.freeze([]),
+    errors: Object.freeze([]),
     stopReason: null,
     costUsd: null,
     usageEpoch: null,
     usageSource: null,
-    complete: false,
+    complete: turn === 0,
     inputState: null,
     inputDetail: null,
   });
@@ -372,6 +377,22 @@ function appendChatTextDelta(turn, text) {
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx ? Object.freeze({ ...t, text: t.text + text }) : t)),
     );
+    state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
+  }, ["chat"]);
+}
+
+// Kept on its original turn even after the active banner has recovered.
+// Reconnecting replay may revisit an error already shown in this tab.
+function addChatTurnError(turn, remediation, stderr) {
+  commit(() => {
+    const chat = state.chat;
+    const { turns, idx } = ensureTurn(chat, turn);
+    const errors = turns[idx].errors;
+    if (errors.some((e) => e.remediation === remediation && e.stderr === stderr)) return;
+    const error = Object.freeze({ remediation, stderr });
+    const nextTurns = Object.freeze(turns.map((t, i) => (
+      i === idx ? Object.freeze({ ...t, errors: Object.freeze([...errors, error]) }) : t
+    )));
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
   }, ["chat"]);
 }
@@ -569,9 +590,9 @@ function setChatUsage(usage) {
   }, ["chat"]);
 }
 
-function setChatBanner(kind, text, detail = null) {
+function setChatBanner(kind, text, detail = null, source = null) {
   commit(() => {
-    const banner = Object.freeze({ kind, text, detail: detail || null });
+    const banner = Object.freeze({ kind, text, detail: detail || null, source });
     state = { ...state, chat: Object.freeze({ ...state.chat, banner }) };
   }, ["chat"]);
 }
@@ -748,6 +769,7 @@ export const store = Object.freeze({
   setChatUserTurn,
   setChatInputState,
   appendChatTextDelta,
+  addChatTurnError,
   addChatToolUse,
   setChatToolResult,
   endChatTurn,

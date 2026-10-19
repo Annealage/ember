@@ -409,6 +409,45 @@ async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     assert app.agent_session is retried and up["session"]["agent_error"] is None
 
 
+@pytest.mark.parametrize("recovery", ["provider_ack", "text_delta", "tool_use"])
+async def test_backend_activity_clears_the_error_for_reconnecting_clients(served_dir, recovery):
+    from annealage_ember.session.base import (
+        AgentError,
+        InputState,
+        TextDelta,
+        ToolUse,
+        TurnEnd,
+        UserTurn,
+    )
+
+    app, session = _app_with_fake_session(served_dir)
+    session.emit(UserTurn(turn=1, blocks=[{"type": "text", "text": "first"}]))
+    session.emit(AgentError(stderr="No API key found", remediation="Check credentials"))
+    session.emit(TurnEnd(turn=1, stop_reason="error", cost_usd=None))
+    session.emit(UserTurn(turn=2, blocks=[{"type": "text", "text": "retry"}]))
+    session.emit(InputState("retry", 2, "received"))
+    session.emit(InputState("retry", 2, "queued"))
+    session.emit(TextDelta(turn=2, text=""))
+    assert (await _hello_of(app))["session"]["agent_error"] == {
+        "remediation": "Check credentials", "stderr": "No API key found",
+    }
+    event = {
+        "provider_ack": InputState("retry", 2, "provider_ack"),
+        "text_delta": TextDelta(turn=2, text="Working."),
+        "tool_use": ToolUse(turn=2, tool_use_id="read-1", name="read", input={}),
+    }[recovery]
+    session.emit(event)
+    assert (await _hello_of(app))["session"]["agent_error"] is None
+    errors = [
+        wire for _seq, wire in app.agent_event_log.replay(0).events
+        if wire["kind"] == "agent_error"
+    ]
+    assert errors == [{
+        "kind": "agent_error", "stderr": "No API key found",
+        "remediation": "Check credentials",
+    }]
+
+
 async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(served_dir):
     """A page shows usage from the hello and live events only, so the hello
     must carry the latest: before the backend has said anything, null; then

@@ -53,6 +53,7 @@ class El {
   setAttribute() {}
   getAttribute() { return null; }
   focus() {}
+  getBoundingClientRect() { return this.rect || { top: 0, bottom: 0 }; }
   blur() {}
   querySelector(sel) {
     const find = (el) => {
@@ -65,7 +66,7 @@ class El {
     };
     return find(this);
   }
-  querySelectorAll() { return []; }
+  querySelectorAll() { return this.anchorNodes || []; }
   set innerHTML(v) { this._html = v; }
   get innerHTML() { return this._html || ""; }
 }
@@ -329,6 +330,99 @@ modelInput.value = "haiku";
 blurModel();
 out.modelSent = sent.filter((f) => f.type === "set_model").map((f) => f.model);
 
+// Recovery requires backend acknowledgement or actual model output, never
+// a send, queue entry, terminal failure, or old output replayed on reconnect.
+chat.handleHello({ id: "recovery", agent: "ready" });
+const failure = { kind: "agent_error", remediation: "Check credentials", stderr: "No API key found" };
+const user = (turn) => ({ kind: "user_turn", turn, blocks: [{ type: "text", text: "try again" }] });
+chat.handleEvent(user(1));
+chat.handleEvent(failure);
+chat.handleEvent({ kind: "turn_end", turn: 1, stop_reason: "error", cost_usd: null });
+sendMessage("retry");
+out.errorAfterSend = store.getState().chat.banner.text;
+chat.handleEvent(user(2));
+chat.handleEvent({ kind: "input_state", turn: 2, state: "queued" });
+out.errorWhileQueued = store.getState().chat.banner.text;
+chat.handleEvent({ kind: "text_delta", turn: 1, text: "old output" }, { replayed: true });
+out.errorAfterOldActivity = store.getState().chat.banner.text;
+chat.handleEvent({ kind: "input_state", turn: 2, state: "provider_ack" });
+out.errorAfterAck = store.getState().chat.banner;
+out.errorHistory = store.getState().chat.turns.find((t) => t.turn === 1).errors;
+const recoveryRow = (n) => [...el("chatLog").children].reverse().find((r) => r.dataset.turn === String(n));
+out.errorHistoryVisible = recoveryRow(1).children[1].children[2].children[0].children.map((n) => n.textContent);
+
+out.activityRecovery = [];
+for (const event of [
+  { kind: "text_delta", turn: 2, text: "Working." },
+  { kind: "tool_use", turn: 2, tool_use_id: "recover", name: "read", input: {} },
+]) {
+  chat.handleEvent(failure);
+  chat.handleEvent(event);
+  out.activityRecovery.push(store.getState().chat.banner);
+}
+store.setChatBanner("error", "Export failed");
+chat.handleEvent({ kind: "text_delta", turn: 2, text: " Still working." });
+out.unrelatedErrorSurvives = store.getState().chat.banner.text;
+chat.handleEvent(failure);
+chat.handleHello({ id: "recovery", agent: "ready", agent_error: null });
+out.errorAfterRecoveredHello = store.getState().chat.banner;
+
+// Rebuild the failed turn from history, without announcing the failure as
+// current. New queued input must not steal errors from the executing turn.
+chat.handleHello({ id: "replay", agent: "ready", agent_error: null });
+chat.handleEvent(user(1), { replayed: true });
+chat.handleEvent(failure, { replayed: true });
+chat.handleEvent({ kind: "turn_end", turn: 1, stop_reason: "error", cost_usd: null }, { replayed: true });
+chat.handleEvent(user(2), { replayed: true });
+chat.handleEvent({ kind: "input_state", turn: 2, state: "provider_ack" }, { replayed: true });
+chat.handleEvent(user(3), { replayed: true });
+chat.handleEvent({ kind: "input_state", turn: 3, state: "queued" }, { replayed: true });
+chat.handleEvent(failure, { replayed: true });
+out.replayedHistory = store.getState().chat.turns.map((t) => [t.turn, t.errors.length]);
+out.bannerAfterHistory = store.getState().chat.banner;
+
+// Hundreds of calls are one initially closed disclosure inside their turn.
+for (let i = 0; i < 120; i++) {
+  chat.handleEvent({ kind: "tool_use", turn: 2, tool_use_id: "long-" + i, name: "read", input: { i } });
+  chat.handleEvent({ kind: "tool_result", tool_use_id: "long-" + i, is_error: i === 4, text: "result " + i });
+}
+const group = recoveryRow(2).children[1].children[1];
+const tools = group.children[1];
+out.toolGroup = {
+  tag: group.tagName, className: group.className, collapsed: !group.open,
+  summary: group.children[0].textContent, count: tools.children.length,
+  nextTurnTools: recoveryRow(3).children[1].children[1].children[1].children.length,
+};
+group.open = true;
+group.listeners.toggle[0]();
+tools.scrollTop = 92;
+const firstCard = tools.children[0];
+firstCard.open = true;
+firstCard.children[2].scrollTop = 37;
+const log = el("chatLog");
+log.scrollTop = 240; log.clientHeight = 200; log.scrollHeight = 2000;
+chat.handleEvent({ kind: "text_delta", turn: 2, text: " More prose." });
+out.inspectionPreserved = [
+  group.open, firstCard.open, tools.scrollTop, firstCard.children[2].scrollTop, log.scrollTop,
+];
+// A deterministic geometry change above a visible anchor is compensated.
+let anchorReads = 0;
+log.anchorNodes = [{
+  isConnected: true,
+  getBoundingClientRect() {
+    anchorReads++;
+    return { top: anchorReads < 3 ? 20 : 80, bottom: 100 };
+  },
+}];
+log.listeners.scroll[0]();
+chat.handleEvent({ kind: "text_delta", turn: 2, text: " Anchored." });
+out.anchoredScrollTop = log.scrollTop;
+log.anchorNodes = [];
+log.scrollTop = 1800;
+log.listeners.scroll[0]();
+chat.handleEvent({ kind: "text_delta", turn: 2, text: " Following." });
+out.followingScrollTop = log.scrollTop;
+
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -516,3 +610,33 @@ def test_products_can_omit_the_live_model_picker(observed):
         "mountedWithoutInput": True,
         "sent": [],
     }
+
+
+def test_recovery_needs_live_backend_activity_and_preserves_error_history(observed):
+    assert observed["errorAfterSend"] == "Check credentials"
+    assert observed["errorWhileQueued"] == "Check credentials"
+    assert observed["errorAfterOldActivity"] == "Check credentials"
+    assert observed["errorAfterAck"] is None
+    assert observed["activityRecovery"] == [None, None]
+    assert observed["errorAfterRecoveredHello"] is None
+    assert observed["unrelatedErrorSurvives"] == "Export failed"
+    assert observed["errorHistory"] == [
+        {"remediation": "Check credentials", "stderr": "No API key found"}
+    ]
+    assert observed["errorHistoryVisible"] == ["Check credentials", "No API key found"]
+    assert observed["replayedHistory"] == [[1, 1], [2, 1], [3, 0]]
+    assert observed["bannerAfterHistory"] is None
+
+
+def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(observed):
+    assert observed["toolGroup"] == {
+        "tag": "details",
+        "className": "toolgroup",
+        "collapsed": True,
+        "summary": "120 tool calls · 1 failed",
+        "count": 120,
+        "nextTurnTools": 0,
+    }
+    assert observed["inspectionPreserved"] == [True, True, 92, 37, 240]
+    assert observed["anchoredScrollTop"] == 300
+    assert observed["followingScrollTop"] == 2000

@@ -60,9 +60,12 @@ from .session.base import (
     AgentRuntimeResolved,
     AgentModelsAvailable,
     AgentStatus,
+    InputState,
     PermissionResolved,
     SessionReset,
     TurnEnd,
+    TextDelta,
+    ToolUse,
     Usage,
 )
 from .session.events import EventLog
@@ -1065,9 +1068,10 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
     would otherwise fall back to permanently showing the CLI-configured
     starting model instead of what the session is actually running. The
     latest ``AgentError`` is kept the same way, as
-    ``session_info["agent_error"]``, and dropped once an ``AgentStatus``
-    says the agent is ready: a page opened while the agent is down learns
-    why from the ``hello``, since it raises no banner from replayed history.
+    ``session_info["agent_error"]``, and dropped once the agent is ready,
+    acknowledges an input, or produces model activity. A user message being
+    sent or queued is not recovery. A new page learns the current failure
+    from ``hello``, since replayed history raises no banner.
     The latest ``Usage`` is kept as ``session_info["usage"]`` for the same
     reason: the page takes its usage from the ``hello`` and live events only;
     a ``SessionReset`` clears it, since the new conversation has used nothing
@@ -1125,9 +1129,14 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
                 "remediation": event.remediation,
                 "stderr": event.stderr,
             }
-        if session_info is not None and isinstance(event, AgentStatus):
-            if event.status == AGENT_READY:
-                session_info["agent_error"] = None
+        recovered = (
+            isinstance(event, AgentStatus) and event.status == AGENT_READY
+            or isinstance(event, InputState) and event.state == "provider_ack"
+            or isinstance(event, TextDelta) and bool(event.text)
+            or isinstance(event, ToolUse)
+        )
+        if session_info is not None and recovered:
+            session_info["agent_error"] = None
         if session_info is not None and isinstance(event, Usage):
             session_info["usage"] = event.snapshot()
         if session_info is not None and isinstance(event, SessionReset):

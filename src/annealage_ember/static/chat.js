@@ -724,13 +724,22 @@ export function initChat({
       chatLogEl.scrollTop + chatLogEl.clientHeight >= chatLogEl.scrollHeight - 24;
   });
 
-  function buildToolCard(tool) {
+  // Opening an inspector is an explicit reading action, not a request to
+  // jump to the newest output. Scrolling to the bottom resumes following.
+  function inspectDisclosure(details, visible = () => true) {
+    details.addEventListener("toggle", () => {
+      if (details.open && visible()) stickToBottom = false;
+    });
+  }
+
+  function buildToolCard(tool, group) {
     const card = document.createElement("details");
     card.className = "toolcard";
     card.dataset.toolId = tool.tool_use_id;
     // A saved preference, read from the store rather than decided here, so the
     // settings window and this builder cannot disagree about the default.
     card.open = store.getState().toolCardsCollapsed === false;
+    inspectDisclosure(card, () => group.open);
     const summary = document.createElement("summary");
     const inputEl = document.createElement("pre");
     inputEl.className = "toolinput";
@@ -745,11 +754,17 @@ export function initChat({
 
   function updateToolCard(rec, tool) {
     rec.summary.textContent = shortToolName(tool.name);
-    rec.inputEl.textContent = formatToolInput(tool.input);
+    if (rec.input !== tool.input) {
+      rec.input = tool.input;
+      rec.inputEl.textContent = formatToolInput(tool.input);
+    }
     if (tool.result) {
       rec.resultEl.hidden = false;
-      rec.resultEl.textContent = tool.result.text;
-      rec.resultEl.classList.toggle("error", !!tool.result.isError);
+      if (rec.result !== tool.result) {
+        rec.result = tool.result;
+        rec.resultEl.textContent = tool.result.text;
+        rec.resultEl.classList.toggle("error", !!tool.result.isError);
+      }
     } else {
       rec.resultEl.hidden = true;
     }
@@ -778,18 +793,31 @@ export function initChat({
     assistantEl.className = "msg assistant";
     const textEl = document.createElement("div");
     textEl.className = "text";
+    const toolGroup = document.createElement("details");
+    toolGroup.className = "toolgroup";
+    toolGroup.hidden = true;
+    const toolSummary = document.createElement("summary");
+    toolGroup.appendChild(toolSummary);
+    inspectDisclosure(toolGroup);
     const toolsEl = document.createElement("div");
     toolsEl.className = "tools";
+    toolGroup.appendChild(toolsEl);
+    const errorsEl = document.createElement("div");
+    errorsEl.className = "turnerrors";
     const metaEl = document.createElement("div");
     metaEl.className = "turnmeta";
     assistantEl.appendChild(textEl);
-    assistantEl.appendChild(toolsEl);
+    assistantEl.appendChild(toolGroup);
+    assistantEl.appendChild(errorsEl);
     assistantEl.appendChild(metaEl);
 
     row.appendChild(userEl);
     row.appendChild(assistantEl);
 
-    return { row, userEl, userAuthor, userText, userAttachmentsEl, textEl, toolsEl, metaEl, tools: new Map() };
+    return {
+      row, userEl, userAuthor, userText, userAttachmentsEl, textEl,
+      toolGroup, toolSummary, toolsEl, errorsEl, metaEl, tools: new Map(),
+    };
   }
 
   function updateTurnRow(rec, t) {
@@ -803,14 +831,17 @@ export function initChat({
       rec.userText.textContent = blocksToText(t.user);
       renderUserAttachments(rec.userAttachmentsEl, t.user);
     }
-    rec.textEl.innerHTML = renderModelText(t.text);
+    if (rec.text !== t.text) {
+      rec.text = t.text;
+      rec.textEl.innerHTML = renderModelText(t.text);
+    }
 
     const seenTools = new Set();
     t.tools.forEach((tool) => {
       seenTools.add(tool.tool_use_id);
       let toolRec = rec.tools.get(tool.tool_use_id);
       if (!toolRec) {
-        toolRec = buildToolCard(tool);
+        toolRec = buildToolCard(tool, rec.toolGroup);
         rec.tools.set(tool.tool_use_id, toolRec);
         rec.toolsEl.appendChild(toolRec.card);
       }
@@ -821,6 +852,31 @@ export function initChat({
         toolRec.card.remove();
         rec.tools.delete(id);
       }
+    }
+
+    rec.toolGroup.hidden = !t.tools.length;
+    const pending = t.tools.filter((tool) => !tool.result).length;
+    const failed = t.tools.filter((tool) => tool.result?.isError).length;
+    rec.toolSummary.textContent = `${t.tools.length} tool call${t.tools.length === 1 ? "" : "s"}`
+      + (pending ? ` · ${pending} running` : "")
+      + (failed ? ` · ${failed} failed` : "");
+
+    // Append only: live recovery removes the banner, never these original
+    // turn records or a reader's open error details.
+    for (let i = rec.errorsEl.childElementCount; i < t.errors.length; i++) {
+      const error = t.errors[i];
+      const details = document.createElement("details");
+      details.className = "turnerror";
+      const summary = document.createElement("summary");
+      summary.textContent = error.remediation || "The agent reported an error.";
+      details.appendChild(summary);
+      if (error.stderr) {
+        const pre = document.createElement("pre");
+        pre.textContent = error.stderr;
+        details.appendChild(pre);
+      }
+      inspectDisclosure(details);
+      rec.errorsEl.appendChild(details);
     }
 
     // Rebuilt only when it changes, since every render passes every turn.
@@ -841,6 +897,15 @@ export function initChat({
   }
 
   function renderTurns(chat) {
+    const following = stickToBottom;
+    const scrollTop = chatLogEl.scrollTop;
+    // Anchor to a visible message/card, not merely the top of its possibly
+    // very tall turn. Changes above it must not move the text being read.
+    const top = chatLogEl.getBoundingClientRect().top;
+    const anchor = following ? null : Array.from(chatLogEl.querySelectorAll(
+      ".msg.user, .msg.assistant > .text, .toolgroup > summary, .toolcard, .turnerror, .turnmeta",
+    )).find((node) => node.getBoundingClientRect().bottom > top);
+    const anchorTop = anchor?.getBoundingClientRect().top;
     const seen = new Set();
     chat.turns.forEach((t) => {
       seen.add(t.turn);
@@ -858,7 +923,12 @@ export function initChat({
         turnEls.delete(turn);
       }
     }
-    if (stickToBottom) chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    if (following) chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    else if (anchor?.isConnected) {
+      chatLogEl.scrollTop = scrollTop + anchor.getBoundingClientRect().top - anchorTop;
+    } else {
+      chatLogEl.scrollTop = scrollTop;
+    }
   }
 
   function buildPermissionCard(req) {
@@ -1342,6 +1412,13 @@ export function initChat({
   const SETTLE_MS = 1500;
   let unconfirmed = new Set();
   let settleTimer = null;
+  // AgentError predates turn ids. Track the executing turn through the
+  // transcript, including replay; queued inputs must not steal its errors.
+  let activityTurn = 0;
+
+  function clearAgentErrorBanner() {
+    if (store.getState().chat.banner?.source === "agent") store.clearChatBanner();
+  }
 
   function settleUnconfirmed() {
     clearTimeout(settleTimer);
@@ -1383,8 +1460,10 @@ export function initChat({
         store.setChatBanner(
           "error",
           session.agent_error.remediation || "The agent reported an error.",
-          session.agent_error.stderr,
+          session.agent_error.stderr, "agent",
         );
+      } else {
+        clearAgentErrorBanner();
       }
     }
     // What this pane sent over an earlier connection is settled by the replay
@@ -1400,6 +1479,7 @@ export function initChat({
       store.resetChatTurns();
       // Another conversation's cards: nobody is waiting on them any more.
       store.clearChatPending();
+      activityTurn = 0;
     }
     // A decision sent over the connection that dropped may never have
     // arrived. A card it did decide is retired by the replay that follows;
@@ -1422,6 +1502,16 @@ export function initChat({
   function handleEvent(event, meta = {}) {
     if (!event) return;
     const replayed = !!meta.replayed;
+    const current = store.getState().chat.turns.find((t) => t.turn === activityTurn);
+    if ((event.kind === "user_turn" && (!current || current.complete))
+        || (event.kind === "input_state" && event.state === "provider_ack")
+        || event.kind === "text_delta" || event.kind === "tool_use") {
+      activityTurn = event.turn;
+    }
+    const recovered = (event.kind === "input_state" && event.state === "provider_ack")
+      || (event.kind === "text_delta" && !!event.text)
+      || event.kind === "tool_use";
+    if (!replayed && recovered) clearAgentErrorBanner();
     switch (event.kind) {
       case "user_turn":
         store.setChatUserTurn(
@@ -1500,12 +1590,7 @@ export function initChat({
         // connection was accepted; a live event is what keeps it current.
         if (!replayed) {
           store.setChatAgentStatus(event.status);
-          // Why it was down (a reload retries a failed start) no longer
-          // holds once it is up; an error during a turn comes after this.
-          const banner = store.getState().chat.banner;
-          if (event.status === "ready" && banner && banner.kind === "error") {
-            store.clearChatBanner();
-          }
+          if (event.status === "ready") clearAgentErrorBanner();
         }
         break;
       case "agent_model_changed":
@@ -1528,6 +1613,7 @@ export function initChat({
         break;
       case "session_reset":
         store.resetChatTurns();
+        activityTurn = 0;
         // The old conversation's usage is not the new one's; the hello of a
         // later connection says so too.
         if (!replayed) store.setChatUsage(null);
@@ -1536,9 +1622,10 @@ export function initChat({
       case "agent_error":
         // What to do, and under it the backend's own words, which are often
         // the only real reason given.
+        store.addChatTurnError(activityTurn, event.remediation || "", event.stderr || "");
         if (!replayed) {
           store.setChatBanner(
-            "error", event.remediation || "The agent reported an error.", event.stderr);
+            "error", event.remediation || "The agent reported an error.", event.stderr, "agent");
         }
         break;
       default:

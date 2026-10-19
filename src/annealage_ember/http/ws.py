@@ -194,9 +194,9 @@ def register_ws(
             # is no second writer for those frames to race.
             # The agent's status is read from the session itself, not the
             # snapshot session_info took at startup: the page takes the status,
-            # and why the agent is down, from this frame and from live events
-            # only (a replayed one may be an earlier process's), so both have
-            # to be as they are now.
+            # and the active failure, from this frame and from live events
+            # only (a replayed one may be an earlier process's). A turn error
+            # can remain active while the backend itself is still ready.
             agent = session.agent_status() if session is not None else None
             agent = agent or session_info.get("agent", "unavailable")
             await ws.send(
@@ -210,9 +210,7 @@ def register_ws(
                         paused=bus.paused if bus is not None else False,
                         model=session_info.get("model"),
                         steers=session_info.get("steers", False),
-                        agent_error=(
-                            session_info.get("agent_error") if agent != AGENT_READY else None
-                        ),
+                        agent_error=session_info.get("agent_error"),
                         usage=session_info.get("usage"),
                         upload_actions=session_info.get("upload_actions"),
                         models=session_info.get("models"),
