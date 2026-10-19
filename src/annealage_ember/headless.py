@@ -273,9 +273,10 @@ class _Run:
     """The current turn and completed turns of one live run. The guard and
     event sink remain attached to the same object throughout the run."""
 
-    def __init__(self, server_prefix: str, on_runtime=None):
+    def __init__(self, server_prefix: str, on_runtime=None, on_activity=None):
         self._prefix = server_prefix
         self._on_runtime = on_runtime
+        self._on_activity = on_activity
         self.done = asyncio.Event()
         self.text: List[str] = []
         self.errors: List[str] = []
@@ -405,6 +406,28 @@ class _Run:
             and event.turn <= self._last_turn
         ):
             return
+        # Project only public model text and tool identity/outcome, never the
+        # session event itself (which can carry arguments or private results).
+        activity = None
+        if isinstance(event, TextDelta):
+            activity = {"kind": "text_delta", "text": event.text, "turn": event.turn}
+        elif isinstance(event, ToolUse):
+            name = event.name
+            if name.startswith(self._prefix):
+                name = name[len(self._prefix):]
+            activity = {"kind": "tool_use", "name": name,
+                        "tool_use_id": event.tool_use_id, "turn": event.turn}
+        elif isinstance(event, ToolResult):
+            if not self._completed or event.tool_use_id in self._by_id:
+                activity = {"kind": "tool_result", "tool_use_id": event.tool_use_id,
+                            "is_error": event.is_error}
+        if activity is not None and self._on_activity is not None:
+            try:
+                self._on_activity(activity)
+            except Exception:
+                # Observability must not change execution or leak event data
+                # through an observer exception's repr.
+                sys.stderr.write("warning: headless activity observer failed\n")
         if isinstance(event, AgentRuntimeResolved):
             if self._on_runtime is not None:
                 try:
@@ -1055,6 +1078,7 @@ async def run_prompt(
     usage_sink=None,
     builtin_tools=(),
     on_runtime=None,
+    on_activity=None,
     max_budget_usd=None,
     native_max_turns=None,
     on_owner=None,
@@ -1192,6 +1216,11 @@ async def run_prompt(
     alias requested, the alias OMP resolved to the reported model, and the
     verified OMP role-resolution path. Observer failures are logged and do not
     change the run.
+    ``on_activity(event: dict) -> None`` receives ordered public ``text_delta``,
+    ``tool_use`` (name/id/turn only) and ``tool_result`` (id/is_error only)
+    records, including results arriving after a turn boundary. It receives no
+    prompts, reasoning, tool arguments or tool result text. It is synchronous,
+    best effort, and observer exceptions never change execution.
     ``on_owner(event)`` optionally receives native-process ownership and
     termination records for a Claude SDK run when ``owner_context`` supplies
     ``run_id``, ``project_id``, ``source`` and integer ``epoch``. The SDK
@@ -1247,7 +1276,8 @@ async def run_prompt(
 
     with _conversation_state(state_dir, resume=resume, backend=backend, cwd=cwd) as state:
         bus = ViewerBus(ViewerRegistry(), url="")
-        run = _Run(namespaced(product.current().mcp_server_name, ""), on_runtime=on_runtime)
+        run = _Run(namespaced(product.current().mcp_server_name, ""),
+                   on_runtime=on_runtime, on_activity=on_activity)
         def recovery_info():
             return RecoveryInfo(
                 backend=backend,

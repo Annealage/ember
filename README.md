@@ -632,6 +632,14 @@ replacement child.
 
 `run_prompt(..., on_runtime=callback)` calls `callback(event)` with each `AgentRuntimeResolved` event the backend reports. Events carry backend, nullable provider/model/effort and `provenance`; role-selected OMP runs also include the requested and resolved role plus role-resolution provenance. The model always comes from backend runtime observation, never from requested configuration. This callback observes runtime facts, it doesn't establish a pre-submit admission guarantee.
 
+`run_prompt(..., on_activity=callback)` calls a synchronous, best-effort observer
+with ordered public activity dictionaries: `text_delta` (text/turn), `tool_use`
+(name/tool_use_id/turn) and `tool_result` (tool_use_id/is_error). Late results
+stay attached to their original tool id. The observer receives no prompts,
+hidden reasoning, tool arguments or result text. Keep it quick and batch any
+persistence; observer exceptions are reported without event data and never
+change execution. This is read-only visibility, not an admission or review gate.
+
 When a run ends early (timeout or cancel), further tool calls are refused, handlers still running are cancelled and waited for (up to 5 seconds, so their cleanup is done before `run_prompt` returns), the backend process is killed and the close is bounded at 10 seconds. A handler blocked inside a synchronous call cannot be stopped and finishes on its own thread, so keep per-run handlers free of that. `omp_agent_dir`, `omp_binary` and `omp_config_dir` take the omp profile, executable and config root, as `launch.build_session` does.
 `provider_session_id` and `cache_retention` are OMP-only and refused with
 `ValueError` on Claude. The provider ID is an opaque affinity hint passed to

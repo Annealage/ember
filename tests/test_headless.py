@@ -1262,3 +1262,44 @@ async def test_callback_ignoring_cancellation_cannot_hold_timeout_or_submit_afte
         release.set()
         await asyncio.wait_for(ended.wait(), 2)
     assert len(built.session.submitted_turns) == 1
+
+
+async def test_public_activity_observer_is_live_ordered_private_and_accepts_late_results(monkeypatch, tmp_path):
+    events = []
+    partial = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def script(session):
+        session.emit(TextDelta(turn=1, text="Checking "))
+        partial.set()
+        await proceed.wait()
+        session.emit(ToolUse(turn=1, tool_use_id="tool-1", name="lookup",
+                             input={"secret": "PRIVATE ARGUMENT"}))
+        session.emit(TurnEnd(turn=1, stop_reason="end_turn", cost_usd=0.1, tokens=TOKENS))
+        session.emit(ToolResult(tool_use_id="tool-1", is_error=True, text="PRIVATE RESULT"))
+
+    script_session(monkeypatch, script)
+    task = asyncio.create_task(run_prompt("PRIVATE PROMPT", system="PRIVATE SYSTEM",
+                                         **make_args(tmp_path, on_activity=events.append)))
+    await asyncio.wait_for(partial.wait(), 2)
+    assert events == [{"kind": "text_delta", "text": "Checking ", "turn": 1}]
+    assert not task.done()
+    proceed.set()
+    result = await task
+    assert [event["kind"] for event in events] == ["text_delta", "tool_use", "tool_result"]
+    assert events[-1] == {"kind": "tool_result", "tool_use_id": "tool-1", "is_error": True}
+    assert "PRIVATE" not in str(events)
+    assert result.calls == (("lookup", False),)
+
+
+async def test_public_activity_observer_failure_never_changes_result_or_logs_secrets(monkeypatch, tmp_path, capsys):
+    async def script(session):
+        await finish(session, text=("Visible",))
+    def broken(_event):
+        raise RuntimeError("PRIVATE OBSERVER VALUE")
+    script_session(monkeypatch, script)
+    result = await run_prompt("go", **make_args(tmp_path, on_activity=broken))
+    assert result.error is None and result.text == "Visible"
+    captured = capsys.readouterr()
+    assert "activity observer failed" in captured.err
+    assert "PRIVATE" not in captured.err
