@@ -399,6 +399,7 @@ group.listeners.toggle[0]();
 tools.scrollTop = 92;
 const firstCard = tools.children[0];
 firstCard.open = true;
+firstCard.listeners.toggle[0]();
 firstCard.children[2].scrollTop = 37;
 const log = el("chatLog");
 log.scrollTop = 240; log.clientHeight = 200; log.scrollHeight = 2000;
@@ -440,9 +441,13 @@ chat.handleEvent({ kind: "text_delta", turn: 9, text: "Gamma." });
 const orderedNodes = [...segmentContainer(9).children];
 const runA = orderedNodes[1];
 const runB = orderedNodes[3];
-const cardA = runA.children[1].children[0];
-runA.open = true; cardA.open = true;
+runA.open = true;
 runA.listeners.toggle[0]();
+runB.open = true;
+runB.listeners.toggle[0]();
+const cardA = runA.children[1].children[0];
+cardA.open = true;
+cardA.listeners.toggle[0]();
 runA.children[1].scrollTop = 42;
 cardA.children[2].scrollTop = 17;
 chat.handleEvent(user(10));
@@ -450,6 +455,9 @@ chat.handleEvent({ kind: "tool_use", turn: 10, tool_use_id: "next", name: "read"
 chat.handleEvent({ kind: "tool_result", tool_use_id: "a1", is_error: true, text: "late earlier result" });
 chat.handleEvent({ kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: {} }, { replayed: true });
 chat.handleEvent({ kind: "tool_result", tool_use_id: "a2", is_error: false, text: "second result" });
+const nextRun = segmentContainer(10).children[0];
+nextRun.open = true;
+nextRun.listeners.toggle[0]();
 out.inlineOrder = segmentContainer(9).children.map((n) => n.className === "text"
   ? "text:" + n.innerHTML
   : "tools:" + n.children[1].children.map((c) => c.dataset.toolId).join(","));
@@ -480,6 +488,13 @@ for (const event of [
   { kind: "tool_result", tool_use_id: "a1", is_error: true, text: "late earlier result" },
   { kind: "tool_use", turn: 9, tool_use_id: "a1", name: "read", input: {} },
 ]) chat.handleEvent(event, { replayed: true });
+for (const run of segmentContainer(9).children.filter((n) => n.className === "toolgroup")) {
+  run.open = true;
+  run.listeners.toggle[0]();
+}
+const replayCard = segmentContainer(9).children[1].children[1].children[0];
+replayCard.open = true;
+replayCard.listeners.toggle[0]();
 out.inlineReplayOrder = segmentContainer(9).children.map((n) => n.className === "text"
   ? "text:" + n.innerHTML
   : "tools:" + n.children[1].children.map((c) => c.dataset.toolId).join(","));
@@ -696,7 +711,7 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
         "className": "toolgroup",
         "collapsed": True,
         "summary": "120 tool calls · 1 failed",
-        "count": 120,
+        "count": 0,
         "nextTurnTools": 0,
     }
     assert observed["inspectionPreserved"] == [True, True, 92, 37, 240]

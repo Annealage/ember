@@ -190,6 +190,24 @@ const listeners = new Map(); // key (or '*') -> Set<fn(state)>
 let notifying = false;
 const pending = [];
 
+let batchDepth = 0;
+const batchKeys = new Set();
+
+// History pages are one observable change, not thousands of partial renders.
+function batch(fn) {
+  batchDepth++;
+  try {
+    fn();
+  } finally {
+    batchDepth--;
+    if (!batchDepth && batchKeys.size) {
+      const keys = [...batchKeys];
+      batchKeys.clear();
+      commit(() => {}, keys);
+    }
+  }
+}
+
 function commit(mutate, changedKeys) {
   if (notifying) {
     pending.push([mutate, changedKeys]);
@@ -209,6 +227,10 @@ function commit(mutate, changedKeys) {
 function apply(mutate, changedKeys) {
   mutate();
   state = Object.freeze(state);
+  if (batchDepth) {
+    changedKeys.forEach((key) => batchKeys.add(key));
+    return;
+  }
   notifying = true;
   try {
     const keys = new Set([...changedKeys, "*"]);
@@ -329,8 +351,11 @@ function ensureTurn(chat, turn) {
     inputState: null,
     inputDetail: null,
   });
-  const turns = Object.freeze([...chat.turns, record]);
-  return { turns, idx: turns.length - 1 };
+  const next = [...chat.turns];
+  const insertion = next.findIndex((t) => t.turn > turn);
+  const at = insertion === -1 ? next.length : insertion;
+  next.splice(at, 0, record);
+  return { turns: Object.freeze(next), idx: at };
 }
 
 function setChatInputState(turn, stateName, detail = null) {
@@ -481,6 +506,19 @@ function endChatTurn(
       )),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
+  }, ["chat"]);
+}
+
+// Old full-turn pages may predate turn_end (or include abandoned queued input).
+// Such input is transcript, never a new running turn.
+function completeChatHistory(turnNumbers) {
+  commit(() => {
+    const chat = state.chat;
+    const turns = Object.freeze(chat.turns.map((turn) => (
+      turnNumbers.has(turn.turn) && !turn.complete
+        ? Object.freeze({ ...turn, complete: true }) : turn
+    )));
+    state = { ...state, chat: Object.freeze({ ...chat, turns }) };
   }, ["chat"]);
 }
 
@@ -785,6 +823,7 @@ function clearChatAttachments() {
 export const store = Object.freeze({
   getState,
   subscribe,
+  batch,
   setToolCardsCollapsed,
   setActiveTab,
   setPanelOpen,
@@ -797,6 +836,7 @@ export const store = Object.freeze({
   addChatToolUse,
   setChatToolResult,
   endChatTurn,
+  completeChatHistory,
   queueChatUserTurn,
   dropChatUserTurn,
   addChatPermissionRequest,

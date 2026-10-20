@@ -42,6 +42,10 @@ and a hello's ``last_seq`` counts only in the session its ``session_id``
 names. A version-1 page left open across the upgrade would take that
 history as new and show every message twice, so it is closed with
 ``CLOSE_VERSION_MISMATCH`` and told to reload instead.
+
+Recent-turn history is opt-in with ``hello.history_turns``. Version 2
+clients omitting it still receive the original full replay, so adding
+``history_page`` and ``history`` requires no version bump.
 """
 
 from __future__ import annotations
@@ -263,6 +267,38 @@ def build_refused(reason: str, client_id: Optional[str] = None) -> dict:
     return frame
 
 
+def build_history_page(session_id, page, *, initial=False, requested_before=None) -> dict:
+    frame = {
+        "v": PROTOCOL_VERSION,
+        "type": "history_page",
+        "session_id": session_id,
+        "events": [{"seq": seq, "event": event} for seq, event in page.events],
+        "before": page.before,
+        "has_more": page.has_more,
+        "initial": initial,
+        "through": page.through,
+    }
+    if initial:
+        frame["pending_request_ids"] = list(page.pending_request_ids)
+    else:
+        frame["requested_before"] = requested_before
+    return frame
+
+
+def build_history_error(
+    session_id, requested_before, reason, *, initial=False, through=None
+) -> dict:
+    return {
+        "v": PROTOCOL_VERSION,
+        "type": "history_error",
+        "session_id": session_id,
+        "requested_before": requested_before,
+        "initial": initial,
+        "reason": reason,
+        **({"through": through} if through is not None else {}),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Inbound (browser to server) frame validation.
 # ---------------------------------------------------------------------------
@@ -292,6 +328,10 @@ def _check_hello(frame: dict) -> Optional[str]:
     session_id = frame.get("session_id")
     if session_id is not None and not (isinstance(session_id, str) and len(session_id) <= 128):
         return "hello.session_id must be a string of at most 128 characters, or absent"
+    if "history_turns" in frame:
+        count = frame["history_turns"]
+        if type(count) is not int or not 1 <= count <= 50:
+            return "hello.history_turns must be an integer from 1 to 50"
     viewer = frame.get("viewer")
     if viewer is not None:
         error = object_error(viewer, {"tab_id", "w", "h"}, {"tab_id"}, "hello.viewer")
@@ -308,6 +348,19 @@ def _check_hello(frame: dict) -> Optional[str]:
     token = frame.get("token")
     if token is not None and not isinstance(token, str):
         return "hello.token must be a string or absent"
+    return None
+
+
+def _check_history(frame: dict) -> Optional[str]:
+    session_id = frame["session_id"]
+    if not isinstance(session_id, str) or not 0 < len(session_id) <= 128:
+        return "history.session_id must be a string of 1 to 128 characters"
+    before = frame["before"]
+    if before is not None and (type(before) is not int or before < 1):
+        return "history.before must be a positive integer or null"
+    limit = frame.get("limit", 20)
+    if type(limit) is not int or not 1 <= limit <= 50:
+        return "history.limit must be an integer from 1 to 50"
     return None
 
 
@@ -408,7 +461,12 @@ class FrameSpec:
 # flat key shape already passed, for the shapes that need to look inside a
 # nested object or enumerate a value's allowed contents.
 _INBOUND_SPECS = {
-    "hello": FrameSpec({"token", "last_seq", "viewer", "session_id"}, set(), _check_hello),
+    "hello": FrameSpec(
+        {"token", "last_seq", "viewer", "session_id", "history_turns"}, set(), _check_hello
+    ),
+    "history": FrameSpec(
+        {"session_id", "before", "limit"}, {"session_id", "before"}, _check_history
+    ),
     "turn": FrameSpec({"blocks", "client_id"}, {"blocks"}, _check_turn),
     "permission": FrameSpec(
         {"request_id", "decision", "message"}, {"request_id", "decision"}, _check_permission

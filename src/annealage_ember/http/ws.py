@@ -63,6 +63,7 @@ MAX_WS_MESSAGE = 4 * 1024 * 1024
 HOSTED_AUTH_EXPIRED = 4401
 _HOSTED_FRAME_OPS = {
     "hello": "project.read",
+    "history": "project.read",
     "turn": "project.exec",
     "interrupt": "project.exec",
     "result": "project.exec",
@@ -239,6 +240,7 @@ def register_ws(
                 hosted_frame_ops or {},
                 recorder,
                 browser_runtime_controls,
+                history_session_id=session_info["id"],
             )
         except (WebSocketError, ConnectionError, asyncio.IncompleteReadError):
             # The peer closed, vanished (a reset or broken pipe as this
@@ -339,20 +341,14 @@ async def _greet(ws, event_log, token, session_id=None):
     a socket the token opened. ``None`` checks nothing, for a socket a tailnet
     login opened, whose page may hold no token at all.
 
-    The answer is the history since the client's ``last_seq``: the ring's,
-    and before that the event log's file, read off the event loop, which is
-    what brings a reloaded page, or any page after a restart, the whole
-    conversation (``EventLog.replay_async``). A ``last_seq`` is a position in
-    one session's log, so one the client does not say belongs to this
-    session (``session_id``, this server's) is no position here, and the
-    client is answered from the start. Events appended while the history is
-    being read or sent (a turn streaming meanwhile) are caught up with here
-    too, round after round, each starting where the last one's snapshot
-    ended, until one finds nothing new. A broadcast scheduled before that
-    last round may still reach the connection once it is registered, with an
-    event this replay already sent; the page drops any event at or below the
-    last seq it has (``static/ws.js``). A history that really is unavailable
-    (an in-memory log whose ring has moved on) is said so, once.
+    A new client opting in with ``history_turns`` receives a bounded page,
+    followed by catchup above that page's fixed snapshot. A matching-session
+    reconnect with a positive cursor always uses ordinary replay, even when
+    it missed more turns than a page. Older clients retain full replay.
+    Catchup finishes with an in-memory empty snapshot: that final round has
+    no await, and registration starts synchronously before its first await,
+    so there is no unregistered gap in which an appended event can be lost.
+    Already-scheduled duplicate broadcasts are deduplicated by the client.
 
     A client that connects and then says nothing is never registered, so it
     receives no events and consumes no writer task. That is the right outcome
@@ -385,6 +381,31 @@ async def _greet(ws, event_log, token, session_id=None):
         position = frame.get("last_seq")
         if frame.get("session_id") != session_id:
             position = None
+        recent = frame.get("history_turns")
+        reconnect = (
+            frame.get("session_id") == session_id
+            and type(position) is int
+            and 0 < position <= event_log.current_seq
+        )
+        if recent is not None and not reconnect:
+            # Capture the fallback cursor before a worker can run. An
+            # unavailable history must not accidentally trigger full replay.
+            fallback = event_log.history_pending()
+            position = fallback.through
+            try:
+                page = await event_log.history_async(limit=recent)
+            except ValueError as exc:
+                await ws.send(json.dumps(protocol.build_history_page(
+                    session_id, fallback, initial=True
+                )))
+                await ws.send(json.dumps(protocol.build_history_error(
+                    session_id, None, str(exc), initial=True, through=position
+                )))
+            else:
+                position = page.through
+                await ws.send(json.dumps(protocol.build_history_page(
+                    session_id, page, initial=True
+                )))
         told = False
         while True:
             replay = await event_log.replay_async(position)
@@ -456,6 +477,7 @@ async def _serve_connection(
     frame_ops=None,
     records=None,
     browser_runtime_controls=True,
+    history_session_id=None,
 ):
     """Read and dispatch frames until the peer goes away.
 
@@ -532,11 +554,13 @@ async def _serve_connection(
         await _dispatch(
             ws, conn, registry, event_log, token, frame, session, bus, records,
             browser_runtime_controls,
+            history_session_id=history_session_id,
         )
 
 async def _dispatch(
     ws, conn, registry, event_log, token, frame, session=None, bus=None, records=None,
     browser_runtime_controls=True,
+    history_session_id=None,
 ):
     """Route one validated inbound frame."""
     kind = frame["type"]
@@ -546,6 +570,31 @@ async def _dispatch(
                 "model selection is configured by the operator, not in the browser"
             ))
         )
+        return
+    if kind == "history":
+        requested = frame["before"]
+        if frame["session_id"] != history_session_id:
+            await ws.send(json.dumps(protocol.build_history_error(
+                frame["session_id"], requested, "history session does not match"
+            )))
+            return
+        initial = requested is None
+        fallback = event_log.history_pending() if initial else None
+        try:
+            page = await event_log.history_async(requested, frame.get("limit", 20))
+        except ValueError as exc:
+            if initial:
+                await ws.send(json.dumps(protocol.build_history_page(
+                    history_session_id, fallback, initial=True
+                )))
+            await ws.send(json.dumps(protocol.build_history_error(
+                history_session_id, requested, str(exc), initial=initial,
+                through=fallback.through if initial else None,
+            )))
+        else:
+            await ws.send(json.dumps(protocol.build_history_page(
+                history_session_id, page, initial=initial, requested_before=requested
+            )))
         return
     if kind == "hello":
         # The opening hello is answered by _greet, before this connection was

@@ -57,7 +57,9 @@
  * (including every reconnect, since agent status can change between them),
  * and `onAgentEvent` receives every event neither this module nor a product
  * handler takes, replayed ones included, with `{replayed}` saying which.
- * Neither is called from here except at those two points;
+ * Paged history adds `{history:true, initial, seq}` and history_page /
+ * history_page_end lifecycle events around each batch; history_error reports
+ * a retryable read failure. Only the first page advances the transport cursor.
  * chat.js, not this module, decides what an event means. The returned `send`
  * is this module's only outbound capability, so a turn, permission, pause or
  * interrupt frame still goes out over the one socket this closure owns, with
@@ -331,6 +333,10 @@ export function initWs({
   let fallbackTimer = null;
   let reconnectTimer = null;
   let livenessTimer = null;
+  let historyBefore = null;
+  let initialHistoryExpected = false;
+  let historyFloor = 0;
+  const delivered = new Map();
 
   // A Map rather than the object itself, so an event kind can never resolve
   // to something the object inherited ("constructor", "toString").
@@ -362,6 +368,13 @@ export function initWs({
   // immediately instead of waiting on an answer that will never arrive.
   function send(frame) {
     if (frame.type === "set_model" && !allowModelChange) return false;
+    if (frame.type === "history") {
+      if (frame.session_id !== seqSession
+          || (frame.before !== null && !Number.isInteger(frame.before))) return false;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      historyBefore = frame.before;
+      if (frame.before === null) initialHistoryExpected = true;
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ ...frame, v: PROTOCOL_VERSION }));
       return true;
@@ -427,6 +440,7 @@ export function initWs({
       v: PROTOCOL_VERSION,
       type: "hello",
       last_seq: lastSeq,
+      history_turns: 1,
       viewer: { tab_id: TAB_ID, w: window.innerWidth, h: window.innerHeight },
     };
     // Checked by the server when the token opened the socket; a page signed
@@ -459,6 +473,17 @@ export function initWs({
       handleHello(frame);
     } else if (frame.type === "event") {
       handleEvent(frame);
+    } else if (frame.type === "history_page") {
+      handleHistoryPage(frame);
+    } else if (frame.type === "history_error") {
+      if (frame.session_id === seqSession && frame.requested_before === historyBefore
+          && (!frame.initial || frame.through >= historyFloor)) {
+        historyBefore = null;
+        if (frame.initial && Number.isInteger(frame.through)) {
+          lastSeq = Math.max(lastSeq, frame.through);
+        }
+        onAgentEvent({ kind: "history_error", ...frame }, { replayed: true, history: true });
+      }
     } else if (frame.type === "call") {
       handleCall(frame);
     } else if (frame.type === "refused") {
@@ -532,7 +557,13 @@ export function initWs({
     // the position), or a log that has not reached it (a different run of
     // the log), so the replay that follows is not taken for duplicates.
     const session = frame.session && frame.session.id ? frame.session.id : null;
-    if (session !== seqSession || frame.seq < lastSeq) lastSeq = 0;
+    if (session !== seqSession || frame.seq < lastSeq) {
+      lastSeq = 0;
+      delivered.clear();
+      historyFloor = 0;
+    }
+    initialHistoryExpected = lastSeq === 0;
+    historyBefore = null;
     seqSession = session;
     // Everything up to here is replay of what already happened; only a later
     // seq is live (chat.js raises no notification for a replayed attention).
@@ -555,6 +586,47 @@ export function initWs({
     onHello(frame.session);
   }
 
+  function handleHistoryPage(frame) {
+    if (frame.session_id !== seqSession || !Array.isArray(frame.events)) return;
+    if (frame.initial) {
+      if (!initialHistoryExpected || frame.through < historyFloor) return;
+      initialHistoryExpected = false;
+    } else {
+      if (historyBefore === null || frame.requested_before !== historyBefore) return;
+      historyBefore = null;
+    }
+    // A retry of an unreadable initial page can overlap output already shown
+    // live. Rebuild that transcript from real sequenced events, not by appending
+    // yesterday's deltas after today's. Normal scrollback never rebuilds it.
+    const replace = !!frame.initial && delivered.size > 0;
+    let entries = frame.events;
+    if (replace) {
+      const merged = new Map(delivered);
+      for (const entry of entries) merged.set(entry.seq, entry.event);
+      entries = [...merged].sort((a, b) => a[0] - b[0])
+        .map(([seq, event]) => ({ seq, event }));
+    }
+    const meta = {
+      replayed: true, history: true, initial: !!frame.initial, replace, through: frame.through,
+    };
+    store.batch(() => {
+      onAgentEvent({ kind: "history_page", page: frame }, meta);
+      for (const entry of entries) {
+        if (!Number.isInteger(entry.seq) || (!replace && delivered.has(entry.seq))) continue;
+        delivered.set(entry.seq, entry.event);
+        const kind = entry.event?.kind;
+        if (kind !== "pause_changed" && !productHandlers.has(kind)) {
+          onAgentEvent(entry.event, { ...meta, seq: entry.seq });
+        }
+      }
+      onAgentEvent({ kind: "history_page_end", page: frame }, meta);
+    });
+    // Prepending older pages never rewinds the live transport's cursor.
+    if (frame.initial && Number.isInteger(frame.through)) {
+      lastSeq = Math.max(lastSeq, frame.through);
+    }
+  }
+
   function handleEvent(frame) {
     // Each event once, in order: the server can send an event twice around
     // the moment a connection is registered (its replay, then a broadcast
@@ -562,8 +634,16 @@ export function initWs({
     // order otherwise.
     if (frame.seq <= lastSeq) return;
     lastSeq = frame.seq;
+    if (delivered.has(frame.seq)) return;
+    delivered.set(frame.seq, frame.event);
     const event = frame.event;
     const kind = event && event.kind;
+    if (kind === "session_reset") {
+      delivered.clear();
+      historyFloor = frame.seq;
+      historyBefore = null;
+      initialHistoryExpected = false;
+    }
     // History rather than news: the hello already carried the current pause
     // flag, and onLive already refetched what a product event would, so
     // replaying either would only put back a state that has since changed
@@ -575,7 +655,7 @@ export function initWs({
     } else if (productHandlers.has(kind)) {
       if (!replayed) productHandlers.get(kind)(event);
     } else {
-      onAgentEvent(event, { replayed });
+      onAgentEvent(event, { replayed, seq: frame.seq });
     }
   }
 

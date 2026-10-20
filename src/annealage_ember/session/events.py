@@ -48,6 +48,7 @@ everything the model was sent.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import collections
 import dataclasses
 import json
@@ -103,6 +104,18 @@ class Replay:
 _TURN_KINDS = frozenset(("user_turn", "text_delta", "tool_use", "turn_end"))
 
 
+@dataclasses.dataclass(frozen=True)
+class HistoryPage:
+    """One immutable, chronological page, independent of the live cursor."""
+
+    events: List[Tuple[int, dict]]
+    before: Optional[int]
+    has_more: bool
+    through: int
+    pending_request_ids: tuple = ()
+
+
+
 class EventLog:
     """Append-only event history for one session's lifetime.
 
@@ -122,6 +135,20 @@ class EventLog:
         self._ring: collections.deque = collections.deque(maxlen=RING_SIZE)
         self._seq = 0
         self._fd: Optional[int] = None
+        # One entry per non-overlapping group of turns: (first seq, byte
+        # offset, number of turns preceding it). Queued/overlapping turns
+        # share a group so a page never cuts a reply in half.
+        self._history_groups: list = []
+        # Keep old cursors valid if a later result merges turn groups. They
+        # still bound a complete transcript at the snapshot that issued them.
+        self._history_boundaries: dict = {}
+        self._history_turns: dict = {}
+        self._history_tools: dict = {}
+        self._history_open: set = set()
+        self._history_floor = 1
+        self._history_offset = 0
+        self._file_size = 0
+        self._pending_history: dict = {}
         #: The highest turn number in the file, and every turn that has no
         #: ``turn_end`` there (a process killed mid-turn): where a resumed
         #: session's numbering continues and which turns ``app.create_app``
@@ -170,8 +197,11 @@ class EventLog:
         highest = 0
         started, ended = set(), set()
         requests: dict = {}  # request_id -> None, in the order they were asked
-        with open(self._path, "r", encoding="utf-8") as f:
+        with open(self._path, "rb") as f:
+            offset = 0
             for line in f:
+                line_offset = offset
+                offset += len(line)
                 try:
                     record = json.loads(line)
                 except ValueError:
@@ -184,6 +214,8 @@ class EventLog:
                 event = record.get("event")
                 if not isinstance(event, dict):
                     continue
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    self._index_history(seq, event, line_offset)
                 kind = event.get("kind")
                 if kind == "request_usage":
                     event_id = event.get("event_id")
@@ -207,6 +239,9 @@ class EventLog:
                 if kind == "session_reset":
                     # A new conversation began after it: that usage is not its.
                     self.last_usage = None
+                    started.clear()
+                    ended.clear()
+                    requests.clear()
                 request_id = event.get("request_id")
                 if kind == "permission_request" and isinstance(request_id, str):
                     requests[request_id] = None
@@ -219,6 +254,7 @@ class EventLog:
                     started.add(turn)
                     if kind == "turn_end":
                         ended.add(turn)
+            self._file_size = offset
         self.last_turn = max(started, default=0)
         self.unfinished_turns = tuple(sorted(started - ended))
         self.unresolved_requests = tuple(requests)
@@ -260,14 +296,165 @@ class EventLog:
         seq = self._seq
         self._ring.append((seq, wire))
         if self._fd is not None:
-            line = json.dumps({"seq": seq, "event": wire}) + "\n"
-            os.write(self._fd, line.encode("utf-8"))
+            line = (json.dumps({"seq": seq, "event": wire}) + "\n").encode("utf-8")
+            os.write(self._fd, line)
+            offset = self._file_size
+            self._file_size += len(line)
+        else:
+            offset = 0
+        self._index_history(seq, wire, offset)
         for observe in self.observers:
             try:
                 observe(wire)
             except Exception as exc:
                 sys.stderr.write("warning: an event log observer failed: %r\n" % (exc,))
         return seq
+
+    def _index_history(self, seq: int, event: dict, offset: int) -> None:
+        kind = event.get("kind")
+        if kind == "session_reset":
+            self._history_groups.clear()
+            self._history_boundaries.clear()
+            self._history_turns.clear()
+            self._history_tools.clear()
+            self._history_open.clear()
+            self._pending_history.clear()
+            self._history_floor = seq
+            self._history_offset = offset
+        request_id = event.get("request_id")
+        if kind == "permission_request" and isinstance(request_id, str):
+            self._pending_history[request_id] = (seq, event)
+        elif kind == "permission_resolved":
+            self._pending_history.pop(request_id, None)
+        if kind == "tool_result":
+            turn = self._history_tools.pop(event.get("tool_use_id"), None)
+        elif kind in _TURN_KINDS:
+            turn = event.get("turn")
+            if kind == "tool_use" and isinstance(event.get("tool_use_id"), str):
+                self._history_tools[event["tool_use_id"]] = turn
+        else:
+            return
+        if not isinstance(turn, int) or isinstance(turn, bool):
+            return
+        if turn not in self._history_turns:
+            if not self._history_open:
+                self._history_groups.append((seq, offset, len(self._history_turns)))
+                self._history_boundaries[seq] = len(self._history_turns)
+            self._history_turns[turn] = seq
+            if kind != "turn_end":
+                self._history_open.add(turn)
+        else:
+            # A late event for an older turn overlaps every group after its
+            # first event. Merge those boundaries rather than split that turn.
+            first = self._history_turns[turn]
+            i = bisect.bisect_right(
+                self._history_groups, (first, float("inf"), float("inf"))
+            ) - 1
+            del self._history_groups[i + 1:]
+        if kind == "turn_end":
+            self._history_open.discard(turn)
+
+    def history_pending(self) -> HistoryPage:
+        """A pending-only snapshot when a transcript read is unavailable."""
+        return HistoryPage(
+            events=list(self._pending_history.values()),
+            before=None,
+            has_more=False,
+            through=self._seq,
+            pending_request_ids=tuple(self._pending_history),
+        )
+
+    async def history_async(self, before: Optional[int] = None, limit: int = 20) -> HistoryPage:
+        """Read up to ``limit`` complete recent turns off the event loop.
+
+        Turn boundaries and byte offsets are indexed during append/recovery,
+        never by rescanning the file for a page. Overlapping turns are an
+        indivisible group and may make a page larger than the requested limit.
+        Everything needed to read is captured before the first await.
+        """
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("history limit must be an integer from 1 to 50")
+        through = self._seq
+        upper = through + 1 if before is None else before
+        if type(upper) is not int or not self._history_floor <= upper <= through + 1:
+            raise ValueError("history cursor is outside the current conversation")
+        groups = self._history_groups
+        end = bisect.bisect_left(groups, (upper,))
+        if before is not None and upper != self._history_floor:
+            if upper not in self._history_boundaries:
+                raise ValueError("history cursor is not a page boundary")
+        if not groups:
+            # Product notifications before the first conversation turn are
+            # not a transcript, however many have accumulated in the log.
+            return (
+                self.history_pending()
+                if before is None
+                else HistoryPage([], None, False, through)
+            )
+        count = (
+            len(self._history_turns)
+            if before is None
+            else self._history_boundaries.get(upper, 0)
+        )
+        target = max(0, count - limit)
+        start = end - 1
+        while start > 0 and groups[start][2] > target:
+            start -= 1
+        if not end:
+            lower, offset = self._history_floor, self._history_offset
+        elif start == 0:
+            lower, offset = self._history_floor, self._history_offset
+        else:
+            lower, offset, _ = groups[start]
+        pending = tuple(self._pending_history.items()) if before is None else ()
+        ring = [(seq, event) for seq, event in self._ring if lower <= seq < upper]
+        oldest = self._ring[0][0] if self._ring else through + 1
+        if lower < upper and lower < oldest:
+            records = await asyncio.to_thread(self._read_history, offset, lower, upper)
+        else:
+            records = _coalesce(ring)
+        # An old unresolved request is state, not a reason to render all of
+        # the intervening transcript. Retain its original seq and payload.
+        extras = [record for _, record in pending if record[0] < lower]
+        return HistoryPage(
+            events=extras + records,
+            before=lower if lower < upper else None,
+            has_more=lower > self._history_floor,
+            through=through,
+            pending_request_ids=tuple(request_id for request_id, _ in pending),
+        )
+
+    def _read_history(self, offset: int, lower: int, upper: int) -> List[Tuple[int, dict]]:
+        if self._path is None:
+            raise ValueError("older history is no longer kept")
+        records = []
+        reached = lower - 1
+        try:
+            with open(self._path, "rb") as stream:
+                stream.seek(offset)
+                for line in stream:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    seq, event = record.get("seq"), record.get("event")
+                    if type(seq) is not int or not isinstance(event, dict):
+                        continue
+                    if seq >= upper:
+                        break
+                    if seq < lower:
+                        continue
+                    if seq != reached + 1:
+                        raise ValueError("history has an unavailable event range")
+                    reached = seq
+                    records.append((seq, event))
+        except OSError as exc:
+            raise ValueError("history file is unavailable") from exc
+        if reached != upper - 1:
+            raise ValueError("history has an unavailable event range")
+        return _coalesce(records)
 
     def replay(self, last_seq: Optional[int]) -> Replay:
         """Everything newer than ``last_seq``, in seq order, plus whether

@@ -445,6 +445,63 @@ export function initChat({
   // The session this pane belongs to, learned from the hello frame. Null until
   // then, and null for a viewer-only run, which has no conversation to write.
   let sessionId = null;
+  let historyCursor = null;
+  let historyHasMore = false;
+  let historyReady = false;
+  let historyLoading = false;
+  let historyError = "";
+  let historyTimer = null;
+  let historyActivityTurn = 0;
+  let activeHistoryPermissions = new Set();
+  let historyExistingTurns = new Set();
+  let replaceTurnRows = false;
+  const historyControl = document.createElement("button");
+  historyControl.type = "button";
+  historyControl.className = "chathistory";
+  historyControl.hidden = true;
+  historyControl.setAttribute("aria-live", "polite");
+  historyControl.addEventListener("click", loadHistory);
+  chatLogEl.appendChild(historyControl);
+
+  function renderHistoryControl() {
+    historyControl.hidden = !historyReady && !historyError;
+    historyControl.disabled = historyLoading || (!historyHasMore && !historyError);
+    historyControl.textContent = historyLoading ? "Loading older messages…"
+      : historyError ? historyError + " Retry loading older messages"
+      : historyHasMore ? "Load older messages" : "Beginning of conversation";
+  }
+
+  function failHistory(reason) {
+    clearTimeout(historyTimer);
+    historyLoading = false;
+    historyError = reason || "Could not load older messages.";
+    renderHistoryControl();
+  }
+
+  function loadHistory() {
+    if (historyLoading || (!historyHasMore && !historyError) || !sessionId) return;
+    // An explicit request to read older content must never jump to live output.
+    stickToBottom = false;
+    historyLoading = true;
+    historyError = "";
+    renderHistoryControl();
+    if (!send({ type: "history", session_id: sessionId, before: historyCursor, limit: 1 })) {
+      failHistory("Connection unavailable.");
+      return;
+    }
+    historyTimer = setTimeout(() => failHistory("History request timed out."), 15000);
+  }
+
+  function resetHistory() {
+    clearTimeout(historyTimer);
+    historyCursor = null;
+    historyReady = false;
+    historyHasMore = false;
+    historyLoading = false;
+    historyError = "";
+    activeHistoryPermissions.clear();
+    renderHistoryControl();
+  }
   // Whether a message sent while a turn runs redirects it (the hello's
   // `steers`, the omp backend), which is what the Send button then says.
   let steers = false;
@@ -681,13 +738,17 @@ export function initChat({
   chatLogEl.addEventListener("scroll", () => {
     stickToBottom =
       chatLogEl.scrollTop + chatLogEl.clientHeight >= chatLogEl.scrollHeight - 24;
+    if (chatLogEl.scrollTop < 160 && !stickToBottom && !historyError) loadHistory();
   });
 
   // Opening an inspector is an explicit reading action, not a request to
   // jump to the newest output. Scrolling to the bottom resumes following.
-  function inspectDisclosure(details, visible = () => true) {
+  function inspectDisclosure(details, visible = () => true, onOpen = null) {
     details.addEventListener("toggle", () => {
-      if (details.open && visible()) stickToBottom = false;
+      if (details.open && visible()) {
+        stickToBottom = false;
+        if (onOpen) onOpen();
+      }
     });
   }
 
@@ -698,21 +759,26 @@ export function initChat({
     // A saved preference, read from the store rather than decided here, so the
     // settings window and this builder cannot disagree about the default.
     card.open = store.getState().toolCardsCollapsed === false;
-    inspectDisclosure(card, () => group.open);
     const summary = document.createElement("summary");
-    const inputEl = document.createElement("pre");
-    inputEl.className = "toolinput";
-    const resultEl = document.createElement("pre");
-    resultEl.className = "toolresult";
-    resultEl.hidden = true;
     card.appendChild(summary);
-    card.appendChild(inputEl);
-    card.appendChild(resultEl);
-    return { card, summary, inputEl, resultEl };
+    const rec = { card, summary, tool, inputEl: null, resultEl: null };
+    inspectDisclosure(card, () => group.open, () => updateToolCard(rec, rec.tool));
+    return rec;
   }
 
   function updateToolCard(rec, tool) {
+    // Keep only references while closed: formatting a large JSON input or
+    // assigning a megabyte result is work for the reader who opens this card.
+    rec.tool = tool;
     rec.summary.textContent = shortToolName(tool.name);
+    if (!rec.card.open) return;
+    if (!rec.inputEl) {
+      rec.inputEl = document.createElement("pre");
+      rec.inputEl.className = "toolinput";
+      rec.resultEl = document.createElement("pre");
+      rec.resultEl.className = "toolresult";
+      rec.card.append(rec.inputEl, rec.resultEl);
+    }
     if (rec.input !== tool.input) {
       rec.input = tool.input;
       rec.inputEl.textContent = formatToolInput(tool.input);
@@ -726,6 +792,31 @@ export function initChat({
       }
     } else {
       rec.resultEl.hidden = true;
+    }
+  }
+
+  function updateToolRun(rec, segment) {
+    let pending = 0;
+    let failed = 0;
+    for (const tool of segment.tools) {
+      if (!tool.result) pending++;
+      else if (tool.result.isError) failed++;
+    }
+    const count = segment.tools.length;
+    rec.summary.textContent = `${count} tool call${count === 1 ? "" : "s"}`
+      + (pending ? ` · ${pending} running` : "")
+      + (failed ? ` · ${failed} failed` : "");
+    // A collapsed run is one summary, however many calls the real turn has.
+    // Once opened, its cards stay mounted so expansion and inner scroll survive.
+    if (!rec.el.open) return;
+    for (const tool of segment.tools) {
+      let toolRec = rec.tools.get(tool.tool_use_id);
+      if (!toolRec) {
+        toolRec = buildToolCard(tool, rec.el);
+        rec.tools.set(tool.tool_use_id, toolRec);
+        rec.toolsEl.appendChild(toolRec.card);
+      }
+      updateToolCard(toolRec, tool);
     }
   }
 
@@ -791,7 +882,7 @@ export function initChat({
           segmentRec.toolsEl.className = "tools";
           el.appendChild(segmentRec.summary);
           el.appendChild(segmentRec.toolsEl);
-          inspectDisclosure(el);
+          inspectDisclosure(el, () => true, () => updateToolRun(segmentRec, segmentRec.value));
         }
         rec.segments[index] = segmentRec;
         rec.segmentsEl.appendChild(el);
@@ -802,23 +893,7 @@ export function initChat({
         segmentRec.el.innerHTML = renderModelText(segment.text);
         return;
       }
-      let pending = 0;
-      let failed = 0;
-      for (const tool of segment.tools) {
-        let toolRec = segmentRec.tools.get(tool.tool_use_id);
-        if (!toolRec) {
-          toolRec = buildToolCard(tool, segmentRec.el);
-          segmentRec.tools.set(tool.tool_use_id, toolRec);
-          segmentRec.toolsEl.appendChild(toolRec.card);
-        }
-        updateToolCard(toolRec, tool);
-        if (!tool.result) pending++;
-        else if (tool.result.isError) failed++;
-      }
-      const count = segment.tools.length;
-      segmentRec.summary.textContent = `${count} tool call${count === 1 ? "" : "s"}`
-        + (pending ? ` · ${pending} running` : "")
-        + (failed ? ` · ${failed} failed` : "");
+      updateToolRun(segmentRec, segment);
     });
 
     // Append only: live recovery removes the banner, never these original
@@ -844,6 +919,7 @@ export function initChat({
   function renderTurns(chat) {
     const following = stickToBottom;
     const scrollTop = chatLogEl.scrollTop;
+    const oldHeight = chatLogEl.scrollHeight;
     // Anchor to a visible message/card, not merely the top of its possibly
     // very tall turn. Changes above it must not move the text being read.
     const top = chatLogEl.getBoundingClientRect().top;
@@ -851,16 +927,26 @@ export function initChat({
       ".msg.user, .segments > .text, .toolgroup > summary, .toolcard, .turnerror",
     )).find((node) => node.getBoundingClientRect().bottom > top);
     const anchorTop = anchor?.getBoundingClientRect().top;
+    if (replaceTurnRows) {
+      for (const rec of turnEls.values()) rec.row.remove();
+      turnEls.clear();
+      replaceTurnRows = false;
+    }
     const seen = new Set();
-    chat.turns.forEach((t) => {
+    chat.turns.forEach((t, index) => {
       seen.add(t.turn);
       let rec = turnEls.get(t.turn);
       if (!rec) {
         rec = buildTurnRow(t.turn);
         turnEls.set(t.turn, rec);
-        chatLogEl.appendChild(rec.row);
+        const next = chat.turns.slice(index + 1).find((turn) => turnEls.has(turn.turn));
+        if (next) turnEls.get(next.turn).row.before(rec.row);
+        else chatLogEl.appendChild(rec.row);
       }
-      updateTurnRow(rec, t);
+      if (rec.value !== t) {
+        updateTurnRow(rec, t);
+        rec.value = t;
+      }
     });
     for (const [turn, rec] of turnEls) {
       if (!seen.has(turn)) {
@@ -872,7 +958,7 @@ export function initChat({
     else if (anchor?.isConnected) {
       chatLogEl.scrollTop = scrollTop + anchor.getBoundingClientRect().top - anchorTop;
     } else {
-      chatLogEl.scrollTop = scrollTop;
+      chatLogEl.scrollTop = scrollTop + (chatLogEl.scrollHeight - oldHeight);
     }
   }
 
@@ -1234,9 +1320,24 @@ export function initChat({
     data.pending = String(chat.pending.length);
   }
 
+  let turnsFrame = null;
+  let drawnTurns = null;
+  function scheduleTurns(chat) {
+    if (chat.turns === drawnTurns || turnsFrame !== null) return;
+    const draw = () => {
+      turnsFrame = null;
+      const current = store.getState().chat;
+      renderTurns(current);
+      drawnTurns = current.turns;
+    };
+    if (typeof requestAnimationFrame === "function") {
+      turnsFrame = requestAnimationFrame(draw);
+    } else draw();
+  }
+
   function render() {
     const chat = store.getState().chat;
-    renderTurns(chat);
+    scheduleTurns(chat);
     renderPending(chat);
     renderAgentStatus(chat);
     renderActionResults(chat);
@@ -1425,11 +1526,14 @@ export function initChat({
       // Another conversation's cards: nobody is waiting on them any more.
       store.clearChatPending();
       activityTurn = 0;
+      resetHistory();
+      stickToBottom = true;
     }
     // A decision sent over the connection that dropped may never have
     // arrived. A card it did decide is retired by the replay that follows;
     // one still open can be answered again.
     store.clearChatPermissionSubmitted();
+    if (historyLoading) failHistory("Connection changed.");
     // Held for the Export button, which needs the id of the session it is
     // writing out. Viewer-only runs report "viewer-only" here and have no
     // conversation to export, which the button reflects by staying disabled.
@@ -1446,12 +1550,60 @@ export function initChat({
   // from history would report an earlier process's trouble as current.
   function handleEvent(event, meta = {}) {
     if (!event) return;
+    if (event.kind === "history_page") {
+      const page = event.page;
+      if (page.session_id !== sessionId) return;
+      historyActivityTurn = 0;
+      historyExistingTurns = new Set(store.getState().chat.turns.map((turn) => turn.turn));
+      if (meta.replace) {
+        store.resetChatTurns();
+        replaceTurnRows = true;
+      }
+      if (page.initial) {
+        activeHistoryPermissions = new Set(page.pending_request_ids || []);
+        for (const req of store.getState().chat.pending) {
+          if (!activeHistoryPermissions.has(req.request_id)) {
+            store.removeChatPermissionRequest(req.request_id);
+          }
+        }
+      }
+      return;
+    }
+    if (event.kind === "history_page_end") {
+      if (event.page.session_id !== sessionId) return;
+      if (!event.page.initial) {
+        const newlyLoaded = new Set(store.getState().chat.turns
+          .filter((turn) => !historyExistingTurns.has(turn.turn)).map((turn) => turn.turn));
+        store.completeChatHistory(newlyLoaded);
+      }
+      clearTimeout(historyTimer);
+      historyReady = true;
+      historyLoading = false;
+      historyError = "";
+      historyCursor = event.page.before;
+      historyHasMore = !!event.page.has_more;
+      renderHistoryControl();
+      return;
+    }
+    if (event.kind === "history_error") {
+      if (event.session_id === sessionId
+          && (event.initial || event.requested_before === historyCursor)) {
+        if (event.initial) historyCursor = null;
+        failHistory(event.reason);
+      }
+      return;
+    }
+    const olderHistory = !!meta.history && !meta.initial;
     const replayed = !!meta.replayed;
-    const current = store.getState().chat.turns.find((t) => t.turn === activityTurn);
+    const trackedTurn = meta.history ? historyActivityTurn : activityTurn;
+    const current = store.getState().chat.turns.find((t) => t.turn === trackedTurn);
     if ((event.kind === "user_turn" && (!current || current.complete))
         || (event.kind === "input_state" && event.state === "provider_ack")
         || event.kind === "text_delta" || event.kind === "tool_use") {
-      activityTurn = event.turn;
+      if (meta.history) {
+        historyActivityTurn = event.turn;
+        if (meta.initial) activityTurn = event.turn;
+      } else activityTurn = event.turn;
     }
     const recovered = (event.kind === "input_state" && event.state === "provider_ack")
       || (event.kind === "text_delta" && !!event.text)
@@ -1463,7 +1615,7 @@ export function initChat({
           event.turn, event.blocks, event.client_id || null, event.automation_source || null,
         );
         // Only a human answering can clear an attention prompt.
-        if (!event.automation_source) {
+        if (!meta.history && !event.automation_source) {
           const banner = store.getState().chat.banner;
           if (banner && banner.kind === "attention") store.clearChatBanner();
         }
@@ -1510,6 +1662,8 @@ export function initChat({
         }
         break;
       case "permission_request":
+        if (meta.history && (olderHistory
+            || (!activeHistoryPermissions.has(event.request_id) && !(meta.seq > meta.through)))) break;
         store.addChatPermissionRequest(
           event.request_id,
           event.tool,
@@ -1521,14 +1675,17 @@ export function initChat({
         break;
       case "upload_action":
         store.addChatActionResult(event);
+        if (olderHistory) break;
         if (event.upload) {
           store.endChatDocument(event.upload, event.label + ": "
             + (ACTION_OUTCOME[event.outcome] || event.outcome));
         }
         break;
       case "permission_resolved":
+        if (olderHistory) break;
         if (!replayed) reportResolution(event);
         store.removeChatPermissionRequest(event.request_id);
+        activeHistoryPermissions.delete(event.request_id);
         break;
       case "agent_status":
         // The hello frame's `session.agent` is the status at the moment this
@@ -1557,6 +1714,10 @@ export function initChat({
         if (!replayed) store.setChatModels(event.models);
         break;
       case "session_reset":
+        if (meta.history) break;
+        resetHistory();
+        stickToBottom = true;
+        store.clearChatPending();
         store.resetChatTurns();
         activityTurn = 0;
         // The old conversation's usage is not the new one's; the hello of a
@@ -1567,7 +1728,10 @@ export function initChat({
       case "agent_error":
         // What to do, and under it the backend's own words, which are often
         // the only real reason given.
-        store.addChatTurnError(activityTurn, event.remediation || "", event.stderr || "");
+        store.addChatTurnError(
+          meta.history ? historyActivityTurn : activityTurn,
+          event.remediation || "", event.stderr || "",
+        );
         if (!replayed) {
           store.setChatBanner(
             "error", event.remediation || "The agent reported an error.", event.stderr, "agent");
@@ -1577,7 +1741,7 @@ export function initChat({
         // "viewer_primary" and any future kind: no rendering in this pane yet.
         break;
     }
-    if (unconfirmed.size) {
+    if (!olderHistory && unconfirmed.size) {
       if (replayed) {
         clearTimeout(settleTimer);
         settleTimer = setTimeout(settleUnconfirmed, SETTLE_MS);

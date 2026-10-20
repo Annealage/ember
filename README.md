@@ -12,7 +12,7 @@ I split it out of [Annealage Mesh](https://github.com/Annealage/mesh) when Annea
 - **Remote MCP servers** beside your own tools: name a server on the network and grade its tools, and every backend reaches them through the same grades, pause switch and selected approval policy.
 - **Workspace trust.** A served directory's `.claude/` settings and hooks, `.mcp.json`, or a git config or hook that names something executable can run commands before any prompt is sent. The package provides the gate that keeps agent mode off until the human has accepted exactly those contents, and your command line runs it (the example below does).
 - **Secret and write-protected paths.** Tool calls reaching for credentials (`~/.ssh`, `~/.aws` and the like) are refused, and so are writes to files you name as only your own tools' to change.
-- **A WebSocket event channel with replay.** `/ws` streams the conversation as numbered events, the human's own messages included, and a reloaded tab or a second device catches up on it. Recent events come from an in-memory ring of the last 500; in agent mode every event is also written to the session's `events.jsonl`, and anything older than the ring, or from before a restart that resumes the session (`-c` in Mesh and Loom), is replayed from there, with each streamed reply joined into one event per run. A plain rerun starts a new session.
+- **A WebSocket event channel with paged history.** `/ws` streams numbered conversation events, including the human's messages. A newly opened chat renders the most recent complete exchange; scrolling upward loads one earlier exchange per page without moving the message being read, while new messages keep streaming independently. Reconnect catches up from the tab's last sequence without a history-page limit. The last 500 events stay in memory; agent mode also appends every event to the session's `events.jsonl`. A session-local turn/byte-offset index makes older pages seek directly to their range, read in a worker thread, with streamed text coalesced. Overlapping queued turns remain together rather than splitting a reply. History stops at the latest conversation reset, outstanding approvals remain actionable even outside the recent window, and transcript export still includes the full log. A plain rerun starts a new session.
 - **The chat pane's front end**: plain ES modules and one stylesheet served at `/agent/static/`, no build step.
 - **Settings** in four layers (flag, project config, user settings, built-in default), shown in a settings window with where each value came from, plus a diagnostics block.
 - **What the backend itself says.** Every agent error goes to the server's stderr (a service's journal) as well as the page, where the chat banner shows the backend's own words under its advice. The settings window's Agent log section lists the backend's own logs for the session (omp's process log, the Claude CLI's transcript, a Codex rollout, each one's stderr) with their paths and shows the end of any of them.
@@ -401,9 +401,41 @@ The page loads the pane's modules through one import map entry, `"agent/": "/age
 
 - `url.js`: `appUrl(route)` resolves a route, written without a leading slash (`appUrl("settings")`), against the page's own directory: `/settings` for a page at the root, `/p/demo/settings` for one at `/p/demo/`. Every request the package's modules make goes through it, the WebSocket included, so a product's page names its own routes the same way.
 - `ws.js`: `initWs({onEvent, onLive, onFallback, onHello, onAgentEvent, onPaused, onRefused, dispatchCall, connTitles, indicator})` connects to `/ws`, reads the token out of the URL fragment (trading an `#n=` nonce at `POST /login`), replays what the tab missed and reconnects with backoff. `onEvent` takes handlers for the product's own event kinds, called for live events only (the history a connection opens with is not handed to them, so `onLive` should refetch what they would). `onRefused(reason, clientId)` gets each refusal, with the refused turn's `client_id` when it was a turn (pass chat.js's `handleRefused`). It returns `{send}`. A page with no token still connects and lets the server decide (it may know the human by their tailnet login). `withToken(url)` adds `t=` to a token-gated route's URL when the page has a token and leaves it alone when it hasn't; `authToken()` gives the token itself; `whoami()` resolves to `{login, name, via}` (`via` is `"tailscale"` or `"token"`) or `null`, asked once.
+
+  History paging is opt-in at protocol version 2: `hello.history_turns:1`
+  (integer 1–50) asks for a `history_page` on the first connection or a new
+  session. Existing clients omitting it retain full replay; a matching-session
+  reconnect with positive `last_seq` retains ordinary catchup. A page carries
+  `session_id`, chronological `events:[{seq,event}]`, `before` (the next
+  exclusive cursor, or null), `has_more`, `initial`, and the fixed snapshot
+  `through`. Initial pages also carry authoritative `pending_request_ids` and
+  any older still-active request events needed to show their cards. Request
+  older turns with `{type:"history",session_id,before,limit:1}`; replies echo
+  `requested_before`. `before:null` explicitly retries the recent initial
+  page. `history_error` identifies the session, requested cursor, initial flag
+  and reason for a visible retry; an initial error includes `through` and
+  follows a pending-only initial page if transcript data is unavailable.
+  Requests cannot read another session or cross the latest reset. Older pages
+  never move the live cursor. Historical events never trigger product effects
+  or attention, or replace the hello's current model/usage; permission cards
+  are actionable only for currently pending IDs. Existing `initWs`/`initChat`
+  wiring is unchanged: the socket delivers history lifecycle messages through
+  `onAgentEvent`, and transcript events carry `{replayed:true,history:true}`
+  metadata so the chat can prepend them without replaying live effects.
+  The browser requests one coherent exchange initially and one earlier exchange
+  per upward page; overlapping turns may stay grouped. The server API still
+  accepts page sizes from 1 to 50 and defaults an omitted history request's
+  `limit` to 20.
+
 - `chat.js`: `initChat({send, root, ids, agentTitles})` mounts the pane, finding its elements by id under `root`. The ids in the example are the defaults. `ids` maps a role (`log`, `input`, `banner`, `exportButton` and the rest, as in `DEFAULT_IDS`) to a different id. Every role's element has to exist except `exportButton` (default `#chatExport`, for transcript export). A page signed in by tailnet login shows the human's name beside the agent status. The pane element (`#chat`) carries its state for a stylesheet: `data-working` while a turn runs, `data-turn-started` that turn's start in epoch milliseconds (when the page first saw it running, so a page opened mid-turn reads the time it connected), and `data-pending`, the number of open permission requests (`0` when none). A turn ended by an interrupt or by the agent going down clears the first two. A permission card's buttons carry `allow` and `danger` (Deny) classes, so a theme styles them without relying on their order.
 
   Assistant text and tool activity stay in chronological order within their turn: text, an inline run of calls, more text, another run, and so on. Only adjacent calls share an initially collapsed disclosure with total, running and failed counts; an empty text delta does not split a run, and a late result updates its original card without moving it or creating a new run. Expanding a run reveals individual tool cards (respecting their saved collapsed preference), in a list bounded to 24rem or 45% of the viewport height, whichever is smaller. Permission cards remain separately actionable. Opening an inspector pauses auto-follow, and scrolling the conversation back to its bottom resumes it. Streaming updates preserve open disclosures, inner scroll positions and a visible transcript anchor while the human reads above the bottom.
+
+  Collapsed tool runs mount only their summary, not every tool card. Opening
+  a run mounts its cards; each closed card keeps its own summary and defers
+  rendering JSON inputs and result bodies until opened. Already-mounted
+  inspectors retain their identity and scroll position across live updates,
+  so long histories do not pay the DOM cost of details nobody has opened.
 
 - `settings.js`: `initSettings({openButton, container, onLoad})` is the settings window, on the page's `#settingsBtn` and `#settingsModal` by default.
 - `pause.js`: `initPause({send, button})` is the pause control, on the page's `#pauseBtn` by default. It returns `{setPausedFromServer}`, which the page passes to `initWs` as `onPaused`. The paused state is the button's `aria-pressed` and `.on` class. A button with a `[data-label]` child has only that child's text written ("Pause" or "Paused"), so an icon the page put in it stays; without one, the button's whole text is.

@@ -82,6 +82,14 @@
 
 /* Explicit anchoring in chat.js preserves the reader's position while streaming. */
 #chatLog { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; padding: 10px 14px; display: flex; flex-direction: column; gap: 12px; }
+.chathistory {
+  flex: none; align-self: center; max-width: 100%; min-height: 30px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 5px 10px; border: 1px solid #3a4b56; border-radius: 6px;
+  background: #17232c; color: #b9d3e3; font-size: 12px; cursor: pointer;
+}
+.chathistory:disabled { opacity: .7; cursor: default; }
+.chathistory[hidden] { display: none; }
 
 .turn { flex: none; display: flex; flex-direction: column; gap: 6px; }
 .msg { border-radius: 8px; padding: 8px 10px; font-size: 13px; line-height: 1.45; }
