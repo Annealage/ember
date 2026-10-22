@@ -159,31 +159,30 @@ async def _mcp_call(client, name, arguments):
     return json.loads(res.body.decode("utf-8"))["result"]
 
 
-async def test_an_idle_app_closes_and_a_page_connecting_resumes_a_new_session(served_dir):
+async def test_an_idle_app_closes_and_an_interaction_resumes_a_new_session(served_dir):
     built = []
     app = _app(served_dir, built)
     await app.agent_start()
     try:
-        # A connected page keeps the app open however long it sits there.
+        # A connected page keeps nothing open: the agent is the project's, so
+        # it closes for being idle with the page still there, and the page
+        # connecting again does not bring it back.
         conn = await app.agent_registry.add(_Socket())
-        await asyncio.sleep(IDLE * 3)
-        assert app.agent_status()["agent"] == AGENT_READY
-        await app.agent_registry.remove(conn)
-
-        # The status reads closed from the moment the sweep takes the session
-        # away; the close itself runs in a task of its own, so wait for it.
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
         first = built[0]
         await _until(lambda: first.closed == 1)
         assert app.agent_session is None
+        assert [e["reason"] for e in _logged(app, "agent_closed")] == ["idle"]
         denied = await first.broker.ask("mcp__toy__add_note", {"text": "late"}, None)
         assert not denied.allow and "shutting down" in denied.message
 
-        # A page connecting starts the next session, resumed; the page stays,
-        # so nothing below races the idle timer.
         client = make_test_client(app)
         await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
-        await app.agent_registry.add(_Socket())
+        assert len(built) == 1 and app.agent_session is None
+
+        # An interaction starts the next session, resumed; the page stays, so
+        # the broker has someone to ask.
+        await app.agent_holder.ensure(retry=True)
         second = app.agent_session
         assert [session.resumed for session in built] == [False, True]
         assert second is built[1] and app.agent_bus.broker is second.broker
@@ -199,6 +198,7 @@ async def test_an_idle_app_closes_and_a_page_connecting_resumes_a_new_session(se
         assert not (await asyncio.wait_for(call, 5)).get("isError")
         notes = json.loads((served_dir / NOTES_FILE).read_text(encoding="utf-8"))
         assert notes == ["first", "after"]
+        await app.agent_registry.remove(conn)
     finally:
         await app.agent_stop()
 
@@ -225,9 +225,7 @@ async def test_a_resumed_session_comes_back_on_the_model_the_human_switched_to(s
         await built[0].set_model("claude-haiku-5")
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
         before_resume = len(_logged(app, "agent_model_changed"))
-        client = make_test_client(app)
-        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
-        await app.agent_registry.add(_Socket())
+        await app.agent_holder.ensure(retry=True)
         await _until(lambda: len(built) == 2 and built[1].models == ["claude-haiku-5"])
         published = _logged(app, "agent_model_changed")[before_resume:]
         assert [event["model"] for event in published] == ["claude-haiku-5"]
@@ -236,12 +234,13 @@ async def test_a_resumed_session_comes_back_on_the_model_the_human_switched_to(s
 
 
 @pytest.mark.parametrize("resume", [True, False])
-async def test_a_page_connecting_after_the_agent_went_down_starts_it_again(served_dir, resume):
+async def test_an_interaction_after_the_agent_went_down_starts_it_again(served_dir, resume):
     """A start that failed (a model login gone, say) is tried again by the
-    next page to connect, once what stopped it is fixed, rather than only by
+    next interaction, once what stopped it is fixed, rather than only by
     restarting the process: resumed where the app resumes, else built as a
-    restart would build it. A call through /mcp (``ensure`` without retry)
-    leaves it down, and a page connecting to a live agent keeps it."""
+    restart would build it. A page connecting, or a call through /mcp
+    (``ensure`` without retry), leaves it down, and an interaction with a
+    live agent keeps it."""
     built = []
     _FailsToStart.failing = True
     kwargs = {} if resume else {"resume_session": None}
@@ -255,12 +254,15 @@ async def test_a_page_connecting_after_the_agent_went_down_starts_it_again(serve
         _FailsToStart.failing = False
         client = make_test_client(app)
         await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        assert len(built) == 1 and app.agent_session is first
+
+        await app.agent_holder.ensure(retry=True)
         assert len(built) == 2 and first.closed == 1
         second = built[1]
         assert second.resumed is resume and app.agent_session is second
         await _until(lambda: second.started == 1)
         assert app.agent_status()["agent"] == AGENT_READY
-        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        await app.agent_holder.ensure(retry=True)
         assert len(built) == 2 and app.agent_session is second
     finally:
         _FailsToStart.failing = False
@@ -270,10 +272,10 @@ async def test_a_page_connecting_after_the_agent_went_down_starts_it_again(serve
 async def test_a_turn_the_agent_that_went_down_left_running_ends_when_it_is_replaced(
     served_dir,
 ):
-    """A backend that dies mid-turn never ends that turn. Replaced by a page
-    connecting, the turn is ended as interrupted (in the log, so the pages
+    """A backend that dies mid-turn never ends that turn. Replaced by the next
+    interaction, the turn is ended as interrupted (in the log, so the pages
     stop showing it running) and no longer counts: the replacement is not
-    shown as running a turn, and with no page open it closes for being idle."""
+    shown as running a turn, and left alone it closes for being idle."""
     built = []
     app = _app(served_dir, built, cls=_FailsToStart, idle_timeout=IDLE * 5)
     await app.agent_start()
@@ -284,14 +286,14 @@ async def test_a_turn_the_agent_that_went_down_left_running_ends_when_it_is_repl
         first.status = AGENT_UNAVAILABLE
         first.emit(AgentStatus(status=AGENT_UNAVAILABLE))
 
-        client = make_test_client(app)
-        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        await app.agent_holder.ensure(retry=True)
         second = built[1]
         await _until(lambda: second.started == 1)
         status = app.agent_status()
         assert status["agent"] == AGENT_READY and status["turn_running"] is False
         ended = [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")]
         assert ended == [(1, "interrupted")]
+        assert [e["reason"] for e in _logged(app, "agent_closed")][:1] == ["replaced"]
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
         await _until(lambda: second.closed == 1)
     finally:
@@ -341,10 +343,11 @@ async def test_a_cancelled_stop_still_closes_and_runs_the_teardown_hooks(served_
     assert built[0].closed == 1 and released == [1]
 
 
-async def test_an_app_built_closed_starts_no_session_until_a_page_opens_it(served_dir):
-    """A front door's many workspaces: nothing is built or started until a
-    page arrives; then the session a start would have built (the run's own,
-    not a resume), started once; after an idle close, a resumed one."""
+async def test_an_app_built_closed_starts_no_session_until_an_interaction_opens_it(served_dir):
+    """A front door's many workspaces: nothing is built or started until
+    someone interacts (a page merely connecting does not); then the session a
+    start would have built (the run's own, not a resume), started once; after
+    an idle close, a resumed one."""
     built = []
     app = _app(served_dir, built, start_closed=True)
     assert built == [] and app.agent_status()["agent"] == agent_app.AGENT_CLOSED
@@ -356,13 +359,16 @@ async def test_an_app_built_closed_starts_no_session_until_a_page_opens_it(serve
 
         client = make_test_client(app)
         await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        assert built == [] and app.agent_session is None
+
+        await app.agent_holder.ensure(retry=True)
         (first,) = built
         assert first.resumed is False and app.agent_session is first
         await _until(lambda: first.started == 1)
         assert app.agent_status()["agent"] == AGENT_READY
 
         await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
-        await client.get("/ws?t=%s" % BROWSER_TOKEN, headers=_ws_headers())
+        await app.agent_holder.ensure(retry=True)
         assert [session.resumed for session in built] == [False, True]
     finally:
         await app.agent_stop()
@@ -423,6 +429,7 @@ async def test_the_status_follows_a_turn_a_permission_and_an_idle_close(served_d
         "attention": None,
         "last_activity": app.agent_status()["last_activity"],
         "viewers": 0,
+        "pid": None,
     }
     await app.agent_start()
     try:

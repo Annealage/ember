@@ -382,13 +382,13 @@ function withoutPending(pendingUser, clientId) {
 
 // A `user_turn` event: a human-authored turn or an explicitly sourced
 // automatic turn. Its origin is retained beside the blocks through replay.
-function setChatUserTurn(turn, blocks, clientId = null, automationSource = null) {
+function setChatUserTurn(turn, blocks, clientId = null, automationSource = null, redeliveryOf = null) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx
-        ? Object.freeze({ ...t, user: blocks, automationSource })
+        ? Object.freeze({ ...t, user: blocks, automationSource, redeliveryOf })
         : t)),
     );
     const pendingUser = withoutPending(chat.pendingUser, clientId);

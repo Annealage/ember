@@ -220,6 +220,8 @@ from .base import (
     AgentModelChanged,
     AgentModelsAvailable,
     AgentRuntimeResolved,
+    AgentClosed,
+    CLOSE_CHILD_EXITED,
     AgentStatus,
     InputState,
     RequestUsage,
@@ -266,6 +268,9 @@ _DEFAULT_MODEL_ID = "default"
 # session's control calls rather than ahead of them (`_emit_available_models`),
 # so this bounds nothing a turn waits on, only a wait nothing else needs.
 _MODEL_LIST_TIMEOUT = 10.0
+
+# How often a ready session looks at whether its `omp` child is still there.
+_CHILD_POLL_INTERVAL = 1.0
 
 
 class OmpSession:
@@ -401,6 +406,7 @@ class OmpSession:
         # given points at.
         self._stderr_client = None
         self._omp_pid: Optional[int] = None
+        self._watch_task: Optional[asyncio.Future] = None
         self._started_at: Optional[float] = None
         self._start_failed_at: Optional[float] = None
         self._omp_logs_dir: Optional[str] = None
@@ -966,6 +972,7 @@ class OmpSession:
         # so a slow listing holds up neither the start nor what is sent once
         # the session is ready.
         self._models_task = asyncio.ensure_future(self._emit_available_models())
+        self._watch_task = asyncio.ensure_future(self._watch_child())
 
     async def _emit_available_models(self) -> None:
         """Publish ``get_available_models`` as the strings ``set_model``
@@ -1068,6 +1075,8 @@ class OmpSession:
         self._closing = True
         if self._models_task is not None:
             self._models_task.cancel()
+        if self._watch_task is not None:
+            self._watch_task.cancel()
         if self._broker is not None:
             # Before the client goes, while there is still a socket to carry
             # the denial event and while the RPC it belongs to can still get
@@ -1103,6 +1112,37 @@ class OmpSession:
             await asyncio.get_running_loop().run_in_executor(None, client.stop)
         except Exception as exc:
             sys.stderr.write("warning: could not stop the omp process: %r\n" % (exc,))
+
+    @property
+    def process_id(self) -> Optional[int]:
+        """The pid of the `omp` child, once it has started."""
+        return self._omp_pid
+
+    async def _watch_child(self) -> None:
+        """Notice `omp` dying under a session that still says ready.
+
+        `omp` can exit on its own (it has written ``session_exit`` and gone
+        mid-turn); nothing in the RPC client reports that to a session with no
+        request in flight, so without this the session stays ready, a turn
+        stays running and later input queues behind it forever. On an
+        unexpected exit this ends the session the way any backend failure
+        does (``_fail``: unavailable, the running turn ended ``backend_exited``,
+        queued inputs rejected) after saying why it closed."""
+        while not self._closing:
+            await asyncio.sleep(_CHILD_POLL_INTERVAL)
+            client = self._client
+            if self._closing or client is None or self._status == AGENT_UNAVAILABLE:
+                return
+            code = _exit_code(client)
+            if code is None:
+                continue
+            detail = "omp exited with status %d" % code
+            self._emit(AgentClosed(reason=CLOSE_CHILD_EXITED, detail=detail))
+            self._fail(
+                RuntimeError(detail),
+                remediation="omp exited unexpectedly; send a message to start it again",
+            )
+            return
 
     def _discard_agent_dir(self) -> None:
         if self._temp_agent_dir is not None:
@@ -1743,6 +1783,21 @@ def _process_id(client) -> Optional[int]:
     ``omp_rpc``) leaves the log to be found by time instead."""
     pid = getattr(getattr(client, "_process", None), "pid", None)
     return pid if isinstance(pid, int) else None
+
+
+def _exit_code(client) -> Optional[int]:
+    """The exit status of the `omp` process behind ``client`` if it has ended
+    (``Popen.poll`` also reaps it), or ``None`` while it runs or when this
+    client keeps no process (a test's fake)."""
+    process = getattr(client, "_process", None)
+    poll = getattr(process, "poll", None)
+    if not callable(poll):
+        return None
+    try:
+        code = poll()
+    except Exception:
+        return None
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
 
 
 # ---------------------------------------------------------------------------

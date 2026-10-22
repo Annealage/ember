@@ -159,6 +159,9 @@ class EventLog:
         #: already shows from history, nor does history look like it runs.
         self.last_turn = 0
         self.unfinished_turns: tuple = ()
+        #: ``[(turn, its user_turn wire event)]`` of unfinished turns whose input
+        #: never reached the backend; see ``_recover_seq``.
+        self.undelivered_turns: tuple = ()
         #: Every ``permission_request`` in the file with no
         #: ``permission_resolved`` after it: asked by a process that died
         #: before anyone answered, which ``app.create_app`` closes, so a page
@@ -199,6 +202,8 @@ class EventLog:
             return 0
         highest = 0
         started, ended = set(), set()
+        human_turns: dict = {}  # turn -> its user_turn event
+        input_states: dict = {}  # turn -> every input_state seen for it
         requests: dict = {}  # request_id -> None, in the order they were asked
         with open(self._path, "rb") as f:
             offset = 0
@@ -245,11 +250,17 @@ class EventLog:
                     started.clear()
                     ended.clear()
                     requests.clear()
+                    human_turns.clear()
+                    input_states.clear()
                 request_id = event.get("request_id")
                 if kind == "permission_request" and isinstance(request_id, str):
                     requests[request_id] = None
                 elif kind == "permission_resolved":
                     requests.pop(request_id, None)
+                if kind == "user_turn" and isinstance(event.get("turn"), int):
+                    human_turns[event["turn"]] = event
+                elif kind == "input_state" and isinstance(event.get("turn"), int):
+                    input_states.setdefault(event["turn"], set()).add(event.get("state"))
                 if kind not in _TURN_KINDS:
                     continue
                 turn = event.get("turn")
@@ -261,6 +272,18 @@ class EventLog:
         self.last_turn = max(started, default=0)
         self.unfinished_turns = tuple(sorted(started - ended))
         self.unresolved_requests = tuple(requests)
+        # A turn the human sent that its backend never took: received or queued
+        # and not acknowledged (or refused, or uncertain), and not itself a
+        # redelivery (one attempt per turn, so a turn that crashes the agent
+        # cannot loop). The app re-sends these once the agent is back.
+        self.undelivered_turns = tuple(
+            (turn, human_turns[turn])
+            for turn in sorted(started - ended)
+            if turn in human_turns
+            and input_states.get(turn, set()) & {"received", "queued"}
+            and not input_states.get(turn, set()) & {"provider_ack", "uncertain", "rejected"}
+            and human_turns[turn].get("redelivery_of") is None
+        )
         return highest
 
     @property
@@ -761,7 +784,13 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
             continue
         flush_text()
 
-        if kind == "user_turn":
+        if kind == "user_turn" and event.get("redelivery_of") is not None:
+            # The same message, re-sent after a restart; not a second thing the
+            # human said.
+            lines.append("")
+            lines.append("(Turn %s re-sent after a restart; it is turn %s's message.)"
+                         % (turn, event["redelivery_of"]))
+        elif kind == "user_turn":
             lines.append("")
             lines.extend(_human_lines(event.get("blocks"), event.get("automation_source")))
         elif kind == "tool_use":

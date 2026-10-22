@@ -356,10 +356,11 @@ async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir)
 
 
 async def test_a_reload_replacing_a_session_that_went_down_offers_none_of_its_models(served_dir):
-    """The list is the session's own: the reload that replaces a session that
-    went down is greeted before the new one has listed anything, so its hello
-    offers no models rather than the old session's, and the new session's
-    own list reaches the next one."""
+    """The list is the session's own: the interaction that replaces a session
+    that went down is followed by a hello before the new one has listed
+    anything, so it offers no models rather than the old session's, and the
+    new session's own list reaches the next one. A page connecting alone
+    replaces nothing."""
     from annealage_ember.session.base import AgentModelsAvailable, AgentStatus
 
     app, session = _app_with_fake_session(served_dir)
@@ -367,8 +368,11 @@ async def test_a_reload_replacing_a_session_that_went_down_offers_none_of_its_mo
     session.set_status("unavailable")
     session.emit(AgentStatus(status="unavailable"))
 
-    reload = await _hello_of(app)
+    await _hello_of(app)
+    assert app.agent_session is session
+    await app.agent_holder.ensure(retry=True)
     replacement = app.agent_session
+    reload = await _hello_of(app)
     assert replacement is not session and reload["session"]["models"] == []
 
     replacement.emit(AgentModelsAvailable(models=["anthropic/claude-opus-4"]))
@@ -378,9 +382,9 @@ async def test_a_reload_replacing_a_session_that_went_down_offers_none_of_its_mo
 async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     """The page raises no banner from a replayed ``agent_error``, so a tab
     opened after the agent failed to start (omp not logged in) would show an
-    unavailable pane with no reason. Opening it starts the agent again, and
-    the hello carries the latest error while that one is not ready, and
-    nothing once it is."""
+    unavailable pane with no reason. Opening the page alone leaves the agent
+    as it is; an interaction starts it again, and the hello carries the latest
+    error while that one is not ready, and nothing once it is."""
     from annealage_ember.session.base import AGENT_CONNECTING, AgentError, AgentStatus
     from annealage_ember.session.fake import FakeSession
 
@@ -396,12 +400,18 @@ async def test_a_page_opened_while_the_agent_is_down_is_told_why(served_dir):
     session.set_status("unavailable")
     session.emit(AgentStatus(status="unavailable"))
     down = await _hello_of(app)
-    retried = app.agent_session
-    assert retried is not session and down["session"]["agent"] == AGENT_CONNECTING
+    assert app.agent_session is session and down["session"]["agent"] == "unavailable"
     assert down["session"]["agent_error"] == {
         "remediation": "log omp in",
         "stderr": "401 no credentials",
     }
+
+    await app.agent_holder.ensure(retry=True)
+    retried = app.agent_session
+    assert retried is not session
+    starting = await _hello_of(app)
+    assert starting["session"]["agent"] == AGENT_CONNECTING
+    assert starting["session"]["agent_error"] == down["session"]["agent_error"]
 
     retried.set_status("ready")
     retried.emit(AgentStatus(status="ready"))
@@ -483,6 +493,7 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
         }
         assert (await _hello_of(app))["session"]["usage"] == latest
     finally:
+        await app.agent_stop()
         app.agent_event_log.close()
 
     sid = session.session_id
@@ -505,6 +516,7 @@ async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(serve
         # The log ends on the usage the restart below expects.
         reset_app.agent_session.emit(Usage(**latest))
     finally:
+        await reset_app.agent_stop()
         reset_app.agent_event_log.close()
 
     restarted = create_toy_app(

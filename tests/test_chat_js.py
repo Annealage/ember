@@ -554,7 +554,8 @@ def test_a_page_opened_while_the_agent_is_down_shows_why(observed):
     banner = observed["bannerFromHello"]
     assert (banner["kind"], banner["text"]) == ("error", "log omp in")
     assert "401 no credentials" in json.dumps(banner)
-    assert observed["sendDisabledWhileDown"] is True
+    # Sending is what starts a closed or failed agent again.
+    assert observed["sendDisabledWhileDown"] is False
 
 
 def test_only_a_live_agent_error_raises_the_banner(observed):

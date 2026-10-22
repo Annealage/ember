@@ -37,6 +37,7 @@ from typing import Optional
 from microdot import Microdot, Request
 
 from . import files, net, product, protocol, sessions, uploads
+from .agent_lock import AgentAlreadyOpen, AgentLock
 from . import remote_actions
 from . import settings as settings_module
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
@@ -55,6 +56,11 @@ from .session import secret_paths
 from .session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
+    CLOSE_CANCEL,
+    CLOSE_IDLE,
+    CLOSE_REPLACED,
+    CLOSE_STOP,
+    AgentClosed,
     AgentError,
     AgentModelChanged,
     AgentRuntimeResolved,
@@ -64,6 +70,7 @@ from .session.base import (
     PermissionResolved,
     SessionReset,
     TurnEnd,
+    UserTurn,
     TextDelta,
     ToolUse,
     Usage,
@@ -586,7 +593,20 @@ def create_app(
     # no one is waiting on the answer any more.
     for request_id in event_log.unresolved_requests:
         event_log.append(PermissionResolved(request_id=request_id, outcome=OUTCOME_SHUTDOWN))
-    _end_unfinished_turns(event_log.append, event_log.unfinished_turns)
+    # An input the human sent that an earlier process took but never gave its
+    # agent (received or queued, never acknowledged) did not run: it is ended
+    # as ``redelivered`` and handed to the holder to send again once the agent
+    # is up. Everything else unfinished was running, so it is ended as
+    # interrupted and never replayed. Hosted apps replay nothing: a turn there
+    # runs under a delegation that expires with its session.
+    undelivered = {} if hosted_mode else dict(event_log.undelivered_turns)
+    redeliveries = []
+    for turn in event_log.unfinished_turns:
+        if turn in undelivered:
+            event_log.append(TurnEnd(turn=turn, stop_reason="redelivered", cost_usd=None))
+            redeliveries.append((turn, undelivered[turn]))
+        else:
+            event_log.append(TurnEnd(turn=turn, stop_reason="interrupted", cost_usd=None))
     registry = ViewerRegistry(event_log=event_log, on_presence=_presence)
     # The tool layer's view of the browser, and the holder of the human's pause
     # switch. Built here rather than by the session factory because both halves
@@ -770,6 +790,9 @@ def create_app(
             session = ExternalAgentSession(publish, bus.broker)
         return session
 
+    agent_lock = None
+    if tools is not None and session_id is not None:
+        agent_lock = AgentLock(sessions.state_dir(state_project_dir))
     holder = AgentHolder(
         app,
         bus=bus,
@@ -782,8 +805,12 @@ def create_app(
         build_session=build_session,
         resume_session=resume_session,
         idle_timeout=idle_timeout,
+        agent_lock=agent_lock,
     )
+    holder.redeliveries = redeliveries
     app.agent_holder = holder
+    # How a turn accepted while the agent starts is kept for it (ws.py).
+    bus.agent_holder = holder
     holder.session_events = session_events
     app.agent_start = holder.start
     app.agent_stop = holder.stop
@@ -793,12 +820,16 @@ def create_app(
     # A factory returning None is the ordinary viewer-only case, not a
     # failure: it leaves an app that serves the product's page with no agent
     # attached rather than one that could not be built.
-    if start_closed and tools is not None:
+    if tools is not None and (start_closed or (agent_lock is not None and not holder.claim())):
+        # Built closed, or another live process has the project's agent: no
+        # session until an interaction asks for one (which tries the lock again).
         holder.close_at_start(build_session)
         session = None
     else:
         session = _make_session(build_session)
         holder.install(session)
+        if session is None:
+            holder._release_lock()
     app.agent_review_notifications = None
     if review_store is not None and session_id is not None:
         from .review.notifications import ReviewNotifications
@@ -1113,6 +1144,11 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
             session_events = getattr(bus, "session_events", None)
             if session_events is not None:
                 session_events.emit("error", {"message": (event.remediation or "")[:500]})
+        if isinstance(event, AgentClosed):
+            sys.stderr.write(
+                "agent closed: %s%s\n"
+                % (event.reason, " (%s)" % event.detail if event.detail else "")
+            )
         if session_info is not None and isinstance(event, AgentModelChanged):
             session_info["model"] = event.model
         # The latest model list the same way as the model: a tab opened after
@@ -1323,6 +1359,7 @@ class AgentHolder:
         build_session=None,
         resume_session=None,
         idle_timeout=None,
+        agent_lock=None,
     ):
         self._app = app
         self.bus = bus
@@ -1377,6 +1414,14 @@ class AgentHolder:
         self._requests = set()
         self._attention = None
         self._last_activity = time.time()
+        # Inputs accepted while the agent was still starting, in order.
+        self._deferred = []
+        self._drain_task = None
+        self._agent_lock = agent_lock
+        #: Inputs an earlier run accepted but never delivered, found in the
+        #: event log at build time: ``[(old turn, UserTurn fields)]``. The app
+        #: re-sends them once started (``redeliver``).
+        self.redeliveries = []
         self._last_active = time.monotonic()
         event_log.observers.append(self._observe)
 
@@ -1393,7 +1438,7 @@ class AgentHolder:
         # none (the hello's empty list), as at startup.
         self._session_info["models"] = None
         if session is None:
-            self._session_info["agent"] = AGENT_UNAVAILABLE
+            self._session_info["agent"] = AGENT_CLOSED if self.closed else AGENT_UNAVAILABLE
             return
         # The hello frame publishes whatever the session currently knows, so a
         # tab that connects later sees a ready agent rather than the
@@ -1410,7 +1455,7 @@ class AgentHolder:
         self._reopen_with = factory
         self.install(None)
 
-    async def ensure(self, retry=False):
+    async def ensure(self, retry=False, wait_ready=None):
         """The live session, after opening one if the app is closed (by the
         idle sweep, or built closed): a new session from ``resume_session``
         (``close_at_start`` says which factory builds the first), started in
@@ -1419,12 +1464,22 @@ class AgentHolder:
         raises leaves the app closed, reported, for the next caller to try
         again.
 
-        With ``retry`` (a page connecting, or an agent frame from one), a
-        session that announced it is unavailable is closed and replaced the
-        same way, from ``resume_session`` or, for an app without one,
-        ``build_session``. Only a human's action retries: a call through
-        ``/mcp`` does not, so an agent in another process polling a broken
-        backend does not relaunch it on every call."""
+        This is what an interaction calls, and only an interaction: a turn, an
+        interrupt, a permission decision or a model switch from a page, an
+        upload action, a call through ``/mcp``, a review notification, or any
+        product code that sends input. A page merely connecting does not.
+
+        With ``retry`` (an interaction by a human), a session that announced
+        it is unavailable (its start failed, or its backend process died) is
+        closed and replaced the same way, from ``resume_session`` or, for an
+        app without one, ``build_session``. Only a human's action retries: a
+        call through ``/mcp`` does not, so an agent in another process polling
+        a broken backend does not relaunch it on every call.
+
+        ``wait_ready`` is a number of seconds to wait for a session being
+        started to finish starting, for a caller that wants a ready one. It
+        is a bound on the wait, not a refusal: past it the session is simply
+        still starting."""
         if self._stopped:
             return self.session
         if (self.closed and not self._cancelled) or (retry and self._down):
@@ -1435,6 +1490,9 @@ class AgentHolder:
                     self._resume()
                 elif retry and self._down and self._retry_with is not None:
                     await self._replace_down()
+        start = self._start_task
+        if wait_ready and start is not None and not start.done():
+            await asyncio.wait({start}, timeout=wait_ready)
         return self.session
 
     async def _replace_down(self):
@@ -1449,7 +1507,9 @@ class AgentHolder:
         self.closed = True
         self._reopen_with = self._retry_with
         self.install(None)
+        self._closed(CLOSE_REPLACED, "the agent was unavailable and is being opened again")
         await _end_session(start, session)
+        self._release_lock()
         _end_unfinished_turns(self._publish, self._turns)
         self._turns.clear()
         self._resume()
@@ -1458,10 +1518,13 @@ class AgentHolder:
         # The model the human last switched to, which the new session does not
         # start on: every factory builds from the run's settings.
         wanted = self._session_info.get("model")
+        if not self._claim():
+            return
         try:
             session = self._make_session(self._reopen_with)
         except Exception as exc:
             sys.stderr.write("error: could not open the agent session: %r\n" % (exc,))
+            self._release_lock()
             return
         self._reopen_with = self._resume_session
         self.closed = False
@@ -1475,8 +1538,14 @@ class AgentHolder:
                 # session's broker has to know a page is there to answer it.
                 session.on_viewer_presence(self._viewers)
             self._start_task = asyncio.ensure_future(
-                _start_session(session, model=wanted if wanted != self._startup_model else None)
+                _start_session(
+                    session,
+                    model=wanted if wanted != self._startup_model else None,
+                    after=self._session_started,
+                )
             )
+        else:
+            self._release_lock()
         self._note_change()
 
     async def _close_idle(self):
@@ -1490,14 +1559,147 @@ class AgentHolder:
             # the lock and then resumes, rather than getting the one closing.
             self.closed = True
             self.install(None)
+            self._closed(CLOSE_IDLE, "no activity for %d seconds" % self._idle_timeout)
+            _end_unfinished_turns(self._publish, self._turns)
             self._turns.clear()
             # Shielded: a stop cancelling this sweep waits for the close
             # rather than abandoning it halfway (a backend's child left behind).
             self._closing = asyncio.ensure_future(_end_session(start, session))
             await asyncio.shield(self._closing)
+            self._release_lock()
             if self.session_events is not None:
                 await self.session_events.emit_async("end", {"reason": "idle"})
         self._note_change()
+
+    # -- who owns the agent -----------------------------------------------------
+
+    def _closed(self, reason, detail=None):
+        """Say why a session was closed (``agent_closed``), for every close."""
+        self._publish(AgentClosed(reason=reason, detail=detail))
+
+    def _claim(self):
+        """Take the project's agent lock, ending an orphaned agent a killed
+        predecessor left. ``False`` (reported to the page and the journal) when
+        another live process holds it: two agents must never share one
+        conversation."""
+        if self._agent_lock is None:
+            return True
+        try:
+            self._agent_lock.acquire()
+        except AgentAlreadyOpen as exc:
+            sys.stderr.write("error: could not open the agent session: %s\n" % (exc,))
+            self._publish(AgentError(
+                stderr=str(exc),
+                remediation="the agent is already running in another process for this "
+                "project; stop that one first",
+            ))
+            return False
+        if self._agent_lock.reaped is not None:
+            sys.stderr.write(
+                "warning: ended an orphaned agent process (pid %d) left by a previous run\n"
+                % self._agent_lock.reaped
+            )
+        return True
+
+    def claim(self):
+        """``_claim`` for ``create_app``'s first session, built before the app
+        runs."""
+        return self._claim()
+
+    def _release_lock(self):
+        if self._agent_lock is not None:
+            self._agent_lock.release()
+
+    def _session_started(self, session):
+        """A session's start has returned: note its process, so a successor can
+        end it if this server is killed first."""
+        if self._agent_lock is not None and session is self.session:
+            self._agent_lock.record_agent(getattr(session, "process_id", None))
+
+    # -- inputs accepted while the agent starts -----------------------------------
+
+    def has_deferred(self):
+        """Whether inputs are waiting for the agent to start; a new one waits
+        behind them, so they are delivered in the order they were sent."""
+        return bool(self._deferred)
+
+    def defer_turn(self, session, blocks, viewer, turn):
+        """Keep an input accepted while ``session`` is still starting, and
+        deliver it once it is ready. It is never refused for being early: a
+        resumed conversation can take a long time to come up. A start that
+        fails ends it as rejected, with the reason."""
+        self._deferred.append((session, blocks, viewer, turn))
+        self._publish(InputState(
+            input_id="starting-%d" % turn, turn=turn, state="queued",
+            detail="waiting for the agent to start",
+        ))
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = asyncio.ensure_future(self._drain_deferred())
+
+    async def _drain_deferred(self):
+        while self._deferred:
+            session, blocks, viewer, turn = self._deferred[0]
+            start = self._start_task if session is self.session else None
+            if start is not None and not start.done():
+                await asyncio.wait({start})
+            # Still the session the input was accepted for? (A close in between
+            # replaced it; the next one starts with this input unsent.)
+            self._deferred.pop(0)
+            if session is not self.session or session.agent_status() != AGENT_READY:
+                self._publish(InputState(
+                    input_id="starting-%d" % turn, turn=turn, state="rejected",
+                    detail="the agent did not start, so this message was not sent",
+                ))
+                self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+                continue
+            try:
+                await session.submit_turn(blocks, viewer=viewer)
+            except Exception as exc:
+                sys.stderr.write("warning: could not deliver a waiting input: %r\n" % (exc,))
+                self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+
+    # -- inputs an earlier run never delivered -------------------------------------
+
+    async def _redeliver(self):
+        """Send again each input an earlier process accepted but never gave its
+        agent (``create_app`` ended the original as ``redelivered``): the same
+        blocks, with the original's sender and ``client_id``, as a new turn
+        that says which it replaces (``UserTurn.redelivery_of``), so it is
+        never taken for a second thing the human said and never sent a third
+        time. Opens the agent as any interaction would; an agent that does not
+        come up ends each as rejected, with the reason."""
+        for original, fields in list(self.redeliveries):
+            self.redeliveries.remove((original, fields))
+            session = await self.ensure(retry=True)
+            if session is None or self._stopped:
+                return
+            bus = self.bus
+            async with bus.turn_submission_lock:
+                if session is not self.session:
+                    return
+                source = fields.get("automation_source")
+                blocks = fields.get("blocks") or []
+                sent = bus.begin_turn(
+                    blocks, by=fields.get("by"),
+                    automation_source=source if source == "loom_root_continuation" else None,
+                )
+                turn = bus.turn
+                self._publish(UserTurn(
+                    turn=turn, blocks=blocks, client_id=fields.get("client_id"),
+                    by=fields.get("by"), principal_id=fields.get("principal_id"),
+                    display=fields.get("display"), automation_source=source,
+                    review_notification_ids=fields.get("review_notification_ids"),
+                    redelivery_of=original,
+                ))
+                bus.mark_turn_submitted(turn)
+                if session.agent_status() == AGENT_READY:
+                    try:
+                        await session.submit_turn(sent, viewer=None)
+                    except Exception as exc:
+                        sys.stderr.write("warning: could not re-send turn %d: %r\n" % (original, exc))
+                        self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+                else:
+                    self.defer_turn(session, sent, None, turn)
 
     # -- hosted session control (routes_session.py) ------------------------------
 
@@ -1539,7 +1741,9 @@ class AgentHolder:
             self.closed = True
             self._reopen_with = self._retry_with
             self.install(None)
+            self._closed(CLOSE_CANCEL, "ended by a cancel request")
             await _end_session(start, session)
+            self._release_lock()
             interrupted = sorted(self._turns)
             _end_unfinished_turns(self._publish, self._turns)
             self._turns.clear()
@@ -1571,13 +1775,15 @@ class AgentHolder:
     # -- what reads the session at call time -------------------------------------
 
     def on_presence(self, count):
-        """The registry's presence listener: ``count`` pages are connected."""
+        """The registry's presence listener: ``count`` pages are connected.
+        Reported to the broker and the status, but neither opens the agent nor
+        keeps it open."""
         self._viewers = count
         try:
             if self.session is not None:
                 self.session.on_viewer_presence(count)
         finally:
-            self._note_change()
+            self._note_change(active=False)
 
     def end_turn(self):
         """``bus.end_turn_handler``: a tool result asked to end the turn."""
@@ -1629,12 +1835,15 @@ class AgentHolder:
         # before this ran) was started when it was opened.
         if self.session is not None and self._start_task is None:
             await self.session.start()
+            self._session_started(self.session)
         # Started here rather than in create_app, because create_app is called
         # by tests that have no running loop to own a background task and no
         # interest in one; a task per constructed app would leak a task per
         # test.
         tasks = [asyncio.ensure_future(run()) for run in background]
         tasks.append(asyncio.ensure_future(ping_forever(self._registry)))
+        if self.redeliveries:
+            tasks.append(asyncio.ensure_future(self._redeliver()))
         if self._review_watcher is not None:
             tasks.append(asyncio.ensure_future(self._review_watcher.run()))
         notifications = getattr(self._app, "agent_review_notifications", None)
@@ -1678,7 +1887,10 @@ class AgentHolder:
                         await asyncio.shield(self._closing)
                 else:
                     start, self._start_task = self._start_task, None
+                    if self.session is not None:
+                        self._closed(CLOSE_STOP, "the server is shutting down")
                     await _end_session(start, self.session)
+                    self._release_lock()
                     if self.session_events is not None and self.session is not None:
                         await self.session_events.emit_async("end", {"reason": "shutdown"})
                 self._turns.clear()
@@ -1719,11 +1931,13 @@ class AgentHolder:
 
     def _idle_remaining(self):
         """Seconds until the idle sweep closes this app, or ``None`` while
-        something keeps it open: a page, a turn, a permission request, or
-        there being no open session to close."""
+        something keeps it open: a turn running or queued, a permission
+        request, an input waiting for the agent to start, or there being no
+        open session to close. A page counts for nothing: the agent is the
+        project's, and outlives and is opened without any page."""
         if self._idle_timeout is None or self.closed or self._stopped or self.session is None:
             return None
-        if self._viewers or self._turns or self._requests:
+        if self._turns or self._requests or self._deferred:
             return None
         return self._idle_timeout - (time.monotonic() - self._last_active)
 
@@ -1750,6 +1964,8 @@ class AgentHolder:
             "attention": self._attention,
             "last_activity": self._last_activity,
             "viewers": self._viewers,
+            # Read from the live process, never from the last logged status.
+            "pid": None if agent == AGENT_CLOSED else getattr(self.session, "process_id", None),
         }
 
     def _observe(self, wire):
@@ -1771,9 +1987,13 @@ class AgentHolder:
             return
         self._note_change()
 
-    def _note_change(self):
+    def _note_change(self, active=True):
+        """Tell the status listeners. ``active`` says the change is the agent
+        or its human at work, which restarts the idle clock; a page coming or
+        going is not."""
         self._last_activity = time.time()
-        self._last_active = time.monotonic()
+        if active:
+            self._last_active = time.monotonic()
         for listen in list(self.status_listeners):
             try:
                 listen()
@@ -1781,16 +2001,20 @@ class AgentHolder:
                 sys.stderr.write("warning: an app status listener failed: %r\n" % (exc,))
 
 
-async def _start_session(session, model=None):
+async def _start_session(session, model=None, after=None):
     """Start a resumed ``session`` and, when ``model`` is given, switch it
     back to that model: the one the human chose before the app closed, which
     its factory knew nothing of. The switch publishes ``agent_model_changed``
-    like one made from the page."""
+    like one made from the page. ``after(session)`` is called once the start
+    has returned, whatever it came to (the holder notes the agent's process)."""
     try:
         await session.start()
     except Exception as exc:
         sys.stderr.write("warning: the agent session did not start: %r\n" % (exc,))
         return
+    finally:
+        if after is not None:
+            after(session)
     if model is None:
         return
     if session.agent_status() != AGENT_READY:

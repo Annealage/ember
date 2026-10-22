@@ -36,7 +36,14 @@ from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
 from .. import protocol
 from ..hosted_state import attribution
-from ..session.base import AGENT_READY, PauseChanged, TurnEnd, UnknownRequest, UserTurn
+from ..session.base import (
+    AGENT_CONNECTING,
+    AGENT_READY,
+    PauseChanged,
+    TurnEnd,
+    UnknownRequest,
+    UserTurn,
+)
 from ..viewers import ViewerRegistry
 
 # Inbound frame ceiling, and a line that must stay. Microdot's default,
@@ -178,12 +185,13 @@ def register_ws(
         conn = None
         try:
             # After the upgrade, so the page's plain-HTTP refusal probe
-            # (static/ws.js) never starts a session; noted as activity, so
-            # the idle sweep does not close the session this page is greeted
-            # with before the page counts as connected.
-            session = await holder.ensure(retry=True)
-            holder.note_activity()
-            bus = holder.bus if session is not None else None
+            # (static/ws.js) is never counted. Not an interaction: a page
+            # connecting only looks, and starts no agent and keeps none open
+            # (an interaction starts it: a turn, an interrupt, a permission
+            # decision, a model switch). The agent is the project's, not the
+            # page's.
+            session = holder.session
+            bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
             # Greeting and replay both happen before the connection is
             # registered, and that order is load-bearing. Registering starts a
             # writer task that also sends on this socket, and a replayed event
@@ -533,7 +541,7 @@ async def _serve_connection(
         if kind in _AGENT_FRAMES:
             await holder.ensure(retry=True)
         session = holder.session
-        bus = holder.bus if session is not None else None
+        bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
         if hosted and bus is not None:
             if kind == "turn":
                 claims = human.hosted_claims
@@ -735,8 +743,10 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
         await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
 
 
-def turn_refusal(session, bus=None):
-    """The ordinary human-turn gate, shared with explicit review notifications."""
+def turn_refusal(session, bus=None, *, starting_ok=False):
+    """The ordinary human-turn gate, shared with explicit review notifications.
+    ``starting_ok`` lets a session that is still starting (connecting) take
+    the turn, because the caller keeps it until the session is ready."""
     refusal_reader = getattr(bus, "manual_turn_refusal", None)
     blocked_reason = refusal_reader() if callable(refusal_reader) else None
     automation_reader = getattr(session, "automation_metadata", None)
@@ -747,8 +757,11 @@ def turn_refusal(session, bus=None):
     admission_reader = getattr(session, "turn_refusal", None)
     if blocked_reason is None and callable(admission_reader):
         blocked_reason = admission_reader()
-    if blocked_reason is None and session.agent_status() != AGENT_READY:
-        blocked_reason = "the agent is %s, so this message was not sent" % session.agent_status()
+    status = session.agent_status()
+    if blocked_reason is None and status != AGENT_READY and not (
+        starting_ok and status == AGENT_CONNECTING
+    ):
+        blocked_reason = "the agent is %s, so this message was not sent" % status
     return blocked_reason
 
 
@@ -784,7 +797,13 @@ async def _submit_turn_locked(
     """
     blocks = frame["blocks"]
     client_id = frame.get("client_id")
-    blocked_reason = turn_refusal(session, bus)
+    holder = getattr(bus, "agent_holder", None)
+    defer = holder is not None and bus is not None and (
+        session.agent_status() == AGENT_CONNECTING or holder.has_deferred()
+    )
+    blocked_reason = (
+        turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)
+    )
     if blocked_reason is not None:
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
@@ -819,7 +838,13 @@ async def _submit_turn_locked(
     else:
         blocks_to_send = blocks
     try:
-        await session.submit_turn(blocks_to_send, viewer=conn.tab_id)
+        if defer:
+            # The agent is still starting (a closed one an interaction just
+            # opened, or a resumed conversation coming up): the input is kept
+            # and delivered once it is ready, never refused for being early.
+            holder.defer_turn(session, blocks_to_send, conn.tab_id, turn)
+        else:
+            await session.submit_turn(blocks_to_send, viewer=conn.tab_id)
     except Exception as exc:
         # A session that fails must not take the socket with it: the viewer
         # half of this page keeps working whatever the agent does.

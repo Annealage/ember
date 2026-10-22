@@ -2667,3 +2667,36 @@ async def test_thinking_delta_is_emitted_and_capped_per_turn():
         assert isinstance(after, TextDelta) and after.text == "answer"
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_omp_dying_mid_turn_ends_the_session_the_turn_and_the_queue(monkeypatch):
+    """omp wrote ``session_exit`` and went away 16s into a turn, and the
+    session kept saying ready: the turn never ended and later input queued
+    behind it for good. The child is watched, so its exit says why the session
+    closed, makes it unavailable, ends the running turn, and rejects what was
+    queued behind it."""
+    from annealage_ember.session import omp as omp_module
+    from annealage_ember.session.base import AgentClosed, AgentError, InputState
+
+    monkeypatch.setattr(omp_module, "_CHILD_POLL_INTERVAL", 0.01)
+    session, fake, recorder, broker = await _started_session()
+    fake._process = SimpleNamespace(poll=lambda: None, pid=4242)
+    try:
+        await session.submit_turn(_text("first"), viewer=None)
+        await session.submit_turn(_text("second, queued behind it"), viewer=None)
+        fake._process = SimpleNamespace(poll=lambda: 1, pid=4242)
+
+        seen = []
+        while not any(isinstance(e, AgentError) for e in seen):
+            seen.append(await recorder.next(include_status=True))
+        closed = [e for e in seen if isinstance(e, AgentClosed)]
+        assert [(e.reason, e.detail) for e in closed] == [("child_exited", "omp exited with status 1")]
+        assert session.agent_status() == "unavailable"
+        ends = [(e.turn, e.stop_reason) for e in seen if isinstance(e, TurnEnd)]
+        assert ends == [(1, "backend_exited"), (2, "rejected")]
+        states = [(e.turn, e.state) for e in seen if isinstance(e, InputState)]
+        assert (1, "uncertain") in states and (2, "rejected") in states
+        assert any(isinstance(e, AgentError) for e in seen)
+    finally:
+        await session.close()

@@ -275,13 +275,16 @@ function renderUserAttachments(container, blocks) {
     });
 }
 
-const AGENT_LABEL = { connecting: "Connecting…", ready: "Ready", unavailable: "Unavailable" };
+const AGENT_LABEL = {
+  connecting: "Connecting…", ready: "Ready", unavailable: "Unavailable", closed: "Closed",
+};
 // The generic tooltips; `initChat`'s `agentTitles` replaces any of them.
 const AGENT_TITLE = {
-  connecting: "The agent process is starting.",
+  connecting: "The agent process is starting; a message sent now is delivered once it is up.",
   ready: "The agent is ready to receive a message.",
+  closed: "The agent is not running. Sending a message starts it again.",
   unavailable:
-    "The agent is not available right now. The rest of the page keeps working regardless.",
+    "The agent is not available right now. Sending a message tries to start it again; the rest of the page keeps working regardless.",
 };
 
 // The ids the pane's elements have in the markup a page copies, by role.
@@ -862,9 +865,11 @@ export function initChat({
     if (t.user) {
       rec.userEl.hidden = false;
       const automated = !!t.automationSource;
-      rec.userAuthor.hidden = !automated;
+      const resent = t.redeliveryOf !== null && t.redeliveryOf !== undefined;
+      rec.userAuthor.hidden = !automated && !resent;
       rec.userAuthor.textContent = t.automationSource === "loom_root_continuation"
-        ? "Automatic workflow continuation" : automated ? "Automatic turn" : "";
+        ? "Automatic workflow continuation" : automated ? "Automatic turn"
+          : resent ? "Sent again after a restart (turn " + t.redeliveryOf + ")" : "";
       rec.userText.textContent = blocksToText(t.user);
       renderUserAttachments(rec.userAttachmentsEl, t.user);
     }
@@ -1258,7 +1263,7 @@ export function initChat({
     const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
     const steering = steers && busy && ready;
     const queueing = !steers && busy && ready;
-    chatSendBtn.disabled = !ready || uploading;
+    chatSendBtn.disabled = uploading;
     chatSendBtn.textContent = steering ? "Steer" : (queueing ? "Queue" : "Send");
     chatSendBtn.title = uploading
       ? "Waiting for an attachment to finish uploading"
@@ -1377,10 +1382,11 @@ export function initChat({
     const text = chatInputEl.value.trim();
     const chat = store.getState().chat;
     const attachments = chat.attachments;
-    // Held while the agent is not ready or anything is still uploading: the
-    // button is already disabled for both, and this covers the Enter key,
-    // which is not the button. The message stays in the composer.
-    if (chat.agentStatus !== "ready") return;
+    // Held only while something is still uploading: the button is already
+    // disabled for that, and this covers the Enter key, which is not the
+    // button. The agent's own state never holds a message: a closed, starting
+    // or failed agent is opened by the message itself (the server answers it
+    // with a turn once the agent is up, or says why it could not be).
     if (attachments.some((a) => a.state === "uploading")) return;
     const ready = attachments.filter((a) => a.state === "done");
     if (!text && !ready.length) return; // an attachment with no text is allowed; neither is not
@@ -1632,6 +1638,7 @@ export function initChat({
       case "user_turn":
         store.setChatUserTurn(
           event.turn, event.blocks, event.client_id || null, event.automation_source || null,
+          event.redelivery_of ?? null,
         );
         // Only a human answering can clear an attention prompt.
         if (!meta.history && !event.automation_source) {

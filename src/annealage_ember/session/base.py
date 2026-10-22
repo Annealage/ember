@@ -475,6 +475,28 @@ class ViewerPrimary(AgentEvent):
     viewer: Optional[str] = None
 
 
+#: Why a session was closed (``AgentClosed.reason``).
+CLOSE_IDLE = "idle"
+CLOSE_STOP = "stop"
+CLOSE_CANCEL = "cancel"
+CLOSE_REPLACED = "replaced"
+CLOSE_CHILD_EXITED = "child_exited"
+CLOSE_OTHER = "other"
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentClosed(AgentEvent):
+    """The agent session ended, and why. Published for every close so a
+    session that vanished never has to be explained from its absence;
+    ``detail`` is the backend's own words when it has any (an exit code).
+    Never part of a transcript or of what the agent is told."""
+
+    kind: ClassVar[str] = "agent_closed"
+    reason: str
+    detail: Optional[str] = None
+    viewer: Optional[str] = None
+
+
 @dataclasses.dataclass(frozen=True)
 class AgentStatus(AgentEvent):
     """The agent's status changed to ``status``, one of the three AGENT_ values.
@@ -648,6 +670,11 @@ class UserTurn(AgentEvent):
     display: Optional[str] = None
     automation_source: Optional[str] = None
     review_notification_ids: Optional[list[str]] = None
+    #: Set on a turn re-sent after a restart: the number of the original turn,
+    #: which was ended as ``redelivered``. It carries the original's ``by`` and
+    #: ``client_id``. A transcript shows it as a note, not a second human
+    #: message, and a turn that already carries it is never re-sent again.
+    redelivery_of: Optional[int] = None
 
 
 #: Every event kind the agent layer emits itself. A product's own event
@@ -657,6 +684,7 @@ class UserTurn(AgentEvent):
 #: whose kind was ``turn_end`` would be read as the end of a turn.
 GENERIC_EVENTS = (
     TextDelta,
+    ThinkingDelta,
     ToolUse,
     ToolResult,
     PermissionRequest,
@@ -668,6 +696,7 @@ GENERIC_EVENTS = (
     PauseChanged,
     ViewerPrimary,
     AgentStatus,
+    AgentClosed,
     AgentModelChanged,
     AgentModelsAvailable,
     AgentRuntimeResolved,
