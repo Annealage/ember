@@ -500,6 +500,24 @@ out.inlineReplayOrder = segmentContainer(9).children.map((n) => n.className === 
   : "tools:" + n.children[1].children.map((c) => c.dataset.toolId).join(","));
 out.inlineReplayResult = segmentContainer(9).children[1].children[1].children[0].children[2].textContent;
 
+
+// Thinking: its own closed block in event order; textContent only; it is
+// not model activity, so it leaves an error banner alone.
+chat.handleHello({ id: "thinking", agent: "ready", agent_error: null });
+chat.handleEvent(user(30));
+chat.handleEvent(failure);
+chat.handleEvent({ kind: "thinking_delta", turn: 30, text: "weigh it" });
+chat.handleEvent({ kind: "thinking_delta", turn: 30, text: " more", truncated: true });
+chat.handleEvent({ kind: "text_delta", turn: 30, text: "answer" }, { replayed: true });
+chat.handleEvent({ kind: "thinking_delta", turn: 30, text: "again" });
+const thinkingNodes = [...segmentContainer(30).children];
+out.thinkingBlocks = {
+  order: thinkingNodes.map((n) => n.className),
+  opened: !!thinkingNodes[0].open,
+  body: thinkingNodes[0].children[1].textContent,
+  noteHidden: thinkingNodes[0].children[2].hidden,
+  bannerKept: store.getState().chat.banner && store.getState().chat.banner.text,
+};
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -734,3 +752,12 @@ def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
     }
     assert observed["inlineReplayOrder"] == observed["inlineOrder"]
     assert observed["inlineReplayResult"] == "late earlier result"
+
+
+def test_thinking_is_a_closed_block_in_event_order_and_never_raises_activity(observed):
+    thinking = observed["thinkingBlocks"]
+    assert thinking["order"] == ["thinking", "text", "thinking"]
+    assert thinking["opened"] is False
+    assert thinking["body"] == "weigh it more"
+    assert thinking["noteHidden"] is False
+    assert thinking["bannerKept"] == "Check credentials"

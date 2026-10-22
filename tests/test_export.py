@@ -389,3 +389,17 @@ def test_create_review_file_refuses_a_review_directory_swapped_during_the_open(
 
     assert files.create_review_file(project, "swap.md") is None
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "jsonl"])
+@pytest.mark.parametrize("include", ["text", "full"])
+def test_thinking_never_appears_in_a_transcript(fmt, include):
+    from annealage_ember.session.base import ThinkingDelta
+
+    records = [
+        _rec(1, ThinkingDelta(turn=1, text="private reasoning")),
+        _rec(2, TextDelta(turn=1, text="the answer")),
+    ]
+    out = events.render_transcript(records, fmt=fmt, include=include)
+    assert "the answer" in out
+    assert "private reasoning" not in out

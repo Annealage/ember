@@ -432,6 +432,8 @@ The page loads the pane's modules through one import map entry, `"agent/": "/age
 
   Assistant text and tool activity stay in chronological order within their turn: text, an inline run of calls, more text, another run, and so on. Only adjacent calls share an initially collapsed disclosure with total, running and failed counts; an empty text delta does not split a run, and a late result updates its original card without moving it or creating a new run. Expanding a run reveals individual tool cards (respecting their saved collapsed preference), in a list bounded to 24rem or 45% of the viewport height, whichever is smaller. Permission cards remain separately actionable. Opening an inspector pauses auto-follow, and scrolling the conversation back to its bottom resumes it. Streaming updates preserve open disclosures, inner scroll positions and a visible transcript anchor while the human reads above the bottom.
 
+  Model thinking streams as `thinking_delta` events and shows in its place in the turn as a collapsed "Thinking" block, expandable on click (a Claude model may return little or none, depending on model and effort). It is written to the session's `events.jsonl` so a reload or restart shows it again, capped at 64k characters per turn with a "Thinking truncated." note, and never appears in an exported transcript. It does not count as agent activity and is not given to `run_prompt`'s `on_activity` observer.
+
   Collapsed tool runs mount only their summary, not every tool card. Opening
   a run mounts its cards; each closed card keeps its own summary and defers
   rendering JSON inputs and result bodies until opened. Already-mounted

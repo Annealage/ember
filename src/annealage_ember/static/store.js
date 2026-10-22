@@ -57,7 +57,7 @@
  *                 `{turn, user, segments, errors, stopReason, costUsd, complete,
  *                 inputState, inputDetail}`, built by conversation and
  *                 input_state events. `segments` is the ordered transcript:
- *                 `{kind: "text", text}` or `{kind: "tools", tools}`, grouping
+ *                 `{kind: "text", text}`, `{kind: "thinking", text, truncated}` or `{kind: "tools", tools}`, grouping
  *                 only adjacent activity. Each tool has `{tool_use_id, name,
  *                 input, result}`; a result updates that original tool without
  *                 changing segment order. `user` is the blocks the human sent as
@@ -405,7 +405,9 @@ function appendSegment(segments, segment) {
   }
   const merged = segment.kind === "text"
     ? { kind: "text", text: last.text + segment.text }
-    : { kind: "tools", tools: Object.freeze([...last.tools, ...segment.tools]) };
+    : segment.kind === "thinking"
+      ? { kind: "thinking", text: last.text + segment.text, truncated: last.truncated || segment.truncated }
+      : { kind: "tools", tools: Object.freeze([...last.tools, ...segment.tools]) };
   return Object.freeze([...segments.slice(0, -1), Object.freeze(merged)]);
 }
 
@@ -417,6 +419,22 @@ function appendChatTextDelta(turn, text) {
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx ? Object.freeze({
         ...t, segments: appendSegment(t.segments, { kind: "text", text }),
+      }) : t)),
+    );
+    state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
+  }, ["chat"]);
+}
+
+// Thinking is its own segment kind so it keeps its place between text and
+// tool runs; `truncated` is sticky once the server says the cap was hit.
+function appendChatThinkingDelta(turn, text, truncated = false) {
+  if (!text && !truncated) return;
+  commit(() => {
+    const chat = state.chat;
+    const { turns, idx } = ensureTurn(chat, turn);
+    const nextTurns = Object.freeze(
+      turns.map((t, i) => (i === idx ? Object.freeze({
+        ...t, segments: appendSegment(t.segments, { kind: "thinking", text: text || "", truncated }),
       }) : t)),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
@@ -832,6 +850,7 @@ export const store = Object.freeze({
   setChatUserTurn,
   setChatInputState,
   appendChatTextDelta,
+  appendChatThinkingDelta,
   addChatTurnError,
   addChatToolUse,
   setChatToolResult,

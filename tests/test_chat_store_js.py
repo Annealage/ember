@@ -86,6 +86,13 @@ out.frozenSegments = Object.isFrozen(after) && after.every((s) => (
     && s.tools.every((t) => Object.isFrozen(t) && (!t.result || Object.isFrozen(t.result))))
 ));
 
+// Thinking merges with adjacent thinking only, and truncation sticks.
+store.appendChatThinkingDelta(6, "a");
+store.appendChatThinkingDelta(6, "b", true);
+store.appendChatTextDelta(6, "Answer.");
+store.appendChatThinkingDelta(6, "later");
+out.thinkingSegments = turn(6).segments;
+
 console.log(JSON.stringify(out));
 """
 
@@ -146,3 +153,10 @@ def test_segments_keep_text_and_contiguous_tool_runs_in_event_order(observed):
     assert observed["onlyOriginalRunUpdated"] == [True, False, True, True, True]
     assert observed["otherTurnUnchanged"] is True
     assert observed["frozenSegments"] is True
+
+
+def test_thinking_is_its_own_segment_kept_in_event_order(observed):
+    segments = observed["thinkingSegments"]
+    assert [s["kind"] for s in segments] == ["thinking", "text", "thinking"]
+    assert segments[0] == {"kind": "thinking", "text": "ab", "truncated": True}
+    assert segments[2]["truncated"] is False

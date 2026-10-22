@@ -101,7 +101,10 @@ class Replay:
 #: reads a resumed session's turns from these alone). ``user_turn`` is one,
 #: so a turn the human sent that got no reply at all (the process was
 #: killed first) still counts and is closed as interrupted on the next start.
-_TURN_KINDS = frozenset(("user_turn", "text_delta", "tool_use", "turn_end"))
+_TURN_KINDS = frozenset(("user_turn", "text_delta", "thinking_delta", "tool_use", "turn_end"))
+
+#: The streamed-text kinds ``_coalesce`` joins, each only with its own kind.
+_DELTA_KINDS = ("text_delta", "thinking_delta")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -594,23 +597,32 @@ def _coalesce(records: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
     """
     out: List[Tuple[int, dict]] = []
     run: List[str] = []  # the texts of the delta run out[-1] stands for
+    cut = [False]  # whether any thinking delta in the run was truncated
 
     def close_run():
-        if len(run) > 1:
+        if len(run) > 1 or cut[0]:
             seq, event = out[-1]
-            out[-1] = (seq, dict(event, text="".join(run)))
+            joined = dict(event, text="".join(run))
+            if cut[0]:
+                joined["truncated"] = True
+            out[-1] = (seq, joined)
         run.clear()
+        cut[0] = False
 
     for seq, event in records:
-        is_delta = event.get("kind") == "text_delta"
-        if run and is_delta and event.get("turn") == out[-1][1].get("turn"):
+        kind = event.get("kind")
+        is_delta = kind in _DELTA_KINDS
+        if (run and is_delta and kind == out[-1][1].get("kind")
+                and event.get("turn") == out[-1][1].get("turn")):
             run.append(event.get("text", ""))
+            cut[0] = cut[0] or bool(event.get("truncated"))
             out[-1] = (seq, out[-1][1])
             continue
         close_run()
         out.append((seq, event))
         if is_delta:
             run.append(event.get("text", ""))
+            cut[0] = bool(event.get("truncated"))
     close_run()
     return out
 

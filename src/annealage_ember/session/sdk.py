@@ -103,6 +103,7 @@ from .base import (
     SandboxStatus,
     SessionReset,
     TextDelta,
+    ThinkingBudget,
     ToolResult,
     ToolUse,
     TurnEnd,
@@ -339,6 +340,7 @@ class SdkSession:
         self._closing = False
         self._interrupt_epoch = 0
         self._turn = int(turn)
+        self._thinking_budget = ThinkingBudget()
         self._end_turn_pending = False
         self._stop_reason = None
         # Why the last result said it failed (``ResultMessage.is_error``: an API
@@ -1421,6 +1423,12 @@ class SdkSession:
         if event.get("type") != "content_block_delta":
             return
         delta = event.get("delta") or {}
+        if delta.get("type") == "thinking_delta":
+            text = delta.get("thinking")
+            thought = self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            if thought is not None:
+                self._emit(thought)
+            return
         if delta.get("type") != "text_delta":
             return
         text = delta.get("text") or ""

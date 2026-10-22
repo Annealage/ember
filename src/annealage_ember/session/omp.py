@@ -226,6 +226,7 @@ from .base import (
     SandboxStatus,
     SessionReset,
     TextDelta,
+    ThinkingBudget,
     ToolResult,
     ToolUse,
     TurnEnd,
@@ -413,6 +414,8 @@ class OmpSession:
         # The last turn of a resumed session's history (launch passes
         # bus.turn), so the next one continues its numbering.
         self._turn = int(turn)
+        # Read only on omp_rpc's reader thread (``_on_message_update``).
+        self._thinking_budget = ThinkingBudget()
         # Retain ownership through the terminal event's asynchronous usage read:
         # a later input must not start until that turn's counters are settled.
         self._running = False
@@ -1300,6 +1303,11 @@ class OmpSession:
             if text:
                 turn = self._turn
                 self._loop.call_soon_threadsafe(self._emit, TextDelta(turn=turn, text=text))
+        elif kind == "thinking_delta":
+            text = assistant_event.get("delta")
+            thought = self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            if thought is not None:
+                self._loop.call_soon_threadsafe(self._emit, thought)
         elif kind == "error":
             error = assistant_event.get("error")
             if error is not None:

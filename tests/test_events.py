@@ -405,3 +405,25 @@ def test_close_is_idempotent(tmp_path):
     log.append(_evt("a"))
     log.close()
     log.close()
+
+
+def test_thinking_coalesces_apart_from_text_and_keeps_truncation(tmp_path):
+    from annealage_ember.session.base import ThinkingDelta
+
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path))
+    for event in (
+        ThinkingDelta(turn=1, text="a "),
+        ThinkingDelta(turn=1, text="b", truncated=True),
+        _evt("answer", turn=1),
+        ThinkingDelta(turn=2, text="c"),
+    ):
+        log.append(event)
+    log.close()
+
+    replayed = EventLog(str(path)).replay(0).events
+    assert [(w["kind"], w["text"], w.get("truncated")) for _, w in replayed] == [
+        ("thinking_delta", "a b", True),
+        ("text_delta", "answer", None),
+        ("thinking_delta", "c", None),
+    ]

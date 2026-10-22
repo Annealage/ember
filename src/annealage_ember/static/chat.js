@@ -874,8 +874,22 @@ export function initChat({
       let segmentRec = rec.segments[index];
       if (!segmentRec) {
         const el = document.createElement(segment.kind === "text" ? "div" : "details");
-        el.className = segment.kind === "text" ? "text" : "toolgroup";
+        el.className = segment.kind === "text" ? "text"
+          : segment.kind === "thinking" ? "thinking" : "toolgroup";
         segmentRec = { el, tools: new Map() };
+        if (segment.kind === "thinking") {
+          // Closed by default; `textContent` only, since this is model output.
+          const summary = document.createElement("summary");
+          summary.textContent = "Thinking";
+          segmentRec.body = document.createElement("div");
+          segmentRec.body.className = "thinkingtext";
+          segmentRec.note = document.createElement("div");
+          segmentRec.note.className = "thinkingnote";
+          segmentRec.note.textContent = "Thinking truncated.";
+          segmentRec.note.hidden = true;
+          el.append(summary, segmentRec.body, segmentRec.note);
+          inspectDisclosure(el);
+        }
         if (segment.kind === "tools") {
           segmentRec.summary = document.createElement("summary");
           segmentRec.toolsEl = document.createElement("div");
@@ -891,6 +905,11 @@ export function initChat({
       segmentRec.value = segment;
       if (segment.kind === "text") {
         segmentRec.el.innerHTML = renderModelText(segment.text);
+        return;
+      }
+      if (segment.kind === "thinking") {
+        segmentRec.body.textContent = segment.text;
+        segmentRec.note.hidden = !segment.truncated;
         return;
       }
       updateToolRun(segmentRec, segment);
@@ -1625,6 +1644,11 @@ export function initChat({
         break;
       case "text_delta":
         store.appendChatTextDelta(event.turn, event.text);
+        break;
+      case "thinking_delta":
+        // Not activity: it neither clears an error banner nor marks a turn
+        // as running, so a replay of it changes nothing but the block.
+        store.appendChatThinkingDelta(event.turn, event.text, !!event.truncated);
         break;
       case "tool_use":
         store.addChatToolUse(event.turn, event.tool_use_id, event.name, event.input);

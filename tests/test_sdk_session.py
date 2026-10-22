@@ -2067,3 +2067,28 @@ async def test_interrupted_automated_reconnect_never_sends_the_prompt(monkeypatc
         release.set()
         await asyncio.gather(sending, return_exceptions=True)
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_event_thinking_delta_becomes_thinking_delta_event():
+    from annealage_ember.session.base import ThinkingDelta
+
+    session, transport, recorder = await _started_session()
+    try:
+        for delta in (
+            {"type": "thinking_delta", "thinking": "weighing it"},
+            {"type": "signature_delta", "signature": "abc"},
+        ):
+            transport.push(
+                {
+                    "type": "stream_event",
+                    "uuid": "u1",
+                    "session_id": "sdk-sess-1",
+                    "event": {"type": "content_block_delta", "delta": delta},
+                }
+            )
+        event = await recorder.next()
+        assert isinstance(event, ThinkingDelta)
+        assert event.text == "weighing it"
+    finally:
+        await session.close()

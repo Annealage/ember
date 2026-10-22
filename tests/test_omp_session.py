@@ -2643,3 +2643,27 @@ async def test_launch_forwards_operator_effort_to_omp_thinking(tmp_path, monkeyp
         assert clients[0].prompt_calls == []
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_is_emitted_and_capped_per_turn():
+    from annealage_ember.session.base import THINKING_CAP, ThinkingDelta
+
+    session, fake, recorder, broker = await _started_session()
+    try:
+        fake.push_message_update({"type": "thinking_delta", "delta": "hmm"})
+        first = await recorder.next()
+        assert isinstance(first, ThinkingDelta)
+        assert (first.text, first.truncated) == ("hmm", None)
+
+        fake.push_message_update({"type": "thinking_delta", "delta": "x" * THINKING_CAP})
+        cut = await recorder.next()
+        assert len(cut.text) == THINKING_CAP - 3 and cut.truncated is True
+
+        # Spent: further thinking emits nothing, but text still arrives.
+        fake.push_message_update({"type": "thinking_delta", "delta": "more"})
+        fake.push_message_update({"type": "text_delta", "delta": "answer"})
+        after = await recorder.next()
+        assert isinstance(after, TextDelta) and after.text == "answer"
+    finally:
+        await session.close()

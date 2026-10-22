@@ -156,6 +156,45 @@ class TextDelta(AgentEvent):
     viewer: Optional[str] = None
 
 
+#: Most characters of model thinking kept per turn. Past it the last event
+#: carries ``truncated`` and nothing more is emitted for that turn.
+THINKING_CAP = 65536
+
+
+@dataclasses.dataclass(frozen=True)
+class ThinkingDelta(AgentEvent):
+    """A piece of the model's thinking text. Shown collapsed by the page and
+    never part of a transcript (``events._KIND_MIN_INCLUDE`` omits it)."""
+
+    kind: ClassVar[str] = "thinking_delta"
+    turn: int
+    text: str
+    truncated: Optional[bool] = None
+    viewer: Optional[str] = None
+
+
+class ThinkingBudget:
+    """Per-turn cap on thinking text: ``take(turn, text)`` returns the
+    ``ThinkingDelta`` to emit, or ``None`` once the turn's cap is spent."""
+
+    def __init__(self):
+        self._turn = None
+        self._used = 0
+        self._done = False
+
+    def take(self, turn, text):
+        if turn != self._turn:
+            self._turn, self._used, self._done = turn, 0, False
+        if self._done or not text:
+            return None
+        room = THINKING_CAP - self._used
+        if len(text) <= room:
+            self._used += len(text)
+            return ThinkingDelta(turn=turn, text=text)
+        self._done = True
+        self._used = THINKING_CAP
+        return ThinkingDelta(turn=turn, text=text[:room], truncated=True)
+
 @dataclasses.dataclass(frozen=True)
 class ToolUse(AgentEvent):
     kind: ClassVar[str] = "tool_use"
