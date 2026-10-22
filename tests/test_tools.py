@@ -13,11 +13,10 @@ reason ``tests/test_sdk_session.py`` writes out the allow list: a test that
 derives its expectation from the thing it is testing cannot notice that thing
 changing.
 
-**The failure mapping**, because the four ways a viewer call can fail mean four
-different things to a model. A model told "it timed out" retries; one told "no
-viewer is connected" asks the human to open the page; one told "the viewer
-refused it" reads the reason. Collapsing them would be invisible in any test
-that only checked ``is_error``, so each is asserted on its wording.
+**The failure mapping**, including the distinction between a browser reply
+deadline and a host handler deadline. The real registry and host-tool dispatch
+are exercised for deadlines, including pending-call cleanup and handler
+cancellation, rather than substituting a timeout from a fake viewer.
 
 **The pause gate**, exhaustively over every gated toy tool rather than over a
 sample, and over every tool that is not gated.
@@ -34,7 +33,13 @@ import pytest
 from toy_product import NOTES_FILE, TOY_PAUSED_MESSAGE, build_toy_tools
 
 from annealage_ember.tools import Grading, ToolServer, namespaced
-from annealage_ember.viewers import CallError, NoViewerConnected, ViewerGone
+from annealage_ember.viewers import (
+    CallError,
+    NoViewerConnected,
+    ViewerBus,
+    ViewerGone,
+    ViewerRegistry,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -177,7 +182,9 @@ async def test_nonrememberable_write_keeps_its_gate_and_gets_fresh_cards(
     grants.write_text(original, encoding="utf-8")
     events = []
     broker = PermissionBroker(
-        events.append, permissions_path=grants, never_remembered=server.never_remembered,
+        events.append,
+        permissions_path=grants,
+        never_remembered=server.never_remembered,
         no_viewer_grace=0,
     )
     assert (await broker.ask(broker_name, {"text": "first"}, None)).allow is False
@@ -220,8 +227,11 @@ async def test_nonrememberable_names_must_be_registered_product_tools(project):
     real = build_toy_tools(FakeBus(), project)
     with pytest.raises(ValueError, match="never_remembered names are not tools: absent"):
         ToolServer(
-            list(real.tools), grading=real.grading, bus=FakeBus(),
-            paused_message=TOY_PAUSED_MESSAGE, never_remembered=("absent",),
+            list(real.tools),
+            grading=real.grading,
+            bus=FakeBus(),
+            paused_message=TOY_PAUSED_MESSAGE,
+            never_remembered=("absent",),
         )
 
 
@@ -283,14 +293,53 @@ async def test_a_viewer_that_closed_is_reported_as_not_having_happened(project):
     assert "set_view" in text_of(result)
 
 
-async def test_a_timeout_does_not_claim_either_outcome(project):
-    """The one failure where the tool genuinely does not know: the frame was
-    sent, so the browser may have acted on it. Telling the model it failed
-    would be as wrong as telling it it worked."""
-    bus = FakeBus(raises=asyncio.TimeoutError())
-    result = await tools_for(bus, project)["set_view"]({"zoom": 2})
+async def test_browser_deadline_returns_a_host_tool_error_and_cleans_pending_call(project):
+    class Socket:
+        async def send(self, data, opcode=None):
+            return None
+
+    registry = ViewerRegistry()
+    conn = await registry.add(Socket())
+    bus = ViewerBus(registry, url=VIEWER_URL, timeout=0)
+    try:
+        server = build_toy_tools(bus, project)
+        result = await server.host_tool_table()["get_view"].handler({})
+        assert result["is_error"] is True
+        assert registry._pending == {}
+        assert not conn.removed
+    finally:
+        await registry.remove(conn)
+        await asyncio.gather(conn.writer_task, return_exceptions=True)
+
+
+async def test_host_handler_deadline_returns_an_error_without_undoing_completed_work(project):
+    from claude_agent_sdk import tool
+
+    unfinished = asyncio.get_running_loop().create_future()
+    stopped = asyncio.Event()
+
+    @tool("host_capture", "Capture on the host without a viewer.", {})
+    async def host_capture(args):
+        (project / NOTES_FILE).write_text('["captured"]', encoding="utf-8")
+        try:
+            await asyncio.wait_for(unfinished, timeout=0)
+        finally:
+            stopped.set()
+
+    registry = ViewerRegistry()
+    server = ToolServer(
+        [host_capture],
+        grading=Grading(read=("host_capture",), view=(), write=()),
+        bus=ViewerBus(registry, url=VIEWER_URL),
+        paused_message=TOY_PAUSED_MESSAGE,
+    )
+    result = await server.host_tool_table()["host_capture"].handler({})
+
     assert result["is_error"] is True
-    assert "may or may not have happened" in text_of(result)
+    assert stopped.is_set()
+    assert unfinished.cancelled()
+    assert json.loads((project / NOTES_FILE).read_text(encoding="utf-8")) == ["captured"]
+    assert registry._pending == {}
 
 
 async def test_a_viewer_refusal_carries_its_code_and_reason(project):

@@ -47,6 +47,7 @@ from annealage_ember.viewers import (
     ViewerBus,
     ViewerGone,
     ViewerRegistry,
+    ViewerTimeout,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -168,6 +169,7 @@ async def test_call_resolves_with_the_result_from_a_matching_reply():
     registry.resolve_call(conn, {"type": "result", "id": call_id, "result": {"ok": True}})
 
     assert await call_task == {"ok": True}
+    assert registry._pending == {}
 
 
 async def test_call_raises_call_error_on_a_matching_error_reply():
@@ -184,6 +186,105 @@ async def test_call_raises_call_error_on_a_matching_error_reply():
     with pytest.raises(CallError) as excinfo:
         await call_task
     assert excinfo.value.error == {"code": "no_canvas", "message": "nope"}
+    assert registry._pending == {}
+
+
+async def test_browser_deadline_cleans_pending_call_and_ignores_its_late_reply():
+    registry = ViewerRegistry()
+    conn = await registry.add(_FakeWebSocket())
+    await _stall_writer(conn)
+    try:
+        task = asyncio.create_task(registry.call("slow", {}, timeout=0, url="x"))
+        await asyncio.sleep(0)
+        call_id, (future, target) = next(iter(registry._pending.items()))
+        assert target is conn
+        assert build_call(call_id, "slow", {}) in _queue_frames(conn)
+
+        with pytest.raises(ViewerTimeout) as caught:
+            await task
+        assert isinstance(caught.value.__cause__, asyncio.TimeoutError)
+        assert isinstance(caught.value.__cause__.__cause__, asyncio.CancelledError)
+        assert future.cancelled()
+        assert registry._pending == {}
+
+        next_task = asyncio.create_task(registry.call("next", {}, timeout=5, url="x"))
+        await asyncio.sleep(0)
+        next_id = next(iter(registry._pending))
+        registry.resolve_call(conn, {"type": "result", "id": call_id, "result": "late"})
+        assert not next_task.done()
+        registry.resolve_call(conn, {"type": "result", "id": next_id, "result": "current"})
+        assert await next_task == "current"
+        assert registry._pending == {}
+    finally:
+        await registry.close_all()
+
+
+@pytest.mark.parametrize("ending", ("cancel", "host_deadline"))
+async def test_external_call_cancellation_is_not_a_browser_deadline(ending):
+    registry = ViewerRegistry()
+    conn = await registry.add(_FakeWebSocket())
+    await _stall_writer(conn)
+    try:
+        task = asyncio.create_task(registry.call("slow", {}, timeout=9999, url="x"))
+        await asyncio.sleep(0)
+        _, (future, _) = next(iter(registry._pending.items()))
+
+        if ending == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(asyncio.TimeoutError) as caught:
+                await asyncio.wait_for(task, timeout=0)
+            assert type(caught.value) is asyncio.TimeoutError
+
+        assert future.cancelled()
+        assert registry._pending == {}
+        assert not conn.removed
+    finally:
+        await registry.close_all()
+
+
+async def test_enqueue_timeout_is_not_a_browser_deadline_and_cleans_future(monkeypatch):
+    registry = ViewerRegistry()
+    conn = await registry.add(_FakeWebSocket())
+    await _stall_writer(conn)
+    failure = TimeoutError("host enqueue failed")
+    pending = []
+
+    async def fail_enqueue(conn, frame):
+        pending.append(registry._pending[frame["id"]][0])
+        raise failure
+
+    monkeypatch.setattr(registry, "_enqueue", fail_enqueue)
+    try:
+        with pytest.raises(TimeoutError) as caught:
+            await registry.call("slow", {}, timeout=9999, url="x")
+        assert caught.value is failure
+        assert pending[0].cancelled()
+        assert registry._pending == {}
+    finally:
+        await registry.close_all()
+
+
+async def test_pending_future_timeout_is_not_relabelled_as_a_browser_deadline():
+    registry = ViewerRegistry()
+    conn = await registry.add(_FakeWebSocket())
+    await _stall_writer(conn)
+    try:
+        task = asyncio.create_task(registry.call("slow", {}, timeout=9999, url="x"))
+        await asyncio.sleep(0)
+        _, (future, _) = next(iter(registry._pending.items()))
+        failure = TimeoutError("not the reply deadline")
+        future.set_exception(failure)
+
+        with pytest.raises(TimeoutError) as caught:
+            await task
+        assert caught.value is failure
+        assert not future.cancelled()
+        assert registry._pending == {}
+    finally:
+        await registry.close_all()
 
 
 async def test_late_reply_for_an_unknown_call_id_is_dropped_without_raising(capsys):
@@ -258,6 +359,7 @@ async def test_removing_a_connection_fails_its_pending_call_future_immediately()
     assert isinstance(future.exception(), ViewerGone)
     with pytest.raises(ViewerGone):
         await call_task
+    assert registry._pending == {}
 
 
 async def test_removing_a_connection_does_not_fail_a_call_targeted_at_another_connection():
@@ -722,7 +824,6 @@ async def test_the_pause_switch_reports_only_a_real_change():
     assert bus.paused is False
 
 
-
 async def test_pause_observer_receives_authenticated_source_before_publication():
     bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:8765/#t=tok")
     source = object()
@@ -735,6 +836,7 @@ async def test_pause_observer_receives_authenticated_source_before_publication()
     assert bus.set_paused(True) is True
     await bus.notify_pause(bus.paused, source)
     assert observed == [(True, source)]
+
 
 async def test_a_primary_change_reaches_every_viewer_behind_events_already_published():
     """A session publishes by appending and scheduling the broadcast; a
@@ -777,18 +879,24 @@ async def test_automatic_turn_origin_is_visible_before_sweep_and_abort_restores_
 
     bus = ViewerBus(ViewerRegistry(), url="http://127.0.0.1:1/")
     observed = []
-    bus.on_turn_start(lambda _turn: observed.append(
-        (bus.turn_automation_source, bus.turn_human)))
+    bus.on_turn_start(lambda _turn: observed.append((bus.turn_automation_source, bus.turn_human)))
     bus.queue_note("queued for the next real turn")
     bus.begin_turn([], automation_source="loom_root_continuation")
     assert bus.turn == 1
     assert observed == [("loom_root_continuation", None)]
     assert bus.turn_human is None
-    assert UserTurn(turn=bus.turn, blocks=[], automation_source=bus.turn_automation_source).to_wire()[
-        "automation_source"
-    ] == "loom_root_continuation"
+    assert (
+        UserTurn(turn=bus.turn, blocks=[], automation_source=bus.turn_automation_source).to_wire()[
+            "automation_source"
+        ]
+        == "loom_root_continuation"
+    )
     assert bus.abort_unsubmitted_turn(bus.turn) is True
     assert bus.turn == 0
     assert bus.turn_automation_source is None
-    assert bus.begin_turn([{"type": "text", "text": "human"}])[0]["text"].find(
-        "queued for the next real turn") >= 0
+    assert (
+        bus.begin_turn([{"type": "text", "text": "human"}])[0]["text"].find(
+            "queued for the next real turn"
+        )
+        >= 0
+    )

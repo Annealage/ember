@@ -73,7 +73,7 @@ from collections import namedtuple
 from claude_agent_sdk import create_sdk_mcp_server
 
 from . import product
-from .viewers import CallError, NoViewerConnected, ViewerGone
+from .viewers import CallError, NoViewerConnected, ViewerGone, ViewerTimeout
 
 
 def namespaced(server_name, name):
@@ -278,9 +278,8 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
                 or operation not in bus.hosted_turn_ops
             ):
                 return fail("hosted operation is not granted for this tool call")
-        automatically_gated = (
-            getattr(bus, "auto_approve_included_tools", False)
-            and getattr(tool_def.handler, _ASKS_THE_HUMAN, False)
+        automatically_gated = getattr(bus, "auto_approve_included_tools", False) and getattr(
+            tool_def.handler, _ASKS_THE_HUMAN, False
         )
         if (gated or automatically_gated) and bus.paused:
             return fail(paused_message() if callable(paused_message) else paused_message)
@@ -298,12 +297,18 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
                 "did not happen; ask the product owner whether the page is still "
                 "open, then try again" % tool_def.name
             )
-        except asyncio.TimeoutError:
+        except ViewerTimeout:
             return fail(
                 "the viewer did not answer %s in time, so it may or may "
                 "not have happened; the page may be busy or in a "
                 "background tab. Read the state back before assuming "
                 "either way" % tool_def.name
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return fail(
+                "%s reached a host/tool deadline; its outcome is not established. "
+                "Read the relevant state back before assuming completion or "
+                "retrying" % tool_def.name
             )
         except CallError as exc:
             error = exc.error or {}
@@ -417,8 +422,8 @@ class ToolServer:
         backend broker names; legacy standing grants are ignored by the broker.
         """
         _verify(tools, grading)
-        self.request_guard = request_guard if request_guard is not None else getattr(
-            bus, "request_guard", None
+        self.request_guard = (
+            request_guard if request_guard is not None else getattr(bus, "request_guard", None)
         )
         installed = product.current()
         self.name = installed.mcp_server_name
@@ -428,7 +433,9 @@ class ToolServer:
         never_remembered = tuple(never_remembered)
         unknown = set(never_remembered) - {t.name for t in tools}
         if unknown:
-            raise ValueError("never_remembered names are not tools: %s" % ", ".join(sorted(unknown)))
+            raise ValueError(
+                "never_remembered names are not tools: %s" % ", ".join(sorted(unknown))
+            )
         self._never_remembered = tuple(dict.fromkeys((*self.asks_the_human, *never_remembered)))
         moved = set(self.asks_the_human)
         self.grading = Grading(
@@ -512,7 +519,9 @@ class ToolServer:
         and explicitly non-rememberable product tools, namespaced (as Claude
         and ``/mcp`` ask) and bare (as omp's host-tool gate does), for the
         session's ``PermissionBroker`` (``launch.py``)."""
-        return tuple(namespaced(self.name, n) for n in self._never_remembered) + self._never_remembered
+        return (
+            tuple(namespaced(self.name, n) for n in self._never_remembered) + self._never_remembered
+        )
 
     def included_permission_names(self):
         """Declared tool and upload-target broker names; excludes native tools.

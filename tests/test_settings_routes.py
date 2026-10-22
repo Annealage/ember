@@ -25,6 +25,8 @@ from toy_product import TOY
 
 from annealage_ember import settings
 
+pytestmark = pytest.mark.asyncio
+
 TOKEN = "the-real-settings-token-Value_123"
 
 
@@ -193,7 +195,8 @@ async def test_get_lays_out_the_window_from_each_keys_own_section(make_client):
 
 
 async def test_runtime_controls_are_hidden_and_refused_for_products_that_reserve_them(
-    served_dir, swap_product,
+    served_dir,
+    swap_product,
 ):
     """A product can keep backend/model/effort operator-owned: the browser
     neither learns their settings fields nor writes any part of a mixed batch."""

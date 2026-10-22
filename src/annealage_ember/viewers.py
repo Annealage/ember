@@ -77,13 +77,18 @@ class NoViewerConnected(Exception):
     slightly different phrase reaching the model each time."""
 
 
+class ViewerTimeout(asyncio.TimeoutError):
+    """The primary viewer did not reply before ``call``'s own deadline.
+
+    Host/tool deadlines remain ordinary ``TimeoutError`` exceptions; only
+    this exception means the browser itself was waited on and did not answer.
+    """
+
+
 class ViewerGone(Exception):
     """Raised to fail a pending call whose target connection closed before
-    replying. Distinct from ``asyncio.TimeoutError``, which ``call``'s own
-    ``asyncio.wait_for`` still raises for the case the reply genuinely
-    never arrives: this exception fires the moment the connection is
-    known to be gone, rather than making the caller wait out the full
-    timeout to learn a fact already known."""
+    replying. Unlike ``ViewerTimeout``, this fires as soon as the connection
+    is known to be gone, rather than waiting out the browser reply deadline."""
 
 
 class CallError(Exception):
@@ -376,6 +381,10 @@ class ViewerRegistry:
         this call ends, so a timeout or a ``ViewerGone`` never leaves a
         stale entry for some later, unrelated reply to match against.
 
+        Raises ``ViewerTimeout`` only when the browser reply wait expires,
+        with the underlying ``TimeoutError`` as its cause. Cancellation and
+        failures before the reply wait are not translated.
+
         Raises ``NoViewerConnected`` if no connection is registered at
         all: with zero viewers there is no state to query, and per plan
         section 3.3 a silent hang here teaches the model nothing.
@@ -389,9 +398,18 @@ class ViewerRegistry:
         self._pending[call_id] = (future, conn)
         try:
             await self._enqueue(conn, build_call(call_id, method, params))
-            return await asyncio.wait_for(future, timeout=timeout)
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                # wait_for cancels its future when its own deadline expires.
+                # A TimeoutError supplied by the future is not that deadline.
+                if not future.cancelled():
+                    raise
+                raise ViewerTimeout("viewer did not answer %s in time" % method) from exc
         finally:
             self._pending.pop(call_id, None)
+            if not future.done():
+                future.cancel()
 
     def resolve_call(self, conn: _Connection, frame: dict) -> None:
         """Feed an inbound ``result`` or ``error`` frame to the pending
@@ -860,10 +878,9 @@ class ViewerBus:
             except Exception as exc:
                 sys.stderr.write("warning: a pause observer failed: %r\n" % (exc,))
 
-
-
-    def begin_turn(self, blocks: list, by: Optional[Any] = None, *,
-                   automation_source: Optional[str] = None) -> list:
+    def begin_turn(
+        self, blocks: list, by: Optional[Any] = None, *, automation_source: Optional[str] = None
+    ) -> list:
         """Count one human or explicitly automated turn, then run start callbacks.
 
         ``automation_source`` is absent on human turns. The supported explicit
@@ -872,8 +889,7 @@ class ViewerBus:
         """
         if automation_source not in {None, "loom_root_continuation"}:
             raise ValueError("Unsupported automatic turn source")
-        self._unsubmitted_turn = (
-            self._turn, self.turn_human, self.turn_automation_source, ())
+        self._unsubmitted_turn = (self._turn, self.turn_human, self.turn_automation_source, ())
         self._turn += 1
         self.turn_automation_source = automation_source
         if automation_source is not None:
@@ -915,6 +931,7 @@ class ViewerBus:
         self._notes = list(notes) + self._notes
         self._unsubmitted_turn = None
         return True
+
     def mark_turn_submitted(self, turn: int) -> bool:
         """Discard the rollback snapshot once the turn is durably logged."""
         if self._turn != turn or self._unsubmitted_turn is None:
@@ -954,8 +971,8 @@ class ViewerBus:
 
         Raises what ``ViewerRegistry.call`` raises, untranslated:
         ``NoViewerConnected``, ``ViewerGone``, ``CallError`` and
-        ``asyncio.TimeoutError``. Turning those into tool errors is the
-        registry's job (``tools.py``'s ``_wrap``), in one place, because the four
+        ``ViewerTimeout``. Turning those into tool errors is the tool
+        server's job (``tools.py``'s ``_wrap``), in one place, because the four
         of them mean four different things to a model and a wrapper here would
         have to flatten them to say anything at all.
         """
