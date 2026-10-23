@@ -45,6 +45,7 @@ import { store } from "./store.js";
 import { withToken } from "./ws.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
+import { providerLoginSection } from "./login.js";
 
 // Which layer a value came from, in words a person can act on. The keys are
 // the layer names `settings.py` reports; the project file lives in the
@@ -648,6 +649,9 @@ export function initSettings({
     diagSection.appendChild(diagHeading);
     diagSection.appendChild(diagnosticsBlock(payload.diagnostics || {}, product));
     body.appendChild(diagSection);
+    providerLoginSection().then((section) => {
+      if (section) body.insertBefore(section, diagSection);
+    });
     body.appendChild(agentLogSection());
     panel.appendChild(body);
 

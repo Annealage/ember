@@ -45,6 +45,7 @@ from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
 from .http.routes_mcp import register_mcp_routes
+from .http.routes_provider_login import register_provider_login_routes
 from .http.routes_review import register_review_routes
 from .http.routes_session import register_session_routes
 from .http.routes_settings import register_settings_routes
@@ -250,6 +251,7 @@ def create_app(
     url_prefix="",
     resume_session=None,
     idle_timeout=None,
+    provider_login=None,
     identity=None,
     start_closed=False,
     upload_actions=(),
@@ -825,6 +827,9 @@ def create_app(
     app.agent_start = holder.start
     app.agent_stop = holder.stop
     app.agent_on_stop = holder.on_stop
+    if provider_login is not None and not hosted_mode:
+        register_provider_login_routes(app, login=provider_login, auth=auth)
+        holder.on_stop.append(provider_login.close)
     app.agent_status = holder.status
     app.agent_status_listeners = holder.status_listeners
     # A factory returning None is the ordinary viewer-only case, not a

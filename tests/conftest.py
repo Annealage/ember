@@ -89,6 +89,7 @@ def create_toy_app(
     state_sink=None,
     usage_sink=None,
     settings_model_controls=None,
+    provider_login=None,
 ):
     """The toy product's app over ``serve_dir``: ``agent_app.create_app`` with
     the toy page, whose inline script the Content-Security-Policy hashes, and
@@ -126,6 +127,7 @@ def create_toy_app(
         state_sink=state_sink,
         usage_sink=usage_sink,
         settings_model_controls=settings_model_controls,
+        provider_login=provider_login,
     )
 
 

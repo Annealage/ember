@@ -443,9 +443,13 @@ def agent_route_prefixes():
     registered only in agent mode and is the agent's, not the page's, so a
     page naming it would rightly be refused.)"""
     from annealage_ember import app as agent_app
+    from annealage_ember.provider_login import ProviderLogin
 
     with tempfile.TemporaryDirectory() as d:
-        app = agent_app.create_app(d, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=None)
+        app = agent_app.create_app(
+            d, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=None,
+            provider_login=ProviderLogin(),
+        )
         patterns = {entry[1].url_pattern for entry in app.url_map}
     return tuple(sorted(p.partition("<")[0] for p in patterns))
 

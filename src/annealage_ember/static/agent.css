@@ -322,6 +322,10 @@ pre.toolresult.error { color: #e8a0a0; }
 }
 .logbtn:disabled { opacity: .5; cursor: default; }
 .lognote, .logopts { font-size: 11px; color: #8b93a0; }
+.loginsection .loglist { max-height: 18em; overflow: auto; }
+.loginflow { margin: 8px 0; padding: 8px 10px; border: 1px solid #3a3f48; border-radius: 6px; display: grid; gap: 6px; }
+.loginlink { color: #7fb4ff; font-size: 12px; }
+.loginsection .setinput { min-width: 0; max-width: 100%; box-sizing: border-box; }
 .logopts { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; margin-top: 6px; }
 .logtail {
   margin: 4px 0 0; max-height: 18em; overflow: auto; padding: 6px 8px; border-radius: 6px;
