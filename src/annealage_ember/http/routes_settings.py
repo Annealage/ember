@@ -89,15 +89,38 @@ def register_settings_routes(
     hosted_mode=False,
     mounted=False,
     browser_runtime_controls=True,
+    model_controls=None,
 ):
     """Register GET/PUT settings routes.
 
     Hosted mode filters service-controlled settings and writes only to the
-    supplied per-project cache directory. Standalone behaviour is unchanged.
+    supplied per-project cache directory. ``model_controls`` is an explicit
+    product opt-in to restart-only administrator model settings, independent
+    of the WebSocket's live runtime controls. It cannot opt into hosted mode.
     """
     state_dir = state_dir or serve_dir
     if settings is None:
         settings = settings_module.resolve(state_dir)
+    controls = model_controls if not hosted_mode else None
+    control_keys = set()
+    if controls:
+        for row in (*controls["groups"].values(), *controls["agents"]):
+            control_keys.update((row["model"], row["effort"]))
+        for name in control_keys:
+            key = settings_module.KEYS_BY_NAME.get(name)
+            if key is None or key.effect != "restart" or name == "backend":
+                raise ValueError("model controls require restart-only model/effort keys")
+            if settings_module.USER not in key.layers:
+                raise ValueError("administrator model controls require user-writable keys")
+    hidden_runtime_keys = (
+        {"backend", "model", "effort"} - control_keys
+        if not browser_runtime_controls else set()
+    )
+    control_startup = None
+    if controls:
+        control_startup = controls.get("startup") or settings_module.resolve(
+            None, flags=settings.flags
+        ).to_wire()
 
     async def _payload():
         """The response body both routes return, built off the event loop.
@@ -124,17 +147,19 @@ def register_settings_routes(
         if not hosted_mode:
             facts = await loop.run_in_executor(None, collect)
         wire = settings.to_wire()
+        if control_startup is not None:
+            for name in control_keys:
+                wire[name] = dict(control_startup[name])
         if hosted_mode:
             wire = {name: entry for name, entry in wire.items() if _hosted_visible(name)}
-        if not browser_runtime_controls:
+        if hidden_runtime_keys:
             wire = {name: entry for name, entry in wire.items()
-                    if name not in {"backend", "model", "effort"}}
+                    if name not in hidden_runtime_keys}
         if mounted:
             for name in BIND_KEYS:
                 if name in wire:
                     wire[name].update(editable=False, in_effect=False, reason=MOUNTED_BIND_REASON)
         installed = product.current()
-        hidden_runtime_keys = {"backend", "model", "effort"} if not browser_runtime_controls else set()
         body = {
             "ok": True,
             "settings": wire,
@@ -161,6 +186,15 @@ def register_settings_routes(
             },
             "diagnostics": {} if hosted_mode else facts,
         }
+        if controls:
+            runtime_info = getattr(app, "agent_runtime_info", {})
+            body["model_controls"] = {
+                "groups": controls["groups"],
+                "agents": controls["agents"],
+                "models": list(runtime_info.get("models") or []),
+                "runtime": runtime_info.get("resolved_runtime"),
+                "session_id": runtime_info.get("id"),
+            }
 
         # What is on disk now, which after a write is not what this run started
         # with. A hand-edited file that no longer parses must not take the whole
@@ -171,6 +205,11 @@ def register_settings_routes(
             saved = await loop.run_in_executor(
                 None, functools.partial(settings_module.resolve, state_dir, flags=settings.flags)
             )
+            saved_controls = None
+            if controls:
+                saved_controls = await loop.run_in_executor(
+                    None, functools.partial(settings_module.resolve, None, flags=settings.flags)
+                )
         except settings_module.SettingsError as exc:
             body["pending"] = {}
             body["saved_error"] = str(exc)
@@ -187,11 +226,12 @@ def register_settings_routes(
         for name, entry in wire.items():
             if entry.get("in_effect") is False:
                 continue
+            source = saved_controls if name in control_keys else saved
             if entry["effect"] == "load":
-                entry["value"] = saved[name]
-                entry["from"] = saved.provenance(name)
-            elif saved[name] != entry["value"]:
-                pending[name] = {"value": saved[name], "from": saved.provenance(name)}
+                entry["value"] = source[name]
+                entry["from"] = source.provenance(name)
+            elif source[name] != entry["value"]:
+                pending[name] = {"value": source[name], "from": source.provenance(name)}
         body["pending"] = pending
         return body
 
@@ -225,7 +265,7 @@ def register_settings_routes(
             return {"ok": False, "error": "changes is empty; nothing to write"}, 400
         if not browser_runtime_controls:
             restricted = sorted(
-                name for name in changes if name in {"backend", "model", "effort"}
+                name for name in changes if name in hidden_runtime_keys
             )
             if restricted:
                 return {
@@ -267,6 +307,7 @@ def register_settings_routes(
                     changes,
                     flags=settings.flags,
                     layer="project" if hosted_mode else None,
+                    layer_overrides={name: settings_module.USER for name in control_keys},
                 ),
             )
         except settings_module.SettingsError as exc:

@@ -97,9 +97,10 @@ parentheses are Annealage Mesh's, as an example:
     (Mesh's ``main.js`` passes ``initSettings`` an ``onLoad`` hook for it).
 ``browser_runtime_controls``
     Whether the browser can change backend/model/effort. When false, the
-    settings API omits and rejects those writes, and the WebSocket refuses
-    ``set_model``; the operator's trusted launch and configuration remain
-    unaffected.
+    settings API omits and rejects those writes unless the app explicitly
+    declares restart-only ``settings_model_controls`` for human administration.
+    The WebSocket still refuses ``set_model``; the opt-in never enables the
+    chat picker, backend switching or hosted service configuration.
 ``events``
     The product's own ``AgentEvent`` subclasses (Mesh: ``models_changed``),
     registered by ``install`` so a kind that collides with a generic one is

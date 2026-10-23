@@ -699,7 +699,7 @@ def _serialize_mapping(mapping):
     return "".join(lines).encode("utf-8")
 
 
-def apply(project_dir, changes, *, flags=None, layer=None):
+def apply(project_dir, changes, *, flags=None, layer=None, layer_overrides=None):
     """Validate and write ``changes`` (``{name: value}``), then return
     ``(resolve(project_dir, flags=flags), {"user": [names], "project":
     [names]})`` naming which keys landed in which file.
@@ -719,6 +719,10 @@ def apply(project_dir, changes, *, flags=None, layer=None):
     ``write_layer``: ``--save-default`` uses it to put ``backend`` in the
     user file, where it applies to every project, rather than in this
     project's. A key that may not live at ``layer`` is refused.
+    ``layer_overrides`` chooses a layer for individual keys without splitting
+    a validated batch into separate writes. Administrator model controls use
+    this for user-only overrides of otherwise project-writable generic keys.
+    The same layer restrictions are validated for every overridden target.
     """
     project_dir = Path(project_dir)
 
@@ -732,7 +736,7 @@ def apply(project_dir, changes, *, flags=None, layer=None):
         key = KEYS_BY_NAME.get(name)
         if key is None:
             raise SettingsError("%r is not a %s setting" % (name, product.current().name))
-        target = layer or key.write_layer
+        target = (layer_overrides or {}).get(name, layer or key.write_layer)
         if target not in key.layers:
             raise SettingsError(
                 "%r may only be set at the %s layer" % (name, " or ".join(key.layers))

@@ -112,14 +112,14 @@ function applyToPage(payload, onLoad) {
   }
 }
 
-function fieldRow(name, entry, pending, product) {
+function fieldRow(name, entry, pending, product, options = {}) {
   const row = document.createElement("div");
   row.className = "setrow";
   row.dataset.key = name;
 
   const label = document.createElement("label");
   label.className = "setlabel";
-  label.textContent = name;
+  label.textContent = options.label || name;
   label.htmlFor = "set-" + name;
   row.appendChild(label);
 
@@ -136,7 +136,7 @@ function fieldRow(name, entry, pending, product) {
     for (const choice of choices) {
       const option = document.createElement("option");
       option.value = choice;
-      option.textContent = choice === "" ? "(not set)" : choice;
+      option.textContent = choice === "" ? (options.inherits ? "(inherit)" : "(not set)") : choice;
       input.appendChild(option);
     }
     input.value = editing === null ? "" : String(editing);
@@ -149,8 +149,14 @@ function fieldRow(name, entry, pending, product) {
     input.type = entry.type === "int" ? "number" : "text";
     input.value = editing === null ? "" : String(editing);
   }
+  if (options.models && input.tagName === "INPUT") {
+    input.setAttribute("list", "settings-model-suggestions");
+    input.placeholder = options.inherits ? "Inherit shared default" : "provider/model";
+    input.setAttribute("autocomplete", "off");
+  }
   input.id = "set-" + name;
   input.className = "setinput";
+  if (options.configured) input.dataset.configured = "true";
   input.dataset.key = name;
   input.dataset.valueType = entry.type;
   if (!entry.editable) input.disabled = true;
@@ -158,7 +164,7 @@ function fieldRow(name, entry, pending, product) {
 
   const note = document.createElement("div");
   note.className = "setnote";
-  const origin = originText(entry.from, product);
+  const origin = originText(options.configured && pending ? pending.from : entry.from, product);
   const parts = [origin];
   if (entry.in_effect === false) {
     // A value this app does not use at all (the bind of an app a front door
@@ -170,17 +176,128 @@ function fieldRow(name, entry, pending, product) {
   if (pending) {
     // The field above holds the saved value, so what the note has to supply is
     // the other half: what the running server is still using.
-    parts.push("saved; this run is still using " + JSON.stringify(entry.value));
+    parts.push(options.configured
+      ? "pending restart; startup setting was " + JSON.stringify(entry.value)
+      : "saved; this run is still using " + JSON.stringify(entry.value));
   }
   note.textContent = parts.join(" · ");
   row.appendChild(note);
 
   const help = document.createElement("div");
   help.className = "sethelp";
-  help.textContent = entry.description || "";
+  help.textContent = options.description || entry.description || "";
   row.appendChild(help);
 
   return row;
+}
+
+// A product declares its tier/role keys; the UI does not know product names.
+// These controls save configuration only. Backend-reported runtime is kept
+// separate, since a resumed conversation can have a different actual model.
+function modelSettingsBlock(payload) {
+  const controls = payload.model_controls;
+  const block = document.createElement("section");
+  block.className = "setmodels";
+  const heading = document.createElement("h3");
+  heading.textContent = "Models and providers";
+  const intro = document.createElement("p");
+  intro.className = "sethelp";
+  intro.textContent = "Shared defaults apply unless an agent has an override. "
+    + "Leave either override empty to inherit its corresponding shared value. "
+    + "Use provider/model IDs; changing provider does not change the backend. "
+    + "Save changes your user settings for the next server run. Restart the server "
+    + "and resume this conversation to apply them; saving never interrupts, restarts "
+    + "or forks the conversation. Model availability depends on the operator's provider login.";
+  block.append(heading, intro);
+
+  const runtime = document.createElement("p");
+  runtime.className = "setnote";
+  const actual = controls.runtime;
+  runtime.textContent = actual
+    ? "Actual coordinator runtime (backend-reported): " + [
+      actual.backend, actual.provider, actual.model,
+      actual.effort ? "effort " + actual.effort : null,
+    ].filter(Boolean).join(" · ")
+    : "Actual coordinator runtime: not reported by the backend. Saved selections are not runtime confirmation.";
+  block.appendChild(runtime);
+  const session = document.createElement("p");
+  session.className = "setnote";
+  session.textContent = "Conversation: " + (controls.session_id || "not started")
+    + ". Child runtime is reported by each work run, not by these saved defaults.";
+  block.appendChild(session);
+
+  const models = document.createElement("datalist");
+  models.id = "settings-model-suggestions";
+  for (const model of controls.models || []) {
+    const option = document.createElement("option");
+    option.value = model;
+    models.appendChild(option);
+  }
+  block.appendChild(models);
+  const catalogNote = document.createElement("p");
+  catalogNote.className = "sethelp";
+  catalogNote.textContent = (controls.models || []).length
+    ? "Model suggestions come from the running backend. You can also enter a provider/model ID."
+    : "No backend model catalog is available yet. Enter a provider/model ID directly.";
+  block.appendChild(catalogNote);
+
+  const previews = [];
+  function pair(spec, title, inherits) {
+    const heading = document.createElement("h4");
+    heading.textContent = title;
+    block.appendChild(heading);
+    for (const kind of ["model", "effort"]) {
+      const name = spec[kind];
+      const entry = payload.settings[name];
+      if (!entry) continue;
+      block.appendChild(fieldRow(name, entry, payload.pending && payload.pending[name],
+        payload.product || {}, {
+          label: kind === "model" ? "Provider / model" : "Reasoning effort",
+          models: kind === "model", inherits, configured: true,
+          description: inherits
+            ? "Optional user override. Empty inherits " + kind + " from "
+              + controls.groups[inherits].title + ". Saves to your user settings, not this project."
+            : "Shared " + kind + ". Empty uses built-in "
+              + spec["default_" + kind] + ". Saves to your user settings, not this project.",
+        }));
+    }
+    const preview = document.createElement("p");
+    preview.className = "setnote";
+    block.appendChild(preview);
+    previews.push({ spec, inherits, preview });
+  }
+  for (const spec of Object.values(controls.groups)) {
+    pair(spec, spec.title + " shared default", null);
+  }
+  const overrides = document.createElement("h3");
+  overrides.textContent = "Optional per-agent overrides";
+  block.appendChild(overrides);
+  for (const spec of controls.agents) {
+    pair(spec, spec.title + " — inherits " + controls.groups[spec.inherits].title, spec.inherits);
+  }
+  function value(name) {
+    const input = block.querySelector("#set-" + name);
+    return input ? input.value.trim() : "";
+  }
+  function updatePreviews(edited = false) {
+    for (const { spec, inherits, preview } of previews) {
+      const configured = ["model", "effort"].map((kind) => {
+        const own = value(spec[kind]);
+        const group = inherits && controls.groups[inherits];
+        const effective = own || (group
+          ? value(group[kind]) || group["default_" + kind]
+          : spec["default_" + kind]) || "";
+        return kind + ": " + (effective || "backend default")
+          + (group && !own ? " (inherited " + group.title + ")" : "");
+      });
+      preview.textContent = (edited ? "Selected configuration (save to persist): " : "Saved configuration: ")
+        + configured.join(" · ");
+    }
+  }
+  block.addEventListener("input", () => updatePreviews(true));
+  block.addEventListener("change", () => updatePreviews(true));
+  updatePreviews();
+  return block;
 }
 
 function diagnosticsBlock(facts, product) {
@@ -384,7 +501,7 @@ function collectChanges(root, payload) {
     if (input.type === "checkbox") {
       value = input.checked;
     } else if (input.value === "") {
-      value = null;
+      value = !entry.nullable && entry.type === "str" ? "" : null;
     } else if (entry.type === "int") {
       const parsed = Number(input.value);
       if (!Number.isInteger(parsed)) {
@@ -500,12 +617,23 @@ export function initSettings({
     const body = document.createElement("div");
     body.className = "setbody";
     const product = payload.product || {};
+    const modelKeys = new Set();
+    if (payload.model_controls) {
+      const controls = payload.model_controls;
+      for (const spec of [...Object.values(controls.groups), ...controls.agents]) {
+        modelKeys.add(spec.model);
+        modelKeys.add(spec.effort);
+      }
+      body.appendChild(modelSettingsBlock(payload));
+    }
     for (const section of payload.sections || []) {
+      if (!section.keys.some((name) => !modelKeys.has(name))) continue;
       const block = document.createElement("section");
       const heading = document.createElement("h3");
       heading.textContent = section.title;
       block.appendChild(heading);
       for (const name of section.keys) {
+        if (modelKeys.has(name)) continue;
         const entry = payload.settings[name];
         if (!entry) continue;
         block.appendChild(

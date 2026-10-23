@@ -482,3 +482,114 @@ async def test_hosted_agent_refuses_backend_with_a_shell(served_dir):
             hosted_tool_ops={"mcp__toy__list_notes": "project.read"},
             settings=settings.resolve(served_dir.parent / "service-settings"),
         )
+
+
+@pytest.fixture
+def model_controls(swap_product):
+    shared = tuple(
+        settings.Key(
+            name="admin_high_" + kind,
+            type_name="str",
+            default=default,
+            layers=(settings.USER,),
+            effect="restart",
+            description="Shared model configuration",
+            py_type=str,
+            section="Models",
+        )
+        for kind, default in (("model", "anthropic/opus"), ("effort", "high"))
+    )
+    swap_product(dataclasses.replace(
+        TOY, browser_runtime_controls=False, settings_keys=(*TOY.settings_keys, *shared),
+    ))
+    return {
+        "groups": {
+            "high": {
+                "title": "High", "model": "admin_high_model", "effort": "admin_high_effort",
+                "default_model": "anthropic/opus", "default_effort": "high",
+            },
+        },
+        "agents": [
+            {"title": "Coordinator", "model": "model", "effort": "effort", "inherits": "high"},
+        ],
+    }
+
+
+async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runtime(
+    served_dir, model_controls,
+):
+    # A project cannot shadow the administrator's user-only coordinator keys.
+    settings.apply(served_dir, {"model": "project/ignored", "effort": "low"})
+    app = create_toy_app(
+        served_dir, token=TOKEN, agent_token="agent-only-secret",
+        settings_model_controls=model_controls,
+    )
+    app.agent_runtime_info.update(
+        id="same-conversation",
+        models=["anthropic/opus", "openai-codex/gpt"],
+        resolved_runtime={
+            "backend": "omp", "provider": "anthropic", "model": "opus",
+            "effort": "high", "provenance": "get_state",
+        },
+    )
+    before_runtime = dict(app.agent_runtime_info["resolved_runtime"])
+    client = make_test_client(app)
+    payload = body_of(await _put(client, {
+        "admin_high_model": "openai-codex/gpt", "model": "anthropic/sonnet",
+    }))
+    assert payload["ok"]
+    assert payload["pending"]["admin_high_model"]["value"] == "openai-codex/gpt"
+    assert payload["settings"]["admin_high_model"]["value"] == "anthropic/opus"
+    assert payload["pending"]["model"]["value"] == "anthropic/sonnet"
+    assert payload["model_controls"]["runtime"] == before_runtime
+    assert payload["model_controls"]["session_id"] == "same-conversation"
+    assert payload["model_controls"]["models"] == ["anthropic/opus", "openai-codex/gpt"]
+    assert app.agent_runtime_info["resolved_runtime"] == before_runtime
+    assert "backend" not in payload["settings"]
+    assert settings.resolve(served_dir)["admin_high_model"] == "openai-codex/gpt"
+    user_values = settings.user_settings_path().read_text()
+    assert 'admin_high_model = "openai-codex/gpt"' in user_values
+    assert 'model = "anthropic/sonnet"' in user_values
+    assert settings.resolve(served_dir)["model"] == "project/ignored"
+    denied = await _put(client, {"backend": "codex", "admin_high_effort": "low"})
+    assert denied.status_code == 400
+    assert settings.resolve(served_dir)["admin_high_effort"] == "high"
+    assert (await _put(client, {"model": None}, token="agent-only-secret")).status_code == 403
+    cleared = body_of(await _put(client, {"model": None}))
+    assert "model" not in cleared["pending"]
+
+
+async def test_hosted_cannot_opt_into_operator_model_settings(served_dir, model_controls):
+    app = create_toy_app(
+        served_dir, hosted_mode=True, hosted_verifier=_HostedVerifier(),
+        hosted_state_dir=served_dir.parent / "worker-state",
+        settings=settings.resolve(served_dir.parent / "service-settings"),
+        settings_model_controls=model_controls,
+    )
+    app.agent_runtime_info.update(
+        models=["private-provider/private-model"],
+        resolved_runtime={"provider": "private-provider", "model": "private-model"},
+    )
+    client = make_test_client(app)
+    payload = body_of(await client.get("/settings", headers=_hosted_headers()))
+    assert "model_controls" not in payload
+    assert "admin_high_model" not in payload["settings"]
+    assert "private-provider" not in json.dumps(payload)
+    response = await client.put(
+        "/settings", headers=_hosted_headers(),
+        body=json.dumps({"changes": {"admin_high_model": "other/model"}}),
+    )
+    assert response.status_code == 400
+
+
+async def test_late_workspace_reports_changes_since_operator_startup(served_dir, model_controls):
+    startup = settings.resolve(None).to_wire()
+    model_controls["startup"] = startup
+    settings.apply(served_dir, {"admin_high_model": "changed/after-startup"})
+    client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    payload = body_of(await client.get("/settings?t=%s" % TOKEN))
+    assert payload["settings"]["admin_high_model"]["value"] == "anthropic/opus"
+    assert payload["pending"]["admin_high_model"]["value"] == "changed/after-startup"
+    assert "startup" not in payload["model_controls"]

@@ -263,6 +263,7 @@ def create_app(
     usage_sink=None,
     builtin_tools=None,
     auto_approve_included_tools=False,
+    settings_model_controls=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -314,6 +315,13 @@ def create_app(
     by ``hosted_verifier``; the agent package does not depend on the hosted
     control-plane package. Browser token and Tailscale authentication remain
     available in standalone mode.
+
+    ``settings_model_controls`` declares grouped model/effort defaults and
+    optional per-agent overrides for the settings window. Unlike the chat
+    picker these are saved restart-only configuration, authenticated as the
+    human, and never enabled in hosted mode. It may explicitly expose model
+    and effort even when the product disables live browser runtime controls;
+    it never exposes backend switching.
 
     ``session_id`` is the id the CLI resolved for this run (fresh or resumed,
     per plan section 3.4), or None for viewer-only; it is reported in the
@@ -565,6 +573,7 @@ def create_app(
         hosted_mode=hosted_mode,
         mounted=bool(url_prefix),
         browser_runtime_controls=installed.browser_runtime_controls,
+        model_controls=settings_model_controls,
     )
     recorder = StateRecorder(state_sink)
     register_review_routes(app, store=review_store, auth=auth, recorder=recorder)
@@ -731,6 +740,7 @@ def create_app(
         "resolved_runtime": None,
         "usage": event_log.last_usage,
     }
+    app.agent_runtime_info = session_info
     app.agent_registry = registry
     app.agent_event_log = event_log
     app.agent_bus = bus
