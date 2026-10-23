@@ -795,15 +795,20 @@ class OmpSession:
         could reject locally that `omp` would not also reject, so guessing
         at that in advance would only risk being wrong about what `omp`
         actually accepts.
+        Reapply even an unchanged request: the launch argument is not a cache
+        of the live model, particularly after a native conversation resume.
         """
-        if model == self._model:
-            return
         if self._base_url:
             provider, model_id = _provider_id(), model
         else:
             provider, _, model_id = model.partition("/")
-        await self._run_blocking(self._client.set_model, provider, model_id)
-        self._model = model
+        try:
+            await self._run_blocking(self._client.set_model, provider, model_id)
+        except Exception as exc:
+            # A rejected/uncertain selection must not admit a later turn on
+            # the previous provider as though the operator's switch worked.
+            self._fail(exc)
+            raise
         self._emit(AgentModelChanged(model=model))
 
     # -- lifecycle --------------------------------------------------------------
@@ -918,9 +923,40 @@ class OmpSession:
             self._discard_agent_dir()
             self._fail(exc, remediation=self._no_login_remediation(exc, env))
             return
+        resumed = False
+        selected_model = None
         if self._resume:
             try:
-                await self._switch_to(self._resume)
+                if self._model_role is not None or (
+                    self._model and not self._base_url and "/" not in self._model
+                ):
+                    # Resolve aliases and bare model IDs through OMP, before
+                    # switch_session restores the saved model. Never send a
+                    # CLI alias as an RPC model id.
+                    launch_state = await self._run_blocking(self._client.get_state)
+                    launch_model = getattr(launch_state, "model", None)
+                    provider = _nonempty_string(getattr(launch_model, "provider", None))
+                    model_id = _nonempty_string(getattr(launch_model, "id", None))
+                    if provider is None or model_id is None:
+                        raise RuntimeError("OMP did not resolve the requested model selection")
+                    selected_model = (provider, model_id)
+                elif self._model is not None:
+                    if self._base_url:
+                        selected_model = (_provider_id(), self._model)
+                    else:
+                        provider, _, model_id = self._model.partition("/")
+                        selected_model = (provider, model_id)
+                resumed = await self._switch_to(self._resume)
+                if resumed:
+                    # Native resume restores model AND thinking from history,
+                    # overriding CLI flags. Explicit operator choices win only
+                    # after that switch, on the same native conversation.
+                    if selected_model is not None:
+                        await self._run_blocking(self._client.set_model, *selected_model)
+                    if self._thinking is not None:
+                        await self._run_blocking(
+                            self._client.set_thinking_level, self._thinking
+                        )
             except Exception as exc:
                 self._fail(exc)
                 return
@@ -936,6 +972,12 @@ class OmpSession:
             model = getattr(state, "model", None)
             actual_provider = _nonempty_string(getattr(model, "provider", None))
             actual_model = _nonempty_string(getattr(model, "id", None))
+            if resumed:
+                if selected_model is not None and selected_model != (actual_provider, actual_model):
+                    raise RuntimeError("OMP did not apply the requested model after resume")
+                if (self._thinking is not None
+                        and getattr(state, "thinking_level", None) != self._thinking):
+                    raise RuntimeError("OMP did not apply the requested thinking level after resume")
             role_resolved = (
                 self._model_role is not None
                 and (actual_provider is not None or actual_model is not None)
@@ -956,7 +998,9 @@ class OmpSession:
                 self._record_resolved_runtime(runtime)
             self._remember_session_file(state.session_file)
         except Exception as exc:
-            if self._strict_resume:
+            if self._strict_resume or (
+                resumed and (selected_model is not None or self._thinking is not None)
+            ):
                 self._fail(exc)
                 return
             # A session that cannot read this still works; what it costs is
@@ -1037,17 +1081,17 @@ class OmpSession:
             self._config_rel = rel
         return None
 
-    async def _switch_to(self, session_file: str) -> None:
+    async def _switch_to(self, session_file: str) -> bool:
         """Resume the conversation in ``session_file``; a conversation that
         cannot be resumed is reported (``SessionReset``) and this one goes on
         as a new conversation. A file that does not exist is nothing to
         resume rather than a failure: `omp` names the file at start but
         writes it with the first message, so a session that never had one
-        leaves no file behind."""
+        leaves no file behind. Return whether the native switch succeeded."""
         if not await self._run_blocking(os.path.isfile, session_file):
             if self._strict_resume:
                 raise RuntimeError("the requested OMP conversation file does not exist")
-            return
+            return False
         reason = None
         try:
             result = await self._run_blocking(self._client.switch_session, session_file)
@@ -1065,6 +1109,8 @@ class OmpSession:
                     "this is a new conversation" % reason
                 )
             )
+            return False
+        return True
     def _start_usage_epoch(self, conversation_id: Optional[str] = None) -> None:
         self._usage_epoch += 1
         self._conversation_id = str(conversation_id or uuid.uuid4().hex)

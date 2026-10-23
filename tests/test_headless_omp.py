@@ -673,18 +673,38 @@ class DurableRpcClient(FakeRpcClient):
         self.session_file = str(
             Path(kwargs["session_dir"]) / ("native-%s.jsonl" % len(self.instances))
         )
+        provider, _, model_id = (kwargs.get("model") or "prov/model").partition("/")
+        self.model = SimpleNamespace(provider=provider, id=model_id)
+        self.thinking_level = None
+        self.model_selections = []
+        self.thinking_selections = []
+        self.prompt_runtimes = []
 
     def get_state(self):
         state = super().get_state()
         state.session_file = self.session_file
+        state.model = self.model
+        state.thinking_level = self.thinking_level
         return state
 
     def switch_session(self, path):
         self.switches.append(path)
         self.session_file = str(path)
+        self.model = SimpleNamespace(provider="prov", id="model")
+        self.thinking_level = "high"
         return SimpleNamespace(cancelled=False)
 
+    def set_model(self, provider, model_id):
+        self.model_selections.append((provider, model_id))
+        self.model = SimpleNamespace(provider=provider, id=model_id)
+        return self.model
+
+    def set_thinking_level(self, level):
+        self.thinking_selections.append(level)
+        self.thinking_level = level
+
     def prompt(self, message, **kwargs):
+        self.prompt_runtimes.append((self.model.provider, self.model.id, self.thinking_level))
         Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
         with open(self.session_file, "a", encoding="utf-8") as output:
             output.write(message + "\n")
@@ -748,7 +768,7 @@ async def test_native_explicit_resume_switches_before_new_input_and_keeps_usage_
 
     def script(client):
         client._listeners["message_end"](SimpleNamespace(message={
-            "role": "assistant", "model": "model", "provider": "provider",
+            "role": "assistant", "model": client.model.id, "provider": client.model.provider,
             "responseId": "possibly-repeated-id",
             "usage": {"input": 5, "output": 3, "cost": {"total": 0.01}},
         }))
@@ -762,11 +782,15 @@ async def test_native_explicit_resume_switches_before_new_input_and_keeps_usage_
     second = await run_prompt(
         "explicit new turn", **make_args(
             tmp_path, state_dir=state_dir, resume=True, usage_sink=reports.append,
+            model="openai-codex/gpt-6.1-sol", thinking="low",
         )
     )
     original, resumed = omp_client.instances
     assert resumed.switches == [first.recovery.conversation_file]
     assert resumed.messages == ["explicit new turn"] and original.messages == ["original"]
+    assert resumed.model_selections == [("openai-codex", "gpt-6.1-sol")]
+    assert resumed.thinking_selections == ["low"]
+    assert resumed.prompt_runtimes == [("openai-codex", "gpt-6.1-sol", "low")]
     assert first.recovery.session_id == second.recovery.session_id
     assert second.error is None
     assert [report["turn_index"] for report in reports] == [1, 2]

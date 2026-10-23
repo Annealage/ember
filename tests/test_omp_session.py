@@ -87,6 +87,7 @@ class FakeRpcClient:
         self.confirmations = []
         self.cancellations = []
         self.set_model_calls = []
+        self.set_thinking_level_calls = []
         self.switch_calls = []
         self.set_custom_tools_calls = []
         self._listeners = {}
@@ -145,7 +146,12 @@ class FakeRpcClient:
 
     def set_model(self, provider, model_id):
         self.set_model_calls.append((provider, model_id))
-        return SimpleNamespace(provider=provider, model_id=model_id)
+        self.model = SimpleNamespace(provider=provider, id=model_id)
+        return self.model
+
+    def set_thinking_level(self, level):
+        self.set_thinking_level_calls.append(level)
+        self.thinking_level = level
 
     def get_available_models(self):
         return self.available_models
@@ -1212,12 +1218,21 @@ async def test_set_model_calls_the_rpc_set_model_with_the_provider_and_model():
 
 
 @pytest.mark.asyncio
-async def test_set_model_to_the_current_model_is_a_no_op():
-    session, fake, recorder, broker = await _started_session(model="llama-70b")
+async def test_set_model_reapplies_the_startup_request_instead_of_trusting_a_cache():
+    class DifferentLiveModel(FakeRpcClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.model = SimpleNamespace(provider="anthropic", id="claude-opus-4-6")
+
+    session, fake, recorder, broker = await _started_session(
+        model="llama-70b", client_class=DifferentLiveModel
+    )
     try:
         await session.set_model("llama-70b")
-        assert fake.set_model_calls == []
-        assert not any(isinstance(e, AgentModelChanged) for e in recorder.all)
+        await session.set_model("llama-70b")
+        assert fake.set_model_calls == [(_provider_id(), "llama-70b")] * 2
+        assert (fake.model.provider, fake.model.id) == (_provider_id(), "llama-70b")
+        assert len([e for e in recorder.all if isinstance(e, AgentModelChanged)]) == 2
     finally:
         await session.close()
 
@@ -2641,6 +2656,186 @@ async def test_launch_forwards_operator_effort_to_omp_thinking(tmp_path, monkeyp
         await session.start()
         assert clients[0].kwargs["extra_args"][-2:] == ("--thinking", "high")
         assert clients[0].prompt_calls == []
+    finally:
+        await session.close()
+
+
+class ResumingModelClient(FakeRpcClient):
+    """Native switch_session restores saved runtime, not the launch flags."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        model = kwargs.get("model")
+        if model and (model.startswith("@") or "/" not in model):
+            model = "openai-codex/gpt-6.1-sol"
+        if model:
+            provider, _, model_id = model.partition("/")
+            self.model = SimpleNamespace(provider=provider, id=model_id)
+        self.prompt_runtimes = []
+
+    def switch_session(self, session_path):
+        result = super().switch_session(session_path)
+        self.model = SimpleNamespace(provider="anthropic", id="claude-opus-4-6")
+        self.thinking_level = "high"
+        return result
+
+    def prompt(self, message, **kwargs):
+        self.prompt_runtimes.append(
+            (self.session_id, self.session_file, self.model.provider,
+             self.model.id, self.thinking_level)
+        )
+        return super().prompt(message, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url", [None, "http://127.0.0.1:11434/v1"])
+async def test_resume_operator_selection_wins_on_the_same_native_conversation(tmp_path, base_url):
+    conversation = tmp_path / "saved.jsonl"
+    conversation.write_text("existing history\n")
+    model = "openai-codex/gpt-6.1-sol" if base_url is None else "gpt-6.1-sol"
+    provider = "openai-codex" if base_url is None else _provider_id()
+    session, fake, recorder, _broker = await _started_session(
+        model=model, thinking="low", base_url=base_url,
+        resume=str(conversation), strict_resume=True,
+        client_class=ResumingModelClient,
+    )
+    try:
+        assert fake.switch_calls == [str(conversation)]
+        assert fake.set_model_calls == [(provider, "gpt-6.1-sol")]
+        assert fake.set_thinking_level_calls == ["low"]
+        assert (session.sdk_session_id, session.session_file) == ("omp-resumed", str(conversation))
+        assert session.resolved_runtime["provider"] == provider
+        assert session.resolved_runtime["model"] == "gpt-6.1-sol"
+        assert session.resolved_runtime["effort"] == "low"
+        assert not any(isinstance(e, SessionReset) for e in recorder.all)
+        await session.submit_turn(_text("continue the existing conversation"))
+        assert fake.prompt_runtimes == [
+            ("omp-resumed", str(conversation), provider, "gpt-6.1-sol", "low")
+        ]
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+
+        # Switch away and back without restarting, copying, or resetting.
+        other = "anthropic/claude-opus-4-6" if base_url is None else "other-model"
+        await session.set_model(other)
+        await session.set_model(model)
+        assert (fake.model.provider, fake.model.id) == (provider, "gpt-6.1-sol")
+        assert (fake.session_id, fake.session_file) == ("omp-resumed", str(conversation))
+        assert fake.switch_calls == [str(conversation)]
+        assert conversation.read_text() == "existing history\n"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,thinking,expected", [
+    (None, None, ("anthropic", "claude-opus-4-6", "high")),
+    (None, "low", ("anthropic", "claude-opus-4-6", "low")),
+    ("openai-codex/gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
+    ("gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
+])
+async def test_resume_only_reapplies_explicit_operator_choices(tmp_path, model, thinking, expected):
+    conversation = tmp_path / "saved.jsonl"
+    conversation.touch()
+    session, fake, _recorder, _broker = await _started_session(
+        model=model, thinking=thinking, base_url=None,
+        resume=str(conversation), client_class=ResumingModelClient,
+    )
+    try:
+        assert (fake.model.provider, fake.model.id, fake.thinking_level) == expected
+        assert fake.set_model_calls == ([("openai-codex", "gpt-6.1-sol")] if model else [])
+        assert fake.set_thinking_level_calls == ([thinking] if thinking else [])
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["smol", "default", "slow"])
+async def test_resume_reapplies_the_model_omp_resolved_for_the_role(tmp_path, role):
+    conversation = tmp_path / "saved.jsonl"
+    conversation.touch()
+    session, fake, _recorder, _broker = await _started_session(
+        model_role=role, thinking="low", base_url=None,
+        resume=str(conversation), client_class=ResumingModelClient,
+    )
+    try:
+        assert fake.kwargs["model"] == "@" + role
+        assert fake.set_model_calls == [("openai-codex", "gpt-6.1-sol")]
+        assert session.resolved_runtime["model"] == "gpt-6.1-sol"
+        assert session.resolved_runtime["effort"] == "low"
+        assert session.resolved_runtime["resolved_role"] == role
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "model_rpc", "thinking_rpc", "model_not_applied", "thinking_not_applied", "state_rpc",
+    "role_unresolved",
+])
+async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
+    class FailedSelection(ResumingModelClient):
+        def set_model(self, provider, model_id):
+            if failure == "model_rpc":
+                raise RuntimeError("selection rejected")
+            if failure != "model_not_applied":
+                return super().set_model(provider, model_id)
+
+        def set_thinking_level(self, level):
+            if failure == "thinking_rpc":
+                raise RuntimeError("thinking rejected")
+            if failure != "thinking_not_applied":
+                super().set_thinking_level(level)
+
+        def get_state(self):
+            if failure == "state_rpc" and self.switch_calls:
+                raise RuntimeError("state unavailable")
+            state = super().get_state()
+            if failure == "role_unresolved":
+                state.model = None
+            return state
+
+    clients = []
+
+    def factory(**kwargs):
+        client = FailedSelection(**kwargs)
+        clients.append(client)
+        return client
+
+    conversation = tmp_path / "saved.jsonl"
+    conversation.write_text("existing history\n")
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder, cwd=tmp_path, session_id="ember-existing",
+        model=None if failure == "role_unresolved" else "openai-codex/gpt-6.1-sol",
+        model_role="smol" if failure == "role_unresolved" else None,
+        thinking="low", resume=str(conversation), client_factory=factory,
+    )
+    try:
+        await session.start()
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        await session.submit_turn(_text("must not reach a provider"))
+        assert clients[0].prompt_calls == []
+        assert any(isinstance(e, AgentError) for e in recorder.all)
+        assert not any(isinstance(e, SessionReset) for e in recorder.all)
+        assert conversation.read_text() == "existing history\n"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_model_switch_fails_closed():
+    class RejectedSwitch(FakeRpcClient):
+        def set_model(self, provider, model_id):
+            raise RuntimeError("selection rejected")
+
+    session, fake, _recorder, _broker = await _started_session(client_class=RejectedSwitch)
+    try:
+        with pytest.raises(RuntimeError, match="selection rejected"):
+            await session.set_model("gpt-6.1-sol")
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        await session.submit_turn(_text("must not reach the previous provider"))
+        assert fake.prompt_calls == []
     finally:
         await session.close()
 
