@@ -455,6 +455,7 @@ The page loads the pane's modules through one import map entry, `"agent/": "/age
 - `pause.js`: `initPause({send, button})` is the pause control, on the page's `#pauseBtn` by default. It returns `{setPausedFromServer}`, which the page passes to `initWs` as `onPaused`. The paused state is the button's `aria-pressed` and `.on` class. A button with a `[data-label]` child has only that child's text written ("Pause" or "Paused"), so an icon the page put in it stays; without one, the button's whole text is.
 - `layout.js`: `initLayout({tabs, tabbar, panelButton})` turns the panes into tabs at narrow widths. `tabs` is `[{id, label, target}]`, with `target` a selector for the pane, and the page needs `#tabbar` and `#panelBtn` unless it passes its own elements.
 - `review.js`: `initReview({onChange, onError})` fetches and follows the review, returning the `onEvent`, `onLive` and `onFallback` hooks for `initWs` plus `add` and `setStatus`. It renders nothing, since every product draws anchors its own way.
+- `project.js` and `project.css`: the project list, a project's title bar and its history (paged, grouped, a diff on request, restore after asking), over `annealage_ember.projects`. `createProjectClient()` names the routes relative to the page; `createProjectContext({client})` holds the latest etag and what the views share; `initProjectHistory({ctx, root, onRestored})`, `initProjectHeader({ctx, root, title, projectId, idChange})` and `initProjectList({ctx, root})` render into an element they own the contents of. Every change is sent with the etag the person was looking at, and a change the store refuses as stale stays on the page as a banner with the edit kept (`ConflictError`); nothing is retried unasked. The DOM-free models (`createHistoryModel`, `createNameModel`, `createListModel`) carry the behaviour.
 - `store.js`: the page's one state store. `defineSlice(initial)` gives the product keys of its own.
 - `ui.js` writes to the page's `#toast` and `#err` elements, which the page positions.
 
@@ -506,6 +507,18 @@ so existing clients refetch, including when a queued delivery later fails.
 Reconnects read the same durable state. An unreadable notification ledger adds
 an actionable notification error to saved human comments without hiding their
 text; the review store's own unreadable-file behavior is unchanged.
+
+## Projects
+
+`annealage_ember.projects` is the project list, title and history a product's page shows, as a projection over a store the product owns. It never reads or writes project content, and it is not a second store: a product's own store (Loom's git repository and workflow ledger, a hosted project's git store behind its writer fence) stays the one authority for what a project is and for every compare-and-swap.
+
+A store meets two protocols, one object may meet both. `ProjectDirectory` has `list_projects()`, `create(project_id, *, title, brief, actor)` and `rename(project_id, new_id, *, expected_etag, actor)`. `ProjectHistory` has `set_title(project_id, title, *, expected_etag, actor)`, `history(project_id, *, limit, cursor)` returning a `HistoryPage`, `commit_diff(project_id, commit)` and `restore(project_id, target, *, expected_etag, actor)`. Every method is a coroutine and `capabilities` (`Capabilities`) says what the store does.
+
+A project has an opaque `etag`, the store's token for the state a reader saw. It comes with every `ProjectEntry`, every `HistoryPage` and every change. Each change names the etag it was made against, and the routes refuse a request without one (400), so there is no unconditional write. A store that finds the project has moved on raises `Conflict(message, current_etag)`, which is answered 409 with `conflict: true` and `current_etag`, and the page shows. `Busy` (409, `busy: true`), `Invalid` (400), `NotFound` and `Unsupported` (404) and `StoreFailed` (500) carry the store's own message to the person.
+
+History is newest first, paged by an opaque `next_cursor`. A page carries the etag it was read at, and the page client reads again from the newest when a later page's etag differs, since an offset cursor is stale once a commit lands. Commits may name a `Group` (Loom: the agent turn); a group with a `restore_target` gets a Restore button, which sends the target and the etag the history was read at. A restore is a new commit by the person.
+
+`register_project_routes(app, *, auth, directory=None, history=None, project_id=None, operations=None)` registers the routes behind the app's `BrowserAuth`, in a product's `register_routes`: `GET`/`POST /api/projects` and `POST /api/projects/<id>/rename` for a directory; `GET /api/history`, `GET /api/history/<commit>`, `POST /api/restore` and `POST /api/project/name` for a page bound to one project (`project_id`, a string or a callable of the request), or the same four under `/api/projects/<id>/` without it. Reads need `project.read` and changes `project.write`. The page side is `static/project.js` (above). The module docstring has the wire shapes.
 
 ## Guides
 

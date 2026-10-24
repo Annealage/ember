@@ -1,0 +1,87 @@
+/* The project list, title bar and history (project.js). Every colour is a
+   variable the page may set (--pj-*), falling back to the page's own
+   (--ink, --panel, --rule ...) and then to the agent layer's dark palette, so
+   a product restyles it without touching this file. Linked before the
+   product's stylesheet, so a product rule of the same specificity wins. */
+
+.pj-history, .pj-header, .pj-projects, .pj-modal {
+  --pj-ink: var(--ink, #d7dbe0);
+  --pj-dim: var(--ink-2, #9aa);
+  --pj-panel: var(--panel, #1b1f25);
+  --pj-field: var(--field, #14171c);
+  --pj-rule: var(--rule, #2c313a);
+  --pj-accent: var(--temper-text, #e0c07f);
+  --pj-ok: var(--quench, #9fe0a8);
+  --pj-bad: var(--danger, #e8a0a0);
+  color: var(--pj-ink);
+}
+
+.pj-btn {
+  font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+  color: var(--pj-ink); background: var(--pj-panel); border: 1px solid var(--pj-rule); border-radius: 4px;
+}
+.pj-btn:hover:not(:disabled) { border-color: var(--pj-dim); }
+.pj-btn:disabled { opacity: .5; cursor: default; }
+.pj-btn.pj-sm { font-size: 11px; padding: 2px 8px; }
+.pj-btn.pj-quiet { background: transparent; }
+.pj-btn.pj-danger { border-color: var(--pj-bad); }
+
+.pj-history [hidden], .pj-header [hidden], .pj-projects [hidden], .pj-modal[hidden] { display: none !important; }
+
+.pj-error:empty, .pj-notice:empty { display: none; }
+.pj-error { color: var(--pj-bad); font-size: 12px; padding: 4px 0; overflow-wrap: anywhere; }
+.pj-notice { color: var(--pj-dim); font-size: 12px; padding: 4px 0; }
+.pj-hint { color: var(--pj-dim); font-size: 12px; }
+
+/* A refused change: it stays until dismissed, and is not mistakable for a toast. */
+.pj-conflict {
+  margin: 8px 0; padding: 8px 12px; border: 1px solid var(--pj-bad);
+  border-left-width: 4px; border-radius: 4px; background: var(--pj-field); font-size: 13px;
+}
+.pj-conflict p { margin: 4px 0; overflow-wrap: anywhere; }
+.pj-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* history */
+.pj-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.pj-bar .pj-refresh { margin-left: auto; }
+.pj-group { margin-bottom: 12px; border: 1px solid var(--pj-rule); border-radius: 4px; background: var(--pj-panel); }
+.pj-group > header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--pj-rule); }
+.pj-grouplabel { font-weight: 700; }
+.pj-count { font-size: 12px; color: var(--pj-dim); }
+.pj-group > header .pj-btn { margin-left: auto; }
+.pj-commit { padding: 8px 12px; background: var(--pj-field); }
+.pj-commit + .pj-commit { border-top: 1px solid var(--pj-rule); }
+.pj-commithead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 2px; }
+.pj-subject { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.pj-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--pj-dim); }
+.pj-author { font-weight: 600; }
+.pj-author-agent { color: var(--pj-accent); }
+.pj-author-human { color: var(--pj-ink); }
+.pj-more { margin-top: 4px; }
+pre.pj-diff { margin: 6px 0 0; padding: 8px; overflow: auto; max-height: 28em; font-size: 12px; background: var(--pj-panel); border-radius: 4px; }
+.pj-d-add { color: var(--pj-ok); }
+.pj-d-del { color: var(--pj-bad); }
+.pj-d-hunk { color: var(--pj-accent); }
+.pj-d-file { font-weight: 600; }
+
+/* title bar */
+.pj-titlerow { display: flex; align-items: center; gap: 8px; }
+.pj-nameedit { min-width: 16ch; width: 32ch; max-width: 40vw; font: inherit; font-weight: 600; }
+
+/* list */
+.pj-new { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.pj-new textarea { flex: 1 1 100%; font: inherit; }
+.pj-cards { display: grid; gap: 8px; }
+.pj-card { padding: 8px 12px; border: 1px solid var(--pj-rule); border-radius: 4px; background: var(--pj-panel); }
+.pj-card > header { display: flex; align-items: baseline; gap: 10px; }
+.pj-name { font-weight: 700; }
+.pj-state { font-size: 11px; color: var(--pj-dim); margin-left: auto; }
+.pj-empty { color: var(--pj-dim); }
+
+/* the confirming dialog */
+.pj-modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .55); }
+.pj-dialog { width: min(34em, 92vw); max-height: 90vh; display: flex; flex-direction: column; background: var(--pj-panel); border: 1px solid var(--pj-rule); border-radius: 6px; }
+.pj-dialog header { padding: 12px 16px; border-bottom: 1px solid var(--pj-rule); }
+.pj-dialog h2 { margin: 0; font-size: 15px; }
+.pj-modal-main { padding: 12px 16px; overflow: auto; }
+.pj-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--pj-rule); }
