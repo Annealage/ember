@@ -206,15 +206,23 @@ def inline_script_hashes(html_path):
     return tuple(hashes)
 
 
-def content_security_policy(html_path):
+def content_security_policy(html_path, *, frame_ancestors="'none'"):
     """The one policy every response carries.
 
     ``default-src 'none'`` is the point of it: every kind of fetch this page can
     make has to be named, so a source introduced later fails visibly rather than
     working quietly. The rest is the smallest set that lets the page work, and
     each entry has a reason at its use site in ``create_app``.
+
+    ``frame_ancestors`` is who may embed the page: nobody, unless a page built
+    to be framed (``embed.render_agent_page``) names its host.
     """
-    script_src = " ".join(("'self'",) + inline_script_hashes(html_path))
+    return policy(inline_script_hashes(html_path), frame_ancestors=frame_ancestors)
+
+
+def policy(script_hashes=(), *, frame_ancestors="'none'"):
+    """The policy for a page whose inline scripts hash to ``script_hashes``."""
+    script_src = " ".join(("'self'",) + tuple(script_hashes))
     return "; ".join(
         (
             "default-src 'none'",
@@ -225,7 +233,7 @@ def content_security_policy(html_path):
             "font-src 'self'",
             "base-uri 'none'",
             "form-action 'none'",
-            "frame-ancestors 'none'",
+            "frame-ancestors %s" % frame_ancestors,
         )
     )
 

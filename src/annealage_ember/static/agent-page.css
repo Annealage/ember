@@ -1,0 +1,47 @@
+/* The column layout of a page built by embed.render_agent_page: the chat pane
+   fills the window (a product frames it beside its own view). The colours and
+   sizes are the Annealage theme's variables (--ink, --panel, --rule, --r, --ctl
+   and so on), which the product's own stylesheet defines. */
+html,body{height:100%}
+#chat{height:100%;display:flex;flex-direction:column;border-top:0}
+#chat>header{flex:none;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:0 8px 6px 0;height:auto}
+#chat>header h1{align-self:auto;height:32px}
+#chat>header .spacer{display:block;flex:1 1 0;min-width:0}
+#chat>header .working{flex:0 1 auto;min-width:0;white-space:nowrap}
+#chat[data-working]>header .agentstatus[data-state=ready]{display:none}
+#chat>header .conn{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)}
+#chat>header .more{order:7;position:relative}
+@media (max-width:520px){#chat>header .chatusage{order:8;flex:1 1 100%;padding-left:12px}}
+.more>summary{list-style:none;cursor:pointer}
+.more>summary::-webkit-details-marker{display:none}
+.more>summary::after{content:"\25BE";font-size:10px}
+.more:has(#pauseBtn[aria-pressed=true])>summary::after{content:" (paused) \25BE"}
+.more[open]>summary{background:var(--hover)}
+.more .menu{position:absolute;z-index:30;right:0;top:calc(100% + 4px);display:grid;min-width:150px;
+padding:4px;background:var(--panel);border:1px solid var(--rule-2);border-radius:var(--r);
+box-shadow:0 6px 18px rgba(0,0,0,.25)}
+.more .menu .hdrbtn{justify-content:flex-start;width:100%}
+@media (max-width:420px){#chat>header .working .bar{display:none}#chat>header .conn{font-size:0}}
+#chatLog{flex:1 1 0;min-height:20vh;padding:10px 12px}
+#chatLog .msg{grid-template-columns:minmax(0,1fr)}
+#chatLog .msg::before{grid-row:auto;text-align:left;padding:0;margin-bottom:2px}
+#chatLog .msg>*{grid-column:1}
+.side{flex:0 1 auto;display:flex;flex-direction:column;min-height:0;border-left:0;border-top:1px solid var(--rule)}
+#chatPending{flex:0 1 auto;max-height:50vh;overflow:auto}
+#chatPending .permcard pre.toolinput{max-height:16vh;overflow:auto}
+#chatComposer{flex:none;grid-template-columns:minmax(0,1fr)}
+#sessionStart{height:var(--ctl);padding:0 10px;border:1px solid var(--ink);border-radius:var(--r);
+background:var(--ink);color:var(--view);font-weight:600;cursor:pointer}
+#sessionStart:disabled{opacity:.45;cursor:default}
+#sessionStart[hidden]{display:none}
+#chatComposerRow textarea{flex:1;min-width:0}
+@media (max-width:320px){
+#chatComposerRow{flex-wrap:wrap}
+.chatbtns{flex-basis:100%;flex-direction:row;justify-content:flex-end}
+}
+#toast,#err{position:fixed;z-index:20;left:12px;right:12px;bottom:12px;
+padding:9px 12px;border:1px solid var(--rule-2);border-left-width:3px;border-radius:var(--r);
+background:var(--panel);color:var(--ink);white-space:pre-wrap}
+#toast{border-left-color:var(--quench)}
+#err{bottom:auto;top:12px;border-left-color:var(--danger)}
+#toast:empty,#err:empty{display:none}

@@ -451,6 +451,12 @@ def agent_route_prefixes():
             provider_login=ProviderLogin(),
         )
         patterns = {entry[1].url_pattern for entry in app.url_map}
+    # Registered only in hosted agent mode, which this viewer-only app is not,
+    # and the route the shared page bootstrap admits a hosted session through.
+    from annealage_ember.http import routes_session
+
+    assert '@app.get("/agent/session")' in Path(routes_session.__file__).read_text(encoding="utf-8")
+    patterns.add("/agent/session")
     return tuple(sorted(p.partition("<")[0] for p in patterns))
 
 
