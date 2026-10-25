@@ -4,7 +4,7 @@
    a product restyles it without touching this file. Linked before the
    product's stylesheet, so a product rule of the same specificity wins. */
 
-.pj-history, .pj-header, .pj-projects, .pj-modal {
+.pj-history, .pj-header, .pj-projects, .pj-lineage, .pj-modal {
   --pj-ink: var(--ink, #d7dbe0);
   --pj-dim: var(--ink-2, #9aa);
   --pj-panel: var(--panel, #1b1f25);
@@ -26,7 +26,7 @@
 .pj-btn.pj-quiet { background: transparent; }
 .pj-btn.pj-danger { border-color: var(--pj-bad); }
 
-.pj-history [hidden], .pj-header [hidden], .pj-projects [hidden], .pj-modal[hidden] { display: none !important; }
+.pj-history [hidden], .pj-header [hidden], .pj-projects [hidden], .pj-lineage[hidden], .pj-lineage [hidden], .pj-modal[hidden] { display: none !important; }
 
 .pj-error:empty, .pj-notice:empty { display: none; }
 .pj-error { color: var(--pj-bad); font-size: 12px; padding: 4px 0; overflow-wrap: anywhere; }
@@ -77,6 +77,30 @@ pre.pj-diff { margin: 6px 0 0; padding: 8px; overflow: auto; max-height: 28em; f
 .pj-name { font-weight: 700; }
 .pj-state { font-size: 11px; color: var(--pj-dim); margin-left: auto; }
 .pj-empty { color: var(--pj-dim); }
+
+/* send to / derived from */
+.pj-lineage .pj-bar { flex-wrap: wrap; }
+.pj-lineage-title { margin: 0; font-size: 14px; }
+.pj-menuwrap { position: relative; }
+.pj-menu {
+  position: absolute; z-index: 20; top: 100%; left: 0; min-width: 14em; margin-top: 2px; padding: 4px 0;
+  display: flex; flex-direction: column; background: var(--pj-panel); border: 1px solid var(--pj-rule); border-radius: 4px;
+}
+.pj-menuitem { font: inherit; font-size: 13px; text-align: left; padding: 6px 12px; color: var(--pj-ink); background: transparent; border: 0; cursor: pointer; }
+.pj-menuitem:hover:not(:disabled), .pj-menuitem:focus-visible { background: var(--pj-field); }
+.pj-menuitem:disabled { opacity: .5; cursor: default; }
+.pj-revnote { font-size: 12px; color: var(--pj-dim); }
+.pj-result { margin: 8px 0; padding: 8px 12px; border: 1px solid var(--pj-rule); border-left: 4px solid var(--pj-ok); border-radius: 4px; background: var(--pj-field); font-size: 13px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.pj-result[hidden] { display: none; }
+.pj-links h4 { margin: 12px 0 4px; font-size: 12px; font-weight: 600; color: var(--pj-dim); }
+.pj-links ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.pj-link { padding: 6px 12px; border: 1px solid var(--pj-rule); border-radius: 4px; background: var(--pj-panel); }
+.pj-linkhead { display: flex; align-items: baseline; gap: 8px; }
+.pj-chip { font-size: 11px; padding: 0 6px; border: 1px solid var(--pj-rule); border-radius: 8px; color: var(--pj-dim); }
+.pj-intent { overflow-wrap: anywhere; }
+.pj-choices { display: grid; gap: 6px; margin: 0 0 8px; padding: 0; border: 0; }
+.pj-choice { display: flex; align-items: baseline; gap: 8px; }
+.pj-modal textarea { width: 100%; box-sizing: border-box; font: inherit; color: var(--pj-ink); background: var(--pj-field); border: 1px solid var(--pj-rule); border-radius: 4px; }
 
 /* the confirming dialog */
 .pj-modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .55); }

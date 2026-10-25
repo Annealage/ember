@@ -22,7 +22,7 @@ import pytest
 
 pytest.importorskip("playwright.sync_api")
 
-from fake_project_store import FakeProjects  # noqa: E402
+from fake_project_store import FakeLineage, FakeProjects  # noqa: E402
 from playwright.sync_api import expect, sync_playwright  # noqa: E402
 from toy_product import TOY_PAGE, register_toy_routes  # noqa: E402
 
@@ -53,19 +53,22 @@ DEMO_PAGE = """<!doctype html>
 <div id="header"></div>
 <div id="history"></div>
 <div id="list"></div>
+<div id="lineage"></div>
 <script type="module" src="/demo.js"></script>
 """
 
 DEMO_SCRIPT = """
 import { createProjectClient, createProjectContext, initProjectHeader, initProjectHistory,
-  initProjectList } from "/agent/static/project.js";
+  initProjectLineage, initProjectList } from "/agent/static/project.js";
 const ctx = createProjectContext({ client: createProjectClient() });
-const history = initProjectHistory({ ctx, root: document.getElementById("history"), pageSize: 3 });
+const lineage = initProjectLineage({ ctx, root: document.getElementById("lineage") });
+const history = initProjectHistory({ ctx, root: document.getElementById("history"), pageSize: 3,
+  lineage });
 const header = initProjectHeader({ ctx, root: document.getElementById("header"),
   title: "Camera board", projectId: "camera", idChange: { warning: "The address changes." } });
 const list = initProjectList({ ctx, root: document.getElementById("list") });
-window.demo = { ctx, history, header, list };
-await Promise.all([history.refresh(), list.refresh()]);
+window.demo = { ctx, history, header, list, lineage };
+await Promise.all([history.refresh(), list.refresh(), lineage.refresh()]);
 document.body.dataset.ready = "1";
 """
 
@@ -80,7 +83,7 @@ class _Server:
     """The app on its own loop in a thread: the browser's requests cannot be
     served by the loop the test thread is blocked in."""
 
-    def __init__(self, store, serve_dir):
+    def __init__(self, store, serve_dir, lineage=None):
         self.store = store
         self.port = _free_port()
         self.base = "http://127.0.0.1:%d" % self.port
@@ -102,7 +105,12 @@ class _Server:
                 )
 
             pj.register_project_routes(
-                app, auth=app.agent_auth, directory=store, history=store, project_id="camera"
+                app,
+                auth=app.agent_auth,
+                directory=store,
+                history=store,
+                lineage=lineage,
+                project_id="camera",
             )
 
         self.app = agent_app.create_app(
@@ -157,9 +165,8 @@ def store():
     return s
 
 
-@pytest.fixture
-def page(store, tmp_path):
-    server = _Server(store, tmp_path)
+def _open_page(store, tmp_path, lineage):
+    server = _Server(store, tmp_path, lineage)
     server.start()
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path=CHROME)
@@ -183,6 +190,22 @@ def page(store, tmp_path):
         assert errors == [], errors
         browser.close()
     server.stop()
+
+
+@pytest.fixture
+def page(store, tmp_path):
+    """The host Canvas is today: no lineage, so no send to / derived from."""
+    yield from _open_page(store, tmp_path, None)
+
+
+@pytest.fixture
+def lineage(store, request):
+    return FakeLineage(store, **getattr(request, "param", {}))
+
+
+@pytest.fixture
+def lpage(store, tmp_path, lineage):
+    yield from _open_page(store, tmp_path, lineage)
 
 
 def _commits(page):
@@ -364,3 +387,160 @@ def test_an_id_change_refused_as_stale_stays_on_its_row(page, store):
     banner.get_by_role("button", name="Save my edit on the latest").click()
     expect(page.locator("#list .pj-card[data-project='lamp2']")).to_be_visible()
     assert "lamp2" in store.projects
+
+
+# --- send to / derived from ------------------------------------------------------------
+
+
+def test_a_host_without_lineage_shows_no_send_and_no_lineage(page):
+    expect(page.locator("#lineage")).to_be_hidden()
+    assert page.locator("#lineage").inner_text() == ""
+    assert page.locator("[data-send], .pj-send").count() == 0
+    assert _commits(page) == ["change 6", "change 5", "change 4"]
+
+
+def test_the_lineage_lists_show_both_directions_as_links(lpage):
+    box = lpage.locator("#lineage")
+    expect(box).to_be_visible()
+    derived = box.locator(".pj-derived")
+    expect(derived.locator("h4")).to_have_text("Derived from")
+    link = derived.locator("a", has_text="Reference boards")
+    assert link.get_attribute("href") == "/p/boards/"
+    expect(derived).to_contain_text("Loom")
+    expect(derived).to_contain_text("rescued from")
+    expect(derived).to_contain_text("b042 → c000")
+    expect(derived).to_contain_text("start from the reviewed boards")
+    sent = box.locator(".pj-sent")
+    expect(sent.locator("h4")).to_have_text("Sent to")
+    expect(sent).to_contain_text("Nothing yet.")
+
+
+def test_a_send_chooses_a_product_and_a_target_and_lands_in_the_list(lpage, lineage):
+    button = lpage.locator("#lineage .pj-send")
+    expect(button).to_be_enabled()
+    button.click()
+    items = lpage.locator("#lineage [role='menuitem']")
+    assert items.all_text_contents() == ["Trace", "Mesh"]
+    items.first.click()
+    dialog = lpage.get_by_role("dialog")
+    expect(dialog).to_contain_text("Send to Trace")
+    expect(dialog).to_contain_text("Revision c006")
+    radios = dialog.get_by_role("radio")
+    assert radios.count() == 2
+    expect(radios.first).to_be_checked()
+    expect(dialog).to_contain_text("A new Trace project")
+    expect(dialog).to_contain_text("Rescue review")
+    dialog.get_by_label("Why you are sending it (optional)").fill("check the rails")
+    dialog.get_by_role("button", name="Send to Trace").click()
+    expect(dialog).to_be_hidden()
+    result = lpage.locator("#lineage .pj-result")
+    expect(result).to_contain_text("Sent to Trace: Camera board review")
+    assert result.locator("a").get_attribute("href") == "/p/prj_1/"
+    expect(lpage.locator("#toast")).to_contain_text("Sent to Trace")
+    sent = lpage.locator("#lineage .pj-sent")
+    expect(sent.locator(".pj-link")).to_have_count(1)
+    expect(sent).to_contain_text("c006 → r001")
+    expect(sent).to_contain_text("check the rails")
+    [derive] = [c for c in lineage.calls if c[0] == "derive"]
+    assert derive == ("derive", "camera", "c006", "trace", None, "check the rails")
+
+
+def test_a_send_can_extend_an_existing_project(lpage, lineage):
+    lpage.locator("#lineage .pj-send").click()
+    lpage.locator("#lineage [role='menuitem']").first.click()
+    dialog = lpage.get_by_role("dialog")
+    dialog.get_by_role("radio").nth(1).check()
+    dialog.get_by_role("button", name="Send to Trace").click()
+    expect(lpage.locator("#lineage .pj-result")).to_contain_text("Sent to Trace: Rescue review")
+    assert [c for c in lineage.calls if c[0] == "derive"][0][4] == "review"
+
+
+def test_a_commit_of_the_history_is_the_revision_sent(lpage, lineage):
+    lpage.locator("#history [data-send='c004']").click()
+    expect(lpage.locator("#lineage .pj-revnote")).to_contain_text("revision c004")
+    lpage.locator("#lineage [role='menuitem']").first.click()
+    dialog = lpage.get_by_role("dialog")
+    expect(dialog).to_contain_text("Revision c004")
+    lpage.keyboard.press("Escape")
+    expect(dialog).to_be_hidden()
+    assert lineage.derived == []
+    # "Use the latest" puts the project as it is now back.
+    lpage.locator("#lineage .pj-revnote").get_by_role("button", name="Use the latest").click()
+    expect(lpage.locator("#lineage .pj-revnote")).to_be_hidden()
+
+
+@pytest.mark.parametrize("lineage", [{"viewer": True}], indirect=True)
+def test_someone_who_may_not_send_sees_it_disabled_and_why(lpage, lineage):
+    expect(lpage.locator("#lineage .pj-send")).to_be_disabled()
+    expect(lpage.locator("#lineage .pj-notice")).to_have_text(
+        "Viewers can look at this project but cannot send it."
+    )
+    assert lpage.locator("[data-send]").count() == 0
+    expect(lpage.locator("#lineage .pj-derived")).to_contain_text("Reference boards")
+    assert [c for c in lineage.calls if c[0] == "derive"] == []
+
+
+def _open_dialog(page):
+    page.locator("#lineage .pj-send").click()
+    page.locator("#lineage [role='menuitem']").first.click()
+    return page.get_by_role("dialog")
+
+
+def test_a_refusal_from_the_host_is_shown_in_the_dialog(lpage, lineage):
+    lineage.fail = pj.Forbidden("You may not send this project to that workspace.")
+    dialog = _open_dialog(lpage)
+    dialog.get_by_role("button", name="Send to Trace").click()
+    expect(dialog).to_contain_text("You may not send this project to that workspace.")
+    # It is the host's answer, not the stale-link message.
+    expect(dialog).not_to_contain_text("link has gone stale")
+    expect(dialog.get_by_role("button", name="Send to Trace")).to_be_enabled()
+    assert lineage.derived == []
+
+
+def test_a_send_that_conflicts_stays_visible_and_is_only_sent_again_by_the_person(lpage, lineage):
+    lineage.fail = pj.Conflict("the target moved on while you were choosing", current_etag="v9")
+    dialog = _open_dialog(lpage)
+    dialog.get_by_label("Why you are sending it (optional)").fill("kept words")
+    dialog.get_by_role("button", name="Send to Trace").click()
+    expect(dialog).to_be_hidden()
+    banner = lpage.locator("#lineage .pj-conflict")
+    expect(banner).to_contain_text("Not sent: it changed since you started.")
+    expect(banner).to_contain_text("the target moved on while you were choosing")
+    expect(banner).to_contain_text("Nothing was sent to Trace, and your request is kept.")
+    # Not a toast: still there after one would have faded, and nothing retried behind the person.
+    lpage.wait_for_timeout(3800)
+    expect(banner).to_be_visible()
+    assert len([c for c in lineage.calls if c[0] == "derive"]) == 1
+    assert banner.get_by_role("button", name="Review and send again").count() == 0
+    lineage.fail = None
+    banner.get_by_role("button", name="Reload to see what changed").click()
+    expect(banner).to_contain_text("Reloaded")
+    assert len([c for c in lineage.calls if c[0] == "derive"]) == 1
+    banner.get_by_role("button", name="Review and send again").click()
+    expect(dialog).to_be_visible()
+    assert dialog.get_by_label("Why you are sending it (optional)").input_value() == "kept words"
+    dialog.get_by_role("button", name="Send to Trace").click()
+    expect(lpage.locator("#lineage .pj-result")).to_contain_text("Sent to Trace")
+    expect(banner).to_have_count(0)
+    assert len([c for c in lineage.calls if c[0] == "derive"]) == 2
+
+
+def test_a_busy_target_can_be_discarded(lpage, lineage):
+    lineage.fail = pj.Busy("the target is being built; try again when it is done")
+    dialog = _open_dialog(lpage)
+    dialog.get_by_role("button", name="Send to Trace").click()
+    banner = lpage.locator("#lineage .pj-conflict")
+    expect(banner).to_contain_text("Not sent: it is busy.")
+    expect(banner).to_contain_text("the target is being built")
+    banner.get_by_role("button", name="Discard my request").click()
+    expect(banner).to_have_count(0)
+    assert lineage.derived == []
+
+
+def test_a_product_that_is_unavailable_is_listed_but_cannot_be_chosen(lpage, lineage):
+    lineage.unavailable = "Mesh is not set up for this workspace."
+    lpage.evaluate("demo.lineage.refresh()")
+    lpage.locator("#lineage .pj-send").click()
+    mesh = lpage.locator("#lineage [role='menuitem']", has_text="Mesh")
+    expect(mesh).to_be_disabled()
+    assert mesh.get_attribute("title") == "Mesh is not set up for this workspace."

@@ -195,3 +195,117 @@ class FakeProjects:
             }
         )
         return pj.RestoreResult(self.etag(project_id), commits[-1]["id"], changes, "restored")
+
+
+class FakeLineage:
+    """An in-memory ``ProjectLineage`` (``projects.py``) over a ``FakeProjects``,
+    for a host that can send a project on: ``camera`` here is a ``loom``
+    project, and it may be sent to ``trace`` (new, or the ``review`` project) and
+    ``mesh`` (new only; ``unavailable`` says why not, when set). A test drives
+    the refusals by setting ``viewer`` (may look, may not send) or ``fail`` (the
+    error the next ``derive`` raises), and reads ``derived`` for what was made.
+    Everything it says is its own words: nothing in the page names ``trace``.
+    """
+
+    def __init__(self, store, *, viewer=False):
+        self.store = store
+        self.viewer = viewer
+        self.fail = None
+        self.calls = []
+        self.derived = []
+        self.unavailable = ""
+        #: (source project, source revision, target project, relation, intent, created_at)
+        self.edges = []
+
+    async def send_options(self, project_id, *, actor):
+        self.calls.append(("options", project_id, actor.login))
+        self.store._get(project_id)
+        commits = self.store.projects[project_id]["commits"]
+        return pj.SendOptions(
+            targets=(
+                pj.SendTarget(
+                    "trace",
+                    "Trace",
+                    new_label="A new Trace project",
+                    existing=(pj.TargetProject("review", "Rescue review", "3 findings"),),
+                ),
+                pj.SendTarget(
+                    "mesh", "Mesh", new_label="A new Mesh project", unavailable=self.unavailable
+                ),
+            ),
+            can_send=not self.viewer,
+            disabled_reason="Viewers can look at this project but cannot send it."
+            if self.viewer
+            else "",
+            head_revision=commits[-1]["id"] if commits else "",
+        )
+
+    async def derive(self, project_id, revision, *, target_product, target_project, intent, actor):
+        self.calls.append(("derive", project_id, revision, target_product, target_project, intent))
+        if self.viewer:
+            raise pj.Forbidden("You may not send this project.")
+        if self.fail is not None:
+            raise self.fail
+        if target_product not in ("trace", "mesh"):
+            raise pj.Invalid("%s is not somewhere this can be sent" % target_product)
+        if not any(c["id"] == revision for c in self.store.projects[project_id]["commits"]):
+            raise pj.Invalid("%s is not a revision of %s" % (revision, project_id))
+        new = target_project is None
+        target = "prj_%d" % (len(self.derived) + 1) if new else target_project
+        key = (revision, target_product, target_project)
+        existing = next((d for d in self.derived if d["key"] == key), None)
+        if existing is not None:
+            return pj.DeriveResult(**{**existing["result"], "created": False})
+        result = {
+            "target_project": target,
+            "target_product": target_product,
+            "target_title": "Camera board review" if new else "Rescue review",
+            "target_revision": "r001",
+            "new": new,
+            "created": True,
+            "job_id": "job_%d" % (len(self.derived) + 1),
+            "state": "queued",
+            "href": "/p/%s/" % target,
+        }
+        self.derived.append({"key": key, "result": result})
+        self.edges.append(
+            (project_id, revision, target, "derived", intent, "2026-10-25T09:00:00+00:00")
+        )
+        return pj.DeriveResult(**result)
+
+    async def lineage(self, project_id, *, actor):
+        self.calls.append(("lineage", project_id))
+        self.store._get(project_id)
+        derived_from = (
+            pj.LineageLink(
+                "boards",
+                title="Reference boards",
+                product="loom",
+                product_label="Loom",
+                relation="rescued-from",
+                relation_label="rescued from",
+                revision="b042",
+                local_revision="c000",
+                intent="start from the reviewed boards",
+                created_at="2026-10-20T08:00:00+00:00",
+                href="/p/boards/",
+            ),
+        )
+        sent_to = tuple(
+            pj.LineageLink(
+                target,
+                title="Rescue review" if target == "review" else "Camera board review",
+                product="trace",
+                product_label="Trace",
+                relation=relation,
+                relation_label="derived",
+                revision="r001",
+                local_revision=revision,
+                intent=intent,
+                created_at=when,
+                href="/p/%s/" % target,
+            )
+            for source, revision, target, relation, intent, when in reversed(self.edges)
+            if source == project_id
+        )
+        return pj.Lineage(derived_from, sent_to)

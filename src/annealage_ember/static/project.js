@@ -13,6 +13,8 @@
  *   initProjectHeader({ ctx, root: titleBar, title: "Camera board", projectId,
  *                       onTitle, onRenamed });
  *   initProjectList({ ctx, root: listPane });       // a page that lists projects
+ *   const lineage = initProjectLineage({ ctx, root: lineagePane });  // optional: send to / derived from
+ *   // initProjectHistory({ ..., lineage }) then offers "send" on each commit too
  *
  * `createProjectClient({endpoints, request})` names the routes relative to the
  * page (`appUrl`, the page's token), `endpoints` replacing any of them (the
@@ -33,6 +35,17 @@
  * The state and logic are in DOM-free models (`createHistoryModel`,
  * `createNameModel`, `createListModel`) that call `onChange(state)`; the
  * `init*` functions render them into a root element they own the contents of.
+ *
+ * Send to / derived from is optional: `initProjectLineage` reads the host's
+ * lineage route once, and when the host has none (the route answers 404 with no
+ * JSON, or says unsupported) it shows nothing at all. When it has, the page
+ * shows a menu of the host's target products (words and products are all the
+ * host's), a dialog to choose a new or an existing target project, and the
+ * lists of what the project was derived from and sent to. The host's refusals
+ * are shown, not retried: a 403 (`ForbiddenError`) in the dialog, a 409 as a
+ * banner that keeps the request until the person reloads and sends again, and
+ * someone who may not send gets the menu disabled with the host's reason.
+ *
  * Every string from the server is written as text, never markup.
  */
 
@@ -68,6 +81,14 @@ export class BusyError extends ProjectError {
   }
 }
 
+/** The store refused this caller outright (a viewer, another workspace), in words for the person. */
+export class ForbiddenError extends ProjectError {
+  constructor(message, status, data) {
+    super(message, status, data);
+    this.name = "ForbiddenError";
+  }
+}
+
 export const REFUSED =
   "This page is not signed in, or its link has gone stale: open the URL the server printed.";
 
@@ -79,6 +100,8 @@ const DEFAULT_ENDPOINTS = {
   history: "api/history",
   diff: (commit) => `api/history/${encodeURIComponent(commit)}`,
   restore: "api/restore",
+  lineage: "api/lineage",
+  send: "api/send",
 };
 
 /** The history routes of a page that lists projects: the id is in the path. */
@@ -89,6 +112,8 @@ export function pathEndpoints(projectId) {
     history: `${base}/history`,
     diff: (commit) => `${base}/history/${encodeURIComponent(commit)}`,
     restore: `${base}/restore`,
+    lineage: `${base}/lineage`,
+    send: `${base}/send`,
   };
 }
 
@@ -112,6 +137,10 @@ export function createProjectClient({ endpoints = {}, request = pageRequest } = 
 
   async function call(path, body) {
     const { status, data } = await request(path, body);
+    // The server's own 403 says forbidden: true; the authentication refusal is plain text.
+    if (status === 403 && data && data.forbidden) {
+      throw new ForbiddenError(data.error || "You may not do that.", status, data);
+    }
     if (status === 403) throw new ProjectError(REFUSED, status, data);
     if (status >= 200 && status < 300 && data && data.ok !== false) return data;
     const message = (data && data.error) || `${path} failed (${status})`;
@@ -136,6 +165,11 @@ export function createProjectClient({ endpoints = {}, request = pageRequest } = 
     history: ({ limit, cursor } = {}) => call(route("history") + query({ limit, cursor })),
     diff: (commit) => call(route("diff", commit)),
     restore: (target, expectedEtag) => call(route("restore"), { target, expected_etag: expectedEtag }),
+    lineage: () => call(route("lineage")),
+    send: ({ revision, targetProduct, targetProject, intent }) =>
+      call(route("send"), {
+        revision, target_product: targetProduct, target_project: targetProject || null, intent: intent || "",
+      }),
   };
 }
 
@@ -602,6 +636,196 @@ export function createListModel(ctx, { onChange = () => {}, onRenamed = () => {}
   };
 }
 
+// ── lineage model: send to / derived from ───────────────────────────────
+
+/**
+ * What the host offers for sending this project on, and where it came from.
+ * `state.available` is null until the first read, false when the host has no
+ * lineage (nothing is shown), true when it has. A send is only ever made by
+ * `confirm`, from a draft the person filled in; a refused one is never
+ * retried, only offered again after a reload (`sendAgain`).
+ */
+export function createLineageModel(ctx, { onChange = () => {} } = {}) {
+  const st = {
+    available: null, loading: false, error: "", canSend: false, disabledReason: "", headRevision: "",
+    labels: { send: "Send to", derived: "Derived from", sent: "Sent to" },
+    targets: [], derivedFrom: [], sentTo: [],
+    menuOpen: false, revision: null, draft: null, result: null, conflict: null,
+  };
+  let generation = 0;
+  const listeners = new Set([onChange]);
+  const emit = () => listeners.forEach((fn) => fn(st));
+  const targetOf = (product) => st.targets.find((t) => t.product === product);
+
+  /** A host without lineage: its app has no such route (404, no JSON) or says so. */
+  const absent = (err) => err.status === 404 && (!err.data || err.data.unsupported === true);
+
+  async function refresh() {
+    const mine = ++generation;
+    st.loading = true;
+    emit();
+    try {
+      const data = await ctx.client.lineage();
+      if (mine !== generation) return;
+      st.available = true;
+      st.canSend = data.can_send !== false;
+      st.disabledReason = data.disabled_reason || "";
+      st.headRevision = data.head_revision || "";
+      st.labels = {
+        send: data.send_label || "Send to", derived: data.derived_label || "Derived from",
+        sent: data.sent_label || "Sent to",
+      };
+      st.targets = data.targets || [];
+      st.derivedFrom = data.derived_from || [];
+      st.sentTo = data.sent_to || [];
+      if (!st.canSend) st.menuOpen = false;
+      st.error = "";
+    } catch (err) {
+      if (mine !== generation) return;
+      if (absent(err)) {
+        st.available = false;
+        st.error = "";
+      } else {
+        st.error = err.message;
+      }
+    } finally {
+      if (mine === generation) st.loading = false;
+    }
+    emit();
+  }
+
+  function toggleMenu(open = !st.menuOpen) {
+    st.menuOpen = open && st.canSend && st.targets.length > 0;
+    emit();
+  }
+
+  /** Send this revision (a commit of the history) instead of the project as it is now. */
+  function chooseRevision(revision) {
+    st.revision = revision || null;
+    st.menuOpen = st.canSend && st.targets.length > 0;
+    emit();
+  }
+
+  /** Open the dialog for sending to `product`: a new project of it unless it can only extend one. */
+  function begin(product) {
+    const target = targetOf(product);
+    if (!target || target.unavailable || !st.canSend) return;
+    const existing = target.existing || [];
+    st.menuOpen = false;
+    st.result = null;
+    st.draft = {
+      product, revision: st.revision || st.headRevision,
+      project: target.can_create === false && existing.length ? existing[0].id : null,
+      intent: "", sending: false, error: "",
+    };
+    emit();
+  }
+
+  function setProject(id) {
+    if (st.draft) st.draft.project = id || null;
+  }
+
+  function setIntent(text) {
+    if (st.draft) st.draft.intent = text;
+  }
+
+  function cancelDraft() {
+    if (!st.draft) return;
+    st.draft = null;
+    emit();
+  }
+
+  async function confirm() {
+    const d = st.draft;
+    if (!d || d.sending) return;
+    const target = targetOf(d.product);
+    if (!st.canSend) {
+      d.error = st.disabledReason || "You may not send this project.";
+      emit();
+      return;
+    }
+    if (!d.revision) {
+      d.error = "This project has no revision to send yet.";
+      emit();
+      return;
+    }
+    d.sending = true;
+    d.error = "";
+    emit();
+    try {
+      const data = await ctx.client.send({
+        revision: d.revision, targetProduct: d.product, targetProject: d.project, intent: d.intent,
+      });
+      const r = data.derivation;
+      const label = target ? target.label : r.target_product || d.product;
+      st.draft = null;
+      st.conflict = null;
+      st.revision = null;
+      st.result = { ...r, label, revision: d.revision };
+      ctx.notify(r.created === false ? `Already sent to ${label}` : `${st.labels.sent} ${label}`, true);
+      emit();
+      await refresh();
+      return;
+    } catch (err) {
+      d.sending = false;
+      if (err instanceof ConflictError || err instanceof BusyError) {
+        st.conflict = {
+          kind: "send", message: err.message, busy: err instanceof BusyError,
+          reloaded: false, request: d, label: target ? target.label : d.product,
+        };
+        st.draft = null;
+      } else {
+        d.error = err.message;
+      }
+    }
+    emit();
+  }
+
+  async function reloadAfterConflict() {
+    if (!st.conflict) return;
+    await refresh();
+    if (st.conflict) st.conflict.reloaded = true;
+    emit();
+  }
+
+  /** The kept request, back in the dialog once the options are read again: the person's own click sends it. */
+  function sendAgain() {
+    const c = st.conflict;
+    if (!c || !c.reloaded) return;
+    const target = targetOf(c.request.product);
+    st.conflict = null;
+    if (!target || target.unavailable || !st.canSend) {
+      st.error = target && target.unavailable ? target.unavailable
+        : "That is no longer offered for this project.";
+    } else {
+      st.draft = { ...c.request, sending: false, error: "" };
+    }
+    emit();
+  }
+
+  function dismissConflict() {
+    st.conflict = null;
+    emit();
+  }
+
+  function dismissResult() {
+    st.result = null;
+    emit();
+  }
+
+  /** `fn(state)` after every change; for a view (the history pane) that shows part of it. */
+  function subscribe(fn) {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  }
+
+  ctx.addReloader(refresh);
+  return {
+    state: st, refresh, toggleMenu, chooseRevision, begin, setProject, setIntent, cancelDraft,
+    confirm, reloadAfterConflict, sendAgain, dismissConflict, dismissResult, subscribe,
+  };
+}
+
 // ── DOM ─────────────────────────────────────────────────────────────────
 
 function h(tag, attrs, ...children) {
@@ -700,6 +924,38 @@ function createModal(root) {
   };
 }
 
+/** The lineage of one project: the other project, what it is, and the revisions the edge joins. */
+function lineageItem(link, forward) {
+  const there = link.revision ? h("code", { title: "revision of the other project" }, link.revision) : null;
+  const here = link.local_revision ? h("code", { title: "revision of this project" }, link.local_revision) : null;
+  const name = link.title || link.project;
+  return h("li", { class: "pj-link", "data-project": link.project },
+    h("div", { class: "pj-linkhead" },
+      link.href ? h("a", { href: link.href, class: "pj-name" }, name) : h("span", { class: "pj-name" }, name),
+      link.product_label ? h("span", { class: "pj-chip" }, link.product_label) : null,
+      link.relation_label || link.relation
+        ? h("span", { class: "pj-chip pj-relation" }, link.relation_label || link.relation) : null,
+      link.state ? h("span", { class: "pj-state" }, link.state) : null),
+    h("div", { class: "pj-meta" },
+      here && there ? h("span", {}, ...(forward ? [here, " → ", there] : [there, " → ", here])) : (here || there),
+      link.created_at ? h("span", {}, when(link.created_at)) : null,
+      link.intent ? h("span", { class: "pj-intent" }, link.intent) : null));
+}
+
+/** The refusal of a send as a banner: it stays until dismissed, with the request kept and nothing sent. */
+function sendBanner(conflict, { reload, again, dismiss }) {
+  return h("div", { class: "pj-conflict", role: "alert" },
+    h("p", {}, h("b", {}, conflict.busy ? "Not sent: it is busy. " : "Not sent: it changed since you started. "),
+      conflict.message),
+    h("p", {}, `Nothing was sent to ${conflict.label}, and your request is kept.`),
+    conflict.reloaded ? h("p", {}, "Reloaded: these are the options as they are now.") : null,
+    h("p", { class: "pj-actions" },
+      conflict.reloaded ? null : h("button", { type: "button", class: "pj-btn", onclick: reload },
+        "Reload to see what changed"),
+      conflict.reloaded ? h("button", { type: "button", class: "pj-btn", onclick: again }, "Review and send again") : null,
+      h("button", { type: "button", class: "pj-btn pj-quiet", onclick: dismiss }, "Discard my request")));
+}
+
 const BUSY = "The agent is working on a turn: wait for it to finish, or interrupt it, then restore.";
 
 /**
@@ -708,10 +964,12 @@ const BUSY = "The agent is working on a turn: wait for it to finish, or interrup
  * Restore on each group that has it (asking first), the conflict banner when
  * the store refuses a restore as stale. `busy` text replaces the default
  * refusal shown while the product says a change would race (`setBusy`).
+ * `lineage` (the model `initProjectLineage` returned) adds "send" to each
+ * commit while the host offers it: it picks that commit as the revision.
  * Returns the model: `refresh()` when the product knows history changed,
  * `setBusy(bool)`.
  */
-export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () => {}, busyText = BUSY } = {}) {
+export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () => {}, busyText = BUSY, lineage = null } = {}) {
   root.classList.add("pj-history");
   const now = h("span", { class: "pj-now" });
   const refreshButton = h("button", { type: "button", class: "pj-btn pj-refresh" }, "Refresh");
@@ -730,6 +988,9 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
     return h("div", { class: "pj-commit" },
       h("div", { class: "pj-commithead" },
         h("span", { class: "pj-subject" }, c.subject),
+        lineage && lineage.state.available && lineage.state.canSend && lineage.state.targets.length
+          ? h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", "data-send": c.commit,
+            onclick: () => lineage.chooseRevision(c.commit) }, `${lineage.state.labels.send}…`) : null,
         h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", "aria-expanded": String(open),
           onclick: () => model.toggleDiff(c.commit) }, open ? "Hide diff" : "Diff")),
       h("div", { class: "pj-meta" },
@@ -794,6 +1055,7 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
   }
 
   model = createHistoryModel(ctx, { pageSize, onChange: render, onRestored });
+  if (lineage) lineage.subscribe(() => render(model.state));
   refreshButton.addEventListener("click", () => model.refresh());
   more.addEventListener("click", () => model.loadMore());
   return model;
@@ -981,5 +1243,150 @@ export function initProjectList({ ctx, root, onRenamed = () => {} } = {}) {
   }
 
   model = createListModel(ctx, { onChange: render, onRenamed });
+  return model;
+}
+
+/**
+ * The send to / derived from section in `root`, absent (hidden, empty) unless
+ * the host has lineage. A menu of the host's target products on the project (or
+ * on a commit, when `initProjectHistory` is given the returned model), a dialog
+ * to pick a new or an existing target project and say why, what was just sent,
+ * the refusal banner, and the lists of what this project was derived from and
+ * sent to, each entry a link. Someone who may not send sees the menu disabled
+ * with the host's reason. `onSent(derivation)` tells the page a send succeeded.
+ * Returns the model (`refresh()`, `chooseRevision(commit)`, `subscribe(fn)`).
+ */
+export function initProjectLineage({ ctx, root, heading = "Lineage", onSent = () => {} } = {}) {
+  root.classList.add("pj-lineage");
+  root.hidden = true;
+  const title = h("h3", { class: "pj-lineage-title" }, heading);
+  const menuButton = h("button", { type: "button", class: "pj-btn pj-send", "aria-haspopup": "menu", "aria-expanded": "false" });
+  const menu = h("div", { class: "pj-menu", role: "menu", hidden: true });
+  const wrap = h("div", { class: "pj-menuwrap" }, menuButton, menu);
+  const revision = h("span", { class: "pj-revnote", hidden: true });
+  const why = h("span", { class: "pj-notice", role: "status" });
+  const error = h("div", { class: "pj-error", role: "alert" });
+  const banner = h("div", { class: "pj-banner" });
+  const result = h("div", { class: "pj-result", role: "status" });
+  const derivedBox = h("section", { class: "pj-links pj-derived" });
+  const sentBox = h("section", { class: "pj-links pj-sent" });
+  root.replaceChildren(h("div", { class: "pj-bar" }, title, wrap, revision, why), error, banner, result, derivedBox, sentBox);
+  const modal = createModal(root);
+  // Built, but not in the page until the host has shown it has lineage: with none the root is empty.
+  const parts = [...root.children];
+  root.replaceChildren();
+  let mounted = false;
+  let model;
+  let wasOpen = false;
+
+  function renderDraft(st) {
+    const d = st.draft;
+    const target = d && st.targets.find((t) => t.product === d.product);
+    if (!d || !target) {
+      modal.close();
+      return;
+    }
+    const existing = target.existing || [];
+    const nowhere = target.can_create === false && !existing.length;
+    const choice = (value, label, detail) => {
+      const input = h("input", { type: "radio", name: "pj-target-project", checked: d.project === value,
+        onchange: () => model.setProject(value) });
+      return h("label", { class: "pj-choice" }, input, h("span", {}, label),
+        detail ? h("small", { class: "pj-hint" }, detail) : null);
+    };
+    const intent = h("textarea", { rows: "3", maxlength: 2000, "aria-label": "Why you are sending it (optional)",
+      placeholder: "Why? (optional)", oninput: () => model.setIntent(intent.value) });
+    intent.value = d.intent;
+    modal.show({
+      heading: `${st.labels.send} ${target.label}`,
+      okLabel: d.sending ? "Sending…" : `${st.labels.send} ${target.label}`,
+      okDisabled: d.sending || !d.revision || nowhere,
+      errorText: nowhere ? `There is no ${target.label} project to send this to.`
+        : !d.revision ? "This project has no revision to send yet." : d.error,
+      ok: () => model.confirm(),
+      closed: () => model.cancelDraft(),
+      content: [
+        h("p", {}, "Revision ", h("code", {}, d.revision || "(none)")),
+        h("fieldset", { class: "pj-choices" },
+          target.can_create === false ? null : choice(null, target.new_label || "A new project", null),
+          ...existing.map((p) => choice(p.id, p.title || p.id, p.summary))),
+        intent,
+      ],
+    });
+  }
+
+  function render(st) {
+    root.hidden = st.available !== true && !st.error;
+    if (st.available !== true) {
+      mounted = false;
+      error.textContent = st.error;
+      root.replaceChildren(...(st.error ? [error] : []));
+      return;
+    }
+    if (!mounted) {
+      root.replaceChildren(...parts);
+      mounted = true;
+    }
+    error.textContent = st.error;
+    title.textContent = heading;
+    const usable = st.targets.length > 0;
+    menuButton.textContent = `${st.labels.send}…`;
+    menuButton.disabled = !st.canSend || !usable;
+    menuButton.setAttribute("aria-expanded", String(st.menuOpen));
+    menuButton.title = !st.canSend ? st.disabledReason : "";
+    why.textContent = st.available !== true ? ""
+      : !st.canSend ? st.disabledReason || "You may not send this project."
+        : !usable ? "There is nowhere to send this project yet." : "";
+    revision.hidden = !st.revision;
+    revision.replaceChildren(...(st.revision ? [
+      "revision ", h("code", {}, st.revision), " ",
+      h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", onclick: () => model.chooseRevision(null) },
+        "Use the latest"),
+    ] : []));
+    menu.hidden = !st.menuOpen;
+    menu.replaceChildren(...st.targets.map((t) => h("button", {
+      type: "button", role: "menuitem", class: "pj-menuitem", "data-product": t.product,
+      disabled: !!t.unavailable, title: t.unavailable || null, onclick: () => model.begin(t.product),
+    }, t.label)));
+    banner.replaceChildren(...(st.conflict ? [sendBanner(st.conflict, {
+      reload: () => model.reloadAfterConflict(), again: () => model.sendAgain(),
+      dismiss: () => model.dismissConflict(),
+    })] : []));
+    const r = st.result;
+    result.hidden = !r;
+    result.replaceChildren(...(r ? [
+      h("span", {}, r.created === false
+        ? `This had already been sent to ${r.label}: ` : `${st.labels.sent} ${r.label}: `),
+      r.href ? h("a", { href: r.href, class: "pj-name" }, r.target_title || r.target_project)
+        : h("b", {}, r.target_title || r.target_project),
+      r.state ? h("span", { class: "pj-state" }, r.state) : null,
+      r.note ? h("span", { class: "pj-hint" }, r.note) : null,
+      h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", onclick: () => model.dismissResult() }, "Dismiss"),
+    ] : []));
+    for (const [box, label, links, forward] of [
+      [derivedBox, st.labels.derived, st.derivedFrom, false], [sentBox, st.labels.sent, st.sentTo, true],
+    ]) {
+      box.replaceChildren(h("h4", {}, label),
+        links.length ? h("ul", {}, ...links.map((l) => lineageItem(l, forward)))
+          : h("p", { class: "pj-empty" }, "Nothing yet."));
+    }
+    renderDraft(st);
+    if (st.menuOpen && !wasOpen && root.scrollIntoView) root.scrollIntoView({ block: "nearest" });
+    wasOpen = st.menuOpen;
+  }
+
+  model = createLineageModel(ctx, { onChange: render });
+  let lastResult = null;
+  model.subscribe((st) => {
+    if (st.result && st.result !== lastResult) onSent(st.result);
+    lastResult = st.result;
+  });
+  menuButton.addEventListener("click", () => model.toggleMenu());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && model.state.menuOpen) model.toggleMenu(false);
+  });
+  document.addEventListener("click", (e) => {
+    if (model.state.menuOpen && !wrap.contains(e.target) && !e.target.closest("[data-send]")) model.toggleMenu(false);
+  });
   return model;
 }
