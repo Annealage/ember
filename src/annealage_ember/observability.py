@@ -75,7 +75,12 @@ import time
 import weakref
 from typing import Iterable, Optional
 
-from prometheus_client import CollectorRegistry, GCCollector, ProcessCollector, disable_created_metrics
+from prometheus_client import (
+    CollectorRegistry,
+    GCCollector,
+    ProcessCollector,
+    disable_created_metrics,
+)
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.metrics import Counter, Gauge, Histogram
