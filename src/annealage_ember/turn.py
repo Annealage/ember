@@ -172,6 +172,7 @@ class TurnRun:
             raise RuntimeError("TurnRun needs Python 3.11 or newer (Task.cancelling)")
         self._task = task
         self._completions = 0
+        self._executed = False
         self._failure: Optional[BaseException] = None
         self._failed = False
         self.completed = False
@@ -203,7 +204,9 @@ class TurnRun:
         self._task.cancel()
 
     def complete(self) -> None:
-        """The turn ran to its end: stop serving. Idempotent; a later interrupt still wins."""
+        """The turn ran to its end: stop serving. Idempotent; a later interrupt still wins, and once teardown has started it is ignored."""
+        if self.teardown.started:
+            return  # too late: whatever ended the work, it was not this turn finishing
         self.completed = True
         self._end()
 
@@ -242,6 +245,9 @@ class TurnRun:
         cancelled (an interrupt unless it was :meth:`complete`'s). Teardown runs on every
         path, once, even for ``KeyboardInterrupt``/``SystemExit``, which still propagate.
         """
+        if self._executed:
+            raise RuntimeError("TurnRun.execute runs once; a turn is never replayed")
+        self._executed = True
         try:
             await work()
         except asyncio.CancelledError:

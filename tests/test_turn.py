@@ -223,3 +223,24 @@ def test_may_publish_is_false_after_an_interrupt_or_failure_seen_by_teardown_ste
 def test_turn_run_outside_a_task_is_refused():
     with pytest.raises(RuntimeError):
         TurnRun()
+
+
+def test_a_turn_is_never_replayed_and_a_late_complete_cannot_make_it_succeed():
+    async def main():
+        run = TurnRun()
+        calls = []
+
+        async def work():
+            calls.append(1)
+
+        # teardown began (a shutdown path) before the watcher said complete
+        await run.teardown.run()
+        run.complete()
+        assert not run.completed
+        outcome = await run.execute(work)
+        assert outcome.status is TurnStatus.CANCELLED and not outcome.publishes
+        with pytest.raises(RuntimeError, match="never replayed"):
+            await run.execute(work)
+        assert calls == [1]
+
+    asyncio.run(main())
