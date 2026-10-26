@@ -365,6 +365,11 @@ def _ensure_rpc_metrics() -> None:
             buckets=(1, 5, 15, 60, 180, 600, 1800, 3600),
         )
         _stops = counter(PREFIX + "omp_session_stops_total", "omp sessions stopped")
+        # Every bounded series exists at zero, so a scrape with no client reads 0, not absent.
+        for event_type in (*RPC_EVENT_TYPES, "other"):
+            _rpc_events.labels(event_type)
+        for outcome in TURN_OUTCOMES:
+            _turns.labels(outcome)
         add_collector(_RpcCollector())
         _rpc_ready = True
 
@@ -459,6 +464,8 @@ def mount(app, *, auth, metrics_token: Optional[str] = None) -> None:
     if metrics_token is not None and len(metrics_token) < MIN_TOKEN_LENGTH:
         raise ValueError("the metrics token must be at least %d characters" % MIN_TOKEN_LENGTH)
     app.agent_metrics_mounted = True
+    _ensure_rpc_metrics()
+    websocket_connections()
     unmatched = counter(
         PREFIX + "http_unmatched_total", "Requests no route matched", ("method", "status_class")
     )

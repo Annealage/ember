@@ -436,3 +436,47 @@ async def test_an_unmounted_app_is_stopped_gone_from_the_routes_and_its_id_free_
         )
         == 1
     )
+
+
+async def test_metrics_is_served_once_at_the_front_doors_root_never_under_an_app(tmp_path):
+    token = "m" * 40
+    front = FrontDoor(
+        TOY_PAGE,
+        token=BROWSER_TOKEN,
+        agent_token=AGENT_TOKEN,
+        host=TEST_HOST,
+        port=DEFAULT_PORT,
+        metrics_token=token,
+    )
+    front.mount("a", _app(front, "a", _workspace(tmp_path, "a", [])))
+    client = make_test_client(front.app)
+    auth = {"Authorization": "Bearer " + token}
+
+    assert (await client.get("/metrics", headers=auth)).status_code == 200
+    assert (await client.get("/metrics")).status_code == 403
+    for path in ("/p/a/metrics", "/p/a/metrics?t=" + BROWSER_TOKEN):
+        res = await client.get(path, headers=auth)
+        assert res.status_code == 404, path
+        assert b"# HELP" not in res.body
+    assert [e for e in front.app.url_map if e[1].url_pattern.endswith("/metrics")][0][
+        1
+    ].url_pattern == "/metrics"
+    assert len([e for e in front.app.url_map if e[1].url_pattern.endswith("/metrics")]) == 1
+
+
+async def test_the_omp_gauges_read_zero_with_no_client_not_absent(served_dir):
+    from annealage_ember import observability
+
+    app = create_toy_app(
+        served_dir, token=BROWSER_TOKEN, agent_token=AGENT_TOKEN, host=TEST_HOST, port=DEFAULT_PORT
+    )
+    body = (await make_test_client(app).get("/metrics?t=" + BROWSER_TOKEN)).body.decode()
+    assert not observability._tracked_clients() or "annealage_omp_sessions" in body
+    for series in (
+        "annealage_omp_rpc_retained_events",
+        "annealage_omp_rpc_listeners",
+        'annealage_omp_turns_total{outcome="cancelled"}',
+        'annealage_omp_rpc_events_total{type="message_update"}',
+        "annealage_websocket_connections",
+    ):
+        assert series in body, series

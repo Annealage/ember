@@ -211,6 +211,9 @@ class FrontDoor:
                 "logins that sign in to the front page are the ones it takes" % app_id
             )
         self._drop_routes(handlers=self._moved.pop(app_id, ()))
+        # Before the mount: microdot copies a sub-app's routes into this app's table
+        # then, so a route removed afterwards from the sub-app would stay served here.
+        observability.unmount_route(app)
         self.app.mount(app, prefix, local=True)
 
         async def to_directory(req):
@@ -223,7 +226,6 @@ class FrontDoor:
 
         self.app.get(prefix)(to_directory)
         self._prefix_routes[app_id] = to_directory
-        observability.unmount_route(app)
         self._apps[app_id] = app
         self._background[app_id] = tuple(background)
         if self._serving:
