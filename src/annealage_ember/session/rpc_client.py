@@ -1,9 +1,4 @@
-"""``LeanRpcClient``: ``omp_rpc.RpcClient`` that reports what its history holds (and, from the next
-commit, does not archive streamed message updates).
-
-STAGE 1 (this revision): the history archives every notification exactly as upstream, so the
-retention gauges measure the unfixed behaviour; ``UNARCHIVED_EVENT`` below is ``None``.
-The description that follows is of the finished client.
+"""``LeanRpcClient``: ``omp_rpc.RpcClient`` that does not archive streamed message updates.
 
 omp's ``message_update`` notification carries the whole message so far (``message``)
 and, inside ``assistantMessageEvent``, the same again (``partial``), for every streamed
@@ -60,9 +55,7 @@ from .. import observability
 PINNED_OMP_RPC = "71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9"
 
 #: The notification type this client does not archive.
-UNARCHIVED_EVENT = (
-    None  # stage 1: archive everything, as upstream; the next commit sets "message_update"
-)
+UNARCHIVED_EVENT = "message_update"
 
 #: ``RpcClient``'s list-valued listener registries (``_typed_event_listeners`` is a dict of lists).
 LISTENER_ATTRS = (

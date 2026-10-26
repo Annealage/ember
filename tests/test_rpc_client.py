@@ -12,6 +12,7 @@ pytest.importorskip("omp_rpc")
 
 from omp_rpc import (
     RpcClient,  # noqa: E402
+    RpcError,  # noqa: E402
 )
 from omp_rpc.protocol import MessageEndEvent, parse_notification  # noqa: E402
 
@@ -63,6 +64,18 @@ def _retained(client_class, n):
     return current
 
 
+def test_a_long_reply_is_not_retained_once_per_token():
+    lean, stock = _retained(LeanRpcClient, 2000), _retained(RpcClient, 2000)
+    assert lean < stock / 10, (lean, stock)
+
+
+def test_a_streamed_update_is_counted_and_heard_by_listeners_but_not_archived():
+    client = LeanRpcClient()
+    client._append_event(_update("abc", "c"))
+    client._append_event({"type": "agent_start"})
+    assert [e["type"] for e in client._events.items] == ["agent_start"]
+
+
 def test_every_other_notification_is_archived_as_a_clone_equal_to_upstreams():
     end = {
         "type": "message_end",
@@ -72,6 +85,34 @@ def test_every_other_notification_is_archived_as_a_clone_equal_to_upstreams():
     lean._append_event(end)
     stock._append_event(end)
     assert lean._events.items == stock._events.items and lean._events.items[0] is not end
+
+
+def test_a_turn_of_more_than_the_history_limit_in_updates_still_completes_where_upstream_cannot():
+    events, final = _turn_events()
+    long_turn = [events[0], *_stream(10_500, chunk=1), *events[-2:]]
+
+    def run(client):
+        out = {}
+
+        def wait():
+            try:
+                out["events"] = client.collect_events(timeout=10)
+            except RpcError as exc:
+                out["error"] = exc
+
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        while not client._prompt_lifecycle.active_operation:
+            pass
+        for payload in long_turn:
+            client._append_event(payload)
+        waiter.join(15)
+        return out
+
+    assert "Event history limit" in str(run(RpcClient()).get("error"))
+    got = run(LeanRpcClient())["events"]
+    assert isinstance(got[-1], parse_notification(long_turn[-1]).__class__)
+    assert [type(e).__name__ for e in got].count("MessageEndEvent") == 1
 
 
 def test_a_listener_still_receives_every_update_with_its_full_content():
