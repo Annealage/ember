@@ -206,10 +206,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from omp_rpc import RpcClient, host_tool
+from omp_rpc import host_tool
 from omp_rpc.client import RpcTimeoutError
 
-from .. import hosted_state, product
+from .. import hosted_state, observability, product
 from ..tools import host_tool_name
 from . import logfiles, turn_images
 from .base import (
@@ -237,6 +237,7 @@ from .base import (
     context_figures,
     turn_not_sent,
 )
+from .rpc_client import LeanRpcClient as RpcClient
 
 
 def _provider_id() -> str:
@@ -620,6 +621,7 @@ class OmpSession:
     async def _send_input(self, job) -> None:
         input_id, turn, blocks, viewer = job
         self._turn = turn
+        self._turn_started = time.monotonic()
         self._active_input_id = input_id
         self._running = True
         try:
@@ -757,6 +759,7 @@ class OmpSession:
                     # Already decided or timed out between the snapshot
                     # above and this call; nothing left to unblock.
                     pass
+        self._aborted_turn = self._turn
         try:
             await self._run_blocking(self._client.abort)
         except Exception as exc:
@@ -1146,6 +1149,7 @@ class OmpSession:
             except Exception as exc:
                 sys.stderr.write("warning: agent client did not close cleanly: %r\n" % (exc,))
         self._client = None
+        observability.session_stopped()
         self._executor.shutdown(wait=True)
         # Not waited for: a listing omp never answered holds its thread until
         # the stop above fails it, and nothing needs that answer now.
@@ -1746,6 +1750,17 @@ class OmpSession:
         )
 
     def _emit(self, event) -> None:
+        if isinstance(event, TurnEnd):
+            started = getattr(self, "_turn_started", None)
+            if event.stop_reason in {"backend_exited", "rejected"}:
+                outcome = "failed"
+            elif getattr(self, "_aborted_turn", None) == event.turn:
+                outcome = "cancelled"
+            else:
+                outcome = "completed"
+            observability.turn_finished(
+                outcome, 0.0 if started is None else time.monotonic() - started
+            )
         completion = self._automation_completion
         if isinstance(event, TurnEnd) and completion is not None and not completion.done():
             if event.stop_reason in {"backend_exited", "rejected"}:

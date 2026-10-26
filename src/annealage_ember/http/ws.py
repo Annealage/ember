@@ -34,7 +34,7 @@ import time
 from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
-from .. import protocol
+from .. import observability, protocol
 from ..hosted_state import attribution
 from ..session.base import (
     AGENT_CONNECTING,
@@ -183,6 +183,8 @@ def register_ws(
         ws = await websocket_upgrade(req)
         ws.max_message_length = MAX_WS_MESSAGE
         conn = None
+        connections = observability.websocket_connections()
+        connections.inc()
         try:
             # After the upgrade, so the page's plain-HTTP refusal probe
             # (static/ws.js) is never counted. Not an interaction: a page
@@ -259,6 +261,7 @@ def register_ws(
             # escape would log a traceback and a 500 for it.
             pass
         finally:
+            connections.dec()
             if conn is not None:
                 await registry.remove(conn)
         return Response.already_handled

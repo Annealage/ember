@@ -42,7 +42,7 @@ from pathlib import Path
 from microdot import Microdot, Response
 
 from . import app as agent_app
-from . import net, product
+from . import net, observability, product
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.static import register_agent_static_routes
 from .http.ws import refusal
@@ -106,6 +106,8 @@ class FrontDoor:
         login=None,
         register_routes=None,
         identity=None,
+        metrics=True,
+        metrics_token=None,
     ):
         if agent_token is not None and agent_token == token:
             raise ValueError("the agent token must differ from the browser token")
@@ -161,6 +163,8 @@ class FrontDoor:
             product.current().server_header,
             front_door=True,
         )
+        if metrics:
+            observability.mount(self.app, auth=auth, metrics_token=metrics_token)
 
     def mount(self, app_id, app, *, background=()):
         """Serve ``app`` under ``/p/<app_id>/``; call on the event loop.
@@ -219,6 +223,7 @@ class FrontDoor:
 
         self.app.get(prefix)(to_directory)
         self._prefix_routes[app_id] = to_directory
+        observability.unmount_route(app)
         self._apps[app_id] = app
         self._background[app_id] = tuple(background)
         if self._serving:

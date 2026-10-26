@@ -47,6 +47,8 @@ classifiers = [
 dependencies = [
     # The web framework every route here is written against (app.py, http/).
     "microdot>=2.6,<3",
+    # observability.py: the one process-wide metrics registry and /metrics exporter.
+    "prometheus-client>=0.20,<1",
     # 0.2.163 supports MCP 2 tool servers and includes the
     # ConversationResetMessage imported by session/sdk.py.
     "claude-agent-sdk>=0.2.163,<0.3",

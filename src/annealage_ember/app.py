@@ -36,7 +36,7 @@ from typing import Optional
 
 from microdot import Microdot, Request
 
-from . import files, net, product, protocol, remote_actions, sessions, uploads
+from . import files, net, observability, product, protocol, remote_actions, sessions, uploads
 from . import settings as settings_module
 from .agent_lock import AgentAlreadyOpen, AgentLock
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
@@ -273,6 +273,8 @@ def create_app(
     builtin_tools=None,
     auto_approve_included_tools=False,
     settings_model_controls=None,
+    metrics=True,
+    metrics_token=None,
 ):
     """Build a Microdot app serving ``serve_dir``, routes registered, not started.
 
@@ -971,6 +973,8 @@ def create_app(
     )
 
     install_response_handlers(app, csp_value, server_header)
+    if metrics:
+        observability.mount(app, auth=auth, metrics_token=metrics_token)
     return app
 
 
@@ -2161,6 +2165,7 @@ async def serve(app, host, port, on_ready=None, background=()):
                 await result
         await asyncio.Event().wait()
     finally:
+        observability.stop_loop_monitor()
         await app.agent_stop()
         await close_server(server)
 
