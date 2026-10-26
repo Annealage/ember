@@ -2978,8 +2978,6 @@ async def test_a_session_is_counted_ready_until_it_closes_and_a_close_counts_a_s
     stops = sample("annealage_omp_session_stops_total")
     session, fake, recorder, broker = await _started_session()
     assert sample("annealage_omp_session_state", state="ready") == ready + 1
-    assert sample("annealage_omp_sessions") == sample(
-        "annealage_omp_sessions"
     await session.close()
     assert sample("annealage_omp_session_state", state="ready") == ready
     assert sample("annealage_omp_session_stops_total") == stops + 1
