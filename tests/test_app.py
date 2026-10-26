@@ -90,7 +90,10 @@ async def test_serve_is_accepting_connections_before_on_ready_fires(tmp_path):
     assert probe_result.get("status_line", b"").startswith(b"HTTP/1.0 200")
 
     # Nothing is left listening on the port after shutdown.
+    # (SO_REUSEADDR: the probe's closed connection leaves TIME_WAIT on the port,
+    # which refuses a plain bind with nothing listening.)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
 
 
