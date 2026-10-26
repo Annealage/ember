@@ -457,7 +457,35 @@ def agent_route_prefixes():
 
     assert '@app.get("/agent/session")' in Path(routes_session.__file__).read_text(encoding="utf-8")
     patterns.add("/agent/session")
+    patterns |= _project_route_patterns()
     return tuple(sorted(p.partition("<")[0] for p in patterns))
+
+
+def _project_route_patterns():
+    """The routes ``projects.register_project_routes`` adds, derived the same way
+    (registered, with the fake stores, both as the page's own project's and as
+    the path-id form): the shared project page script (``project.js``) calls
+    them through ``appUrl``, so they are the agent layer's routes to it."""
+    from annealage_ember import app as agent_app
+    from annealage_ember import projects
+    from fake_project_store import FakeLineage, FakeProjects
+
+    patterns = set()
+    for project_id in (None, "page"):
+        with tempfile.TemporaryDirectory() as d:
+            store = FakeProjects()
+
+            def register(app, allowed_origins, store=store, project_id=project_id):
+                projects.register_project_routes(
+                    app, auth=app.agent_auth, directory=store, history=store,
+                    lineage=FakeLineage(store), project_id=project_id,
+                )
+
+            app = agent_app.create_app(
+                d, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=register
+            )
+            patterns |= {entry[1].url_pattern for entry in app.url_map}
+    return patterns
 
 
 def _names_an_agent_route(text):
@@ -506,9 +534,18 @@ def js_violations(source, path):
             )
         else:
             found.append("names %r, which is not one of the agent layer's routes" % text)
-    for route, computed in _app_url_routes(code):
+    routes = _app_url_routes(code)
+    # A route passed to appUrl as a variable cannot be read off the call; a module
+    # that keeps its routes in a table of literals ("api/...") is checked through
+    # the table instead, every entry as if it were an appUrl argument.
+    table = [t for t in strings if t.startswith("api/")]
+    for text in table:
+        if not _names_an_agent_route("/" + text):
+            found.append("names %r, which is not one of the agent layer's routes" % text)
+    for route, computed in routes:
         if computed:
-            found.append("names a route by a computed expression, which cannot be checked")
+            if not table:
+                found.append("names a route by a computed expression, which cannot be checked")
         elif not _names_an_agent_route("/" + route):
             found.append("names %r, which is not one of the agent layer's routes" % route)
     specifiers = [m.group(2) for m in _STATIC_IMPORT_RE.finditer(code)]
@@ -587,6 +624,8 @@ def test_front_end_stylesheet_uses_no_product_vocabulary(path):
         "fetch(appUrl(`submit/${id}`));\n",
         'fetch(appUrl("wsx"));\n',
         "fetch(appUrl(route));\n",
+        # A table of routes is checked entry by entry: a product route in it is refused.
+        'const R = { a: "api/projects", b: "api/model/list" };\nfetch(appUrl(route));\n',
         # An agent route by an absolute path, which misses a mounted app.
         'fetch("/ws?t=" + token);\n',
         "fetch(`/session/${id}/export?t=${t}`);\n",
@@ -628,6 +667,8 @@ def test_the_front_end_checker_catches_a_regression(source):
         'fetch(appUrl("agent/logs/" + encodeURIComponent(name)));\n',
         "export function appUrl(route) {\n  return route;\n}\n",
         'if (frame.type === "ping") return;\n',
+        # A computed route is allowed when the module's table of literal routes is agent routes.
+        'const R = { a: "api/projects", b: (id) => `api/projects/${id}/history` };\nfetch(appUrl(route));\n',
     ],
 )
 def test_the_front_end_checker_allows_the_tree_itself(source):
