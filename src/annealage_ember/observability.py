@@ -63,6 +63,15 @@ What Ember measures (all aggregate; no session, project, path, model or user lab
 ``annealage_omp_turns_total{outcome}`` (``completed``/``cancelled``/``failed``) and
 ``annealage_omp_turn_seconds``
 ``annealage_omp_session_stops_total``
+``annealage_omp_session_state{state}`` (connecting/ready/busy/unavailable), ``annealage_agent_apps{state}`` (open/closed)
+    Live ``OmpSession``s by state and the apps' agents holding a session or closed (idle, stopped), read from
+    their owners at scrape time.
+``annealage_agent_opens_total{reason}`` (initial/resume), ``annealage_agent_closes_total{reason}`` (idle/stop/cancel/replaced/child_exited/other)
+``annealage_permission_pending``, ``annealage_permission_decisions_total{outcome}`` (allow/deny/timeout/no_viewer/shutdown)
+    The real broker's outstanding requests (not host calls), and how requests ended.
+
+Not Ember's to measure: reviewers (Ember has a review *store* of comments, no reviewer agents) and the
+process tree below an omp child; the product's supervisor owns those.
 """
 
 from __future__ import annotations
@@ -269,6 +278,64 @@ def websocket_connections():
     return gauge(PREFIX + "websocket_connections", "Open page WebSocket connections")
 
 
+AGENT_CLOSE_REASONS = ("idle", "stop", "cancel", "replaced", "child_exited", "other")
+AGENT_OPEN_REASONS = ("initial", "resume")
+PERMISSION_OUTCOMES = ("allow", "deny", "timeout", "no_viewer", "shutdown")
+SESSION_STATES = ("connecting", "ready", "busy", "unavailable")
+APP_STATES = ("open", "closed")
+
+_sessions: "weakref.WeakSet" = weakref.WeakSet()
+_holders: "weakref.WeakSet" = weakref.WeakSet()
+_brokers: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _track(group, owner) -> None:
+    _ensure_rpc_metrics()
+    with _lock:
+        group.add(owner)
+
+
+def _tracked(group):
+    with _lock:
+        return list(group)
+
+
+def track_session(session) -> None:
+    """Count ``session`` (anything with ``metrics_state()``) in ``omp_session_state`` until it is untracked or collected."""
+    _track(_sessions, session)
+
+
+def untrack_session(session) -> None:
+    with _lock:
+        _sessions.discard(session)
+
+
+def track_holder(holder) -> None:
+    """Count an app's agent holder (``closed``, ``session``) in ``agent_apps{state}``."""
+    _track(_holders, holder)
+
+
+def track_broker(broker) -> None:
+    """Count a permission broker's outstanding requests (``pending_count``) in ``permission_pending``."""
+    _track(_brokers, broker)
+
+
+def agent_opened(reason: str) -> None:
+    _ensure_rpc_metrics()
+    _opens.labels(bounded(reason, AGENT_OPEN_REASONS)).inc()
+
+
+def agent_closed(reason: str) -> None:
+    _ensure_rpc_metrics()
+    _closes.labels(bounded(reason, AGENT_CLOSE_REASONS)).inc()
+
+
+def permission_resolved(outcome) -> None:
+    _ensure_rpc_metrics()
+    outcome = "allow" if isinstance(outcome, str) and outcome.startswith("allow") else outcome
+    _decisions.labels(bounded(outcome, PERMISSION_OUTCOMES)).inc()
+
+
 def _child_usage(pid):
     """``(resident bytes, cpu seconds)`` of ``pid`` from ``/proc``, or ``None`` when it cannot be read."""
     try:
@@ -345,11 +412,48 @@ class _RpcCollector:
         )
 
 
+class _LifecycleCollector:
+    """Fixed-state gauges over the live owners, at scrape time; an owner that cannot be read removes its family."""
+
+    def collect(self):
+        states = GaugeMetricFamily(
+            PREFIX + "omp_session_state", "omp sessions by state", labels=("state",)
+        )
+        counts, readable = dict.fromkeys(SESSION_STATES, 0), True
+        for session in _tracked(_sessions):
+            try:
+                counts[bounded(session.metrics_state(), SESSION_STATES)] += 1
+            except Exception:
+                readable = False
+        if readable:
+            for state in SESSION_STATES:
+                states.add_metric((state,), counts[state])
+            yield states
+        apps = GaugeMetricFamily(
+            PREFIX + "agent_apps",
+            "Apps' agents: open (a live session) or closed",
+            labels=("state",),
+        )
+        open_apps = sum(1 for h in _tracked(_holders) if h.session is not None and not h.closed)
+        total = len(_tracked(_holders))
+        apps.add_metric(("open",), open_apps)
+        apps.add_metric(("closed",), total - open_apps)
+        yield apps
+        pending = GaugeMetricFamily(
+            PREFIX + "permission_pending", "Permission requests awaiting a decision"
+        )
+        try:
+            pending.add_metric((), sum(b.pending_count for b in _tracked(_brokers)))
+            yield pending
+        except Exception:
+            pass
+
+
 _rpc_ready = False
 
 
 def _ensure_rpc_metrics() -> None:
-    global _rpc_ready, _rpc_events, _turns, _turn_seconds, _stops
+    global _rpc_ready, _rpc_events, _turns, _turn_seconds, _stops, _opens, _closes, _decisions
     if _rpc_ready:
         return
     with _lock:
@@ -370,7 +474,19 @@ def _ensure_rpc_metrics() -> None:
             _rpc_events.labels(event_type)
         for outcome in TURN_OUTCOMES:
             _turns.labels(outcome)
+        _opens = counter(PREFIX + "agent_opens_total", "Agent sessions opened", ("reason",))
+        _closes = counter(PREFIX + "agent_closes_total", "Agent sessions closed", ("reason",))
+        _decisions = counter(
+            PREFIX + "permission_decisions_total", "Permission requests resolved", ("outcome",)
+        )
+        for reason in AGENT_OPEN_REASONS:
+            _opens.labels(reason)
+        for reason in AGENT_CLOSE_REASONS:
+            _closes.labels(reason)
+        for outcome in PERMISSION_OUTCOMES:
+            _decisions.labels(outcome)
         add_collector(_RpcCollector())
+        add_collector(_LifecycleCollector())
         _rpc_ready = True
 
 

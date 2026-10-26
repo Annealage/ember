@@ -414,6 +414,7 @@ class OmpSession:
 
         self._status = AGENT_CONNECTING
         self._client = None
+        observability.track_session(self)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # The throwaway PI_CODING_AGENT_DIR an omp_base_url run writes its
         # models.yml into, removed by close(); never where a conversation is.
@@ -473,6 +474,12 @@ class OmpSession:
     # -- AgentSession surface -------------------------------------------------
 
     def agent_status(self) -> str:
+        return self._status
+
+    def metrics_state(self) -> str:
+        """The bounded state ``observability`` counts this session in."""
+        if self._status == AGENT_READY and getattr(self, "_running", False):
+            return "busy"
         return self._status
 
     def _set_status(self, status: str) -> None:
@@ -1149,6 +1156,7 @@ class OmpSession:
             except Exception as exc:
                 sys.stderr.write("warning: agent client did not close cleanly: %r\n" % (exc,))
         self._client = None
+        observability.untrack_session(self)
         observability.session_stopped()
         self._executor.shutdown(wait=True)
         # Not waited for: a listing omp never answered holds its thread until

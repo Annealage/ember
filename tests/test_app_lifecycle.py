@@ -203,6 +203,61 @@ async def test_an_idle_app_closes_and_an_interaction_resumes_a_new_session(serve
         await app.agent_stop()
 
 
+def _sample(name, **labels):
+    from annealage_ember import observability
+
+    return observability.registry().get_sample_value(name, labels) or 0
+
+
+async def test_the_lifecycle_metrics_follow_an_open_an_idle_close_a_resume_and_a_permission(
+    served_dir,
+):
+    """The same transitions as above, seen from /metrics' owners: opens and closes by
+    reason, the apps' open/closed gauge, and the broker's own pending count."""
+
+    def snapshot():
+        return {
+            "initial": _sample("annealage_agent_opens_total", reason="initial"),
+            "resume": _sample("annealage_agent_opens_total", reason="resume"),
+            "idle": _sample("annealage_agent_closes_total", reason="idle"),
+            "open": _sample("annealage_agent_apps", state="open"),
+            "closed": _sample("annealage_agent_apps", state="closed"),
+            "allow": _sample("annealage_permission_decisions_total", outcome="allow"),
+        }
+
+    before = snapshot()
+    built = []
+    app = _app(served_dir, built)
+    await app.agent_start()
+    try:
+        assert _sample("annealage_agent_opens_total", reason="initial") == before["initial"] + 1
+        assert snapshot()["open"] == before["open"] + 1
+        conn = await app.agent_registry.add(_Socket())
+        await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
+        now = snapshot()
+        assert now["idle"] == before["idle"] + 1
+        assert (now["open"], now["closed"]) == (before["open"], before["closed"] + 1)
+
+        await app.agent_holder.ensure(retry=True)
+        now = snapshot()
+        assert now["resume"] == before["resume"] + 1
+        assert (now["open"], now["closed"]) == (before["open"] + 1, before["closed"])
+
+        client = make_test_client(app)
+        call = asyncio.ensure_future(_mcp_call(client, "add_note", {"text": "after"}))
+        await _until(lambda: _logged(app, "permission_request"))
+        broker = app.agent_session.broker
+        assert broker.pending_count == 1
+        request_id = _logged(app, "permission_request")[-1]["request_id"]
+        await app.agent_session.decide_permission(request_id, "allow")
+        await asyncio.wait_for(call, 5)
+        assert broker.pending_count == 0
+        assert snapshot()["allow"] == before["allow"] + 1
+        await app.agent_registry.remove(conn)
+    finally:
+        await app.agent_stop()
+
+
 async def test_an_app_with_nothing_to_resume_from_never_closes_for_idle(served_dir):
     built = []
     app = _app(served_dir, built, resume_session=None, idle_timeout=0.05)

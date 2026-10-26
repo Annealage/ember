@@ -66,7 +66,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
-from .. import product
+from .. import observability, product
 from .base import AgentEvent, PermissionRequest, PermissionResolved, UnknownRequest
 
 try:
@@ -212,6 +212,7 @@ class PermissionBroker:
         # allocates; cleaned up in ``ask``'s own ``finally`` regardless of
         # how the request ends, mirroring viewers.py's ``call``.
         self._pending: Dict[str, asyncio.Future] = {}
+        observability.track_broker(self)
         # The PermissionRequest event for each entry above, kept alongside
         # it so decide() can look up which tool a request_id was for
         # without ask() having to pass it back out of band, and so
@@ -373,6 +374,7 @@ class PermissionBroker:
             self._open.pop(request_id, None)
             outcome = self._outcomes.pop(request_id, OUTCOME_SHUTDOWN)
             by = self._deciders.pop(request_id, None)
+            observability.permission_resolved(outcome)
             # After the pops, so a viewer that reconnects on the strength of
             # this event and asks for what is still outstanding cannot be told
             # about the request this event just closed.
@@ -386,6 +388,11 @@ class PermissionBroker:
                     "warning: failed to emit permission_resolved %r (%s): %r\n"
                     % (request_id, outcome, exc)
                 )
+
+    @property
+    def pending_count(self) -> int:
+        """How many requests are waiting for a decision."""
+        return len(self._pending)
 
     async def _guard_call(self, method, *args):
         """Call an optional host authority guard without fixing its sync mode."""

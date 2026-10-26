@@ -1417,6 +1417,8 @@ class AgentHolder:
             float(idle_timeout) if idle_timeout is not None and resume_session is not None else None
         )
         self.session = None
+        self._opened = False
+        observability.track_holder(self)
         #: Closed by the idle sweep; the next ``ensure`` resumes it.
         self.closed = False
         # The live session announced it is unavailable (its start failed, or
@@ -1465,6 +1467,9 @@ class AgentHolder:
 
     def install(self, session):
         """Make ``session`` (or ``None``) the live session."""
+        if session is not None:
+            observability.agent_opened("resume" if self._opened else "initial")
+            self._opened = True
         self.session = session
         self._down = False
         self._app.agent_session = session
@@ -1611,6 +1616,7 @@ class AgentHolder:
 
     def _closed(self, reason, detail=None):
         """Say why a session was closed (``agent_closed``), for every close."""
+        observability.agent_closed(reason)
         self._publish(AgentClosed(reason=reason, detail=detail))
 
     def _claim(self):

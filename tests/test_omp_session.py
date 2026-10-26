@@ -2965,3 +2965,21 @@ async def test_omp_dying_mid_turn_ends_the_session_the_turn_and_the_queue(monkey
         assert any(isinstance(e, AgentError) for e in seen)
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_session_is_counted_ready_until_it_closes_and_a_close_counts_a_stop():
+    from annealage_ember import observability
+
+    def sample(name, **labels):
+        return observability.registry().get_sample_value(name, labels) or 0
+
+    ready = sample("annealage_omp_session_state", state="ready")
+    stops = sample("annealage_omp_session_stops_total")
+    session, fake, recorder, broker = await _started_session()
+    assert sample("annealage_omp_session_state", state="ready") == ready + 1
+    assert sample("annealage_omp_sessions") == sample(
+        "annealage_omp_sessions"
+    await session.close()
+    assert sample("annealage_omp_session_state", state="ready") == ready
+    assert sample("annealage_omp_session_stops_total") == stops + 1
