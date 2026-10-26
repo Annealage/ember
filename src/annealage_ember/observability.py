@@ -75,7 +75,7 @@ import time
 import weakref
 from typing import Iterable, Optional
 
-from prometheus_client import CollectorRegistry, GCCollector, ProcessCollector
+from prometheus_client import CollectorRegistry, GCCollector, ProcessCollector, disable_created_metrics
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.metrics import Counter, Gauge, Histogram
@@ -140,6 +140,8 @@ def registry() -> CollectorRegistry:
     global _registry
     with _lock:
         if _registry is None:
+            # The per-series *_created timestamps are noise at this cardinality.
+            disable_created_metrics()
             _registry = CollectorRegistry(auto_describe=True)
             ProcessCollector(registry=_registry)
             GCCollector(registry=_registry)
