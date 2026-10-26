@@ -53,7 +53,9 @@ What Ember measures (all aggregate; no session, project, path, model or user lab
     method that gives a subclass no hook for its length, and reimplementing the reader is
     declined; ``retained_estimated_bytes`` is the encoded size of what the history keeps.
 ``annealage_omp_rpc_events_total{type}``
-    Notifications archived, ``type`` from the protocol's fixed list or ``other``.
+    Notifications the client's archive hook saw, including the streamed ``message_update`` entries it
+    deliberately does not keep (so this can far exceed ``retained_events``); not omp's raw wire lines or
+    bytes, which no reader hook exposes. ``type`` is from the protocol's fixed list or ``other``.
 ``annealage_omp_rpc_retained_events``, ``annealage_omp_rpc_retained_estimated_bytes``
     Summed over live clients. ``estimated`` means the length of the JSON of what the
     history holds, not the Python objects'.
@@ -460,7 +462,9 @@ def _ensure_rpc_metrics() -> None:
         if _rpc_ready:
             return
         _rpc_events = counter(
-            PREFIX + "omp_rpc_events_total", "RPC notifications archived", ("type",)
+            PREFIX + "omp_rpc_events_total",
+            "RPC notifications seen by the archive hook, including message_update entries it does not keep",
+            ("type",),
         )
         _turns = counter(PREFIX + "omp_turns_total", "Turns finished", ("outcome",))
         _turn_seconds = histogram(
