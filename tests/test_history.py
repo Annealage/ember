@@ -52,14 +52,18 @@ async def test_recent_and_older_pages_are_complete_ordered_and_nonoverlapping(tm
             page = await log.history_async(page.before)
             pages.append(page)
         assert [turns(page) for page in pages] == [
-            list(range(46, 66)), list(range(26, 46)),
-            list(range(6, 26)), list(range(1, 6)),
+            list(range(46, 66)),
+            list(range(26, 46)),
+            list(range(6, 26)),
+            list(range(1, 6)),
         ]
         ordered = [record for page in reversed(pages) for record in page.events]
         seqs = [seq for seq, _ in ordered]
         assert seqs == sorted(set(seqs))
         assert sum(event["kind"] == "turn_end" for _, event in ordered) == 65
-        assert all(event["text"].endswith(":11 ") for _, event in ordered if event["kind"] == "text_delta")
+        assert all(
+            event["text"].endswith(":11 ") for _, event in ordered if event["kind"] == "text_delta"
+        )
         assert pages[-1].before == 1
         assert not pages[-1].has_more
     finally:
@@ -128,7 +132,9 @@ async def test_initial_page_includes_only_still_pending_older_approvals(tmp_path
         assert turns(page) == list(range(6, 26))
         assert page.pending_request_ids == ("active",)
         assert page.events[0][0] == first < page.before
-        assert [event["request_id"] for _, event in page.events if event["kind"] == "permission_request"] == ["active"]
+        assert [
+            event["request_id"] for _, event in page.events if event["kind"] == "permission_request"
+        ] == ["active"]
         older = await log.history_async(page.before)
         assert older.pending_request_ids == ()
         assert any(event.get("request_id") == "resolved" for _, event in older.events)
@@ -168,7 +174,9 @@ async def test_file_page_seeks_to_index_and_captures_snapshot_off_event_loop(tmp
         assert page.through == snapshot
         assert turns(page) == [64, 65]
         catchup = await log.replay_async(page.through)
-        assert [event["turn"] for _, event in catchup.events if event["kind"] == "user_turn"] == [66]
+        assert [event["turn"] for _, event in catchup.events if event["kind"] == "user_turn"] == [
+            66
+        ]
     finally:
         release.set()
         log.close()
@@ -208,7 +216,9 @@ async def test_first_greeting_is_bounded_and_catches_events_emitted_during_send(
     await ws_module._greet(sock, log, "tok", "s")
     page, event = sock.sent
     assert page["type"] == "history_page" and page["initial"]
-    assert [item["event"]["turn"] for item in page["events"] if item["event"]["kind"] == "user_turn"] == list(range(6, 26))
+    assert [
+        item["event"]["turn"] for item in page["events"] if item["event"]["kind"] == "user_turn"
+    ] == list(range(6, 26))
     assert event["type"] == "event"
     assert event["seq"] > page["through"]
     assert event["event"]["text"] == "arrived before registration"
@@ -240,7 +250,9 @@ async def test_same_session_reconnect_uses_all_catchup_and_old_clients_keep_full
     reconnect = Socket(hello(history_turns=20, session_id="s", last_seq=4))
     await ws_module._greet(reconnect, log, "tok", "s")
     assert all(frame["type"] == "event" for frame in reconnect.sent)
-    assert [frame["event"]["turn"] for frame in reconnect.sent if frame["event"]["kind"] == "user_turn"] == list(range(2, 31))
+    assert [
+        frame["event"]["turn"] for frame in reconnect.sent if frame["event"]["kind"] == "user_turn"
+    ] == list(range(2, 31))
     old = Socket(hello())
     await ws_module._greet(old, log, "tok", "s")
     assert sum(frame["event"]["kind"] == "user_turn" for frame in old.sent) == 30
@@ -293,7 +305,10 @@ async def test_initial_history_failure_preserves_pending_and_can_retry(tmp_path)
         frame = {"type": "history", "session_id": "s", "before": None}
         await ws_module._dispatch(sock, None, None, log, None, frame, history_session_id="s")
         assert sock.sent[-1]["type"] == "history_page"
-        assert len([item for item in sock.sent[-1]["events"] if item["event"]["kind"] == "user_turn"]) == 20
+        assert (
+            len([item for item in sock.sent[-1]["events"] if item["event"]["kind"] == "user_turn"])
+            == 20
+        )
     finally:
         log.close()
 
@@ -314,14 +329,17 @@ async def test_history_requires_only_hosted_project_read():
     operations = []
     auth = SimpleNamespace(
         hosted_mode=True,
-        permits=lambda human, operation: operations.append(operation) or operation == "project.read",
+        permits=lambda human, operation: (
+            operations.append(operation) or operation == "project.read"
+        ),
         expired=lambda human: False,
     )
     human = SimpleNamespace(hosted_claims=SimpleNamespace(exp=10**12))
     holder = SimpleNamespace(session=None)
     with pytest.raises(End):
-        await ws_module._serve_connection(sock, None, None, EventLog(), None, holder,
-                                         auth, human, history_session_id="s")
+        await ws_module._serve_connection(
+            sock, None, None, EventLog(), None, holder, auth, human, history_session_id="s"
+        )
     assert operations == ["project.read"]
     assert sock.sent[-1]["type"] == "history_page"
 
@@ -329,7 +347,13 @@ async def test_history_requires_only_hosted_project_read():
 @pytest.mark.parametrize("value", [0, 51, True, "20", 1.5, None])
 def test_invalid_history_limits_are_refused(value):
     assert not protocol.validate_inbound(hello(history_turns=value))[0]
-    frame = {"v": protocol.PROTOCOL_VERSION, "type": "history", "session_id": "s", "before": 1, "limit": value}
+    frame = {
+        "v": protocol.PROTOCOL_VERSION,
+        "type": "history",
+        "session_id": "s",
+        "before": 1,
+        "limit": value,
+    }
     assert not protocol.validate_inbound(frame)[0]
 
 

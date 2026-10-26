@@ -107,7 +107,9 @@ class ProviderLogin:
         try:
             client = self._client(request_timeout=30.0)
         except Exception as exc:
-            raise LoginError("omp could not be started to %s: %s" % (command, _brief(exc))) from None
+            raise LoginError(
+                "omp could not be started to %s: %s" % (command, _brief(exc))
+            ) from None
         try:
             return client.request_raw(command, **payload)
         except Exception as exc:
@@ -182,8 +184,12 @@ class ProviderLogin:
         flow.answer(value)
         with self._changed:
             # The answer is taken, then omp either finishes, asks again, or fails.
-            self._changed.wait_for(lambda: self._flow is not flow or self._state["state"] != AWAITING
-                                   or flow.asked_again(), timeout=self._begin_seconds)
+            self._changed.wait_for(
+                lambda: (
+                    self._flow is not flow or self._state["state"] != AWAITING or flow.asked_again()
+                ),
+                timeout=self._begin_seconds,
+            )
             return dict(self._state)
 
     def cancel(self) -> dict:

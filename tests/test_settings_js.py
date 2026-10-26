@@ -1,9 +1,9 @@
 """Settings model inheritance and empty overrides, exercised under Node."""
 
 import json
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -102,7 +102,10 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     script = tmp_path / "settings-harness.mjs"
     script.write_text(HARNESS)
     run = subprocess.run(
-        ["node", str(script), str(SETTINGS_JS)], capture_output=True, text=True, timeout=30,
+        ["node", str(script), str(SETTINGS_JS)],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert run.returncode == 0, run.stderr
     output = json.loads(run.stdout)
@@ -110,7 +113,10 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["suggestions"] == ["anthropic/opus", "openai-codex/gpt"]
     assert "pending restart; startup setting was" in output["initial"]
     assert "model: openai-codex/gpt (inherited High)" in output["initial"]
-    assert "Actual coordinator runtime (backend-reported): omp · anthropic · actual-opus · effort low" in output["initial"]
+    assert (
+        "Actual coordinator runtime (backend-reported): omp · anthropic · actual-opus · effort low"
+        in output["initial"]
+    )
     assert "same-conversation" in output["initial"]
     assert output["changed"] == {"high_model": "anthropic/sonnet"}
     assert "model: anthropic/sonnet (inherited High)" in output["updated"]

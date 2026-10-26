@@ -207,9 +207,7 @@ async def test_local_admission_refusal_keeps_notes_and_does_not_log_or_count():
     bus, log = _bus(), EventLog()
     bus.queue_note("Unsent product note.")
     sent = await _turn(session, bus, "not yet", log=log, client_id="pending")
-    assert [(frame["type"], frame.get("client_id")) for frame in sent] == [
-        ("refused", "pending")
-    ]
+    assert [(frame["type"], frame.get("client_id")) for frame in sent] == [("refused", "pending")]
     assert bus.turn == 0 and not bus.first_turn.is_set()
     assert session.submitted_turns == [] and log.replay(0).events == []
 

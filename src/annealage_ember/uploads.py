@@ -161,14 +161,17 @@ def check_upload_actions(actions, tools=None):
                 % action.name
             )
         if (action.source_url_arg is None) != (action.source_url_label is None):
-            raise ValueError("upload action %r: source_url_arg and source_url_label are both required"
-                             % action.name)
+            raise ValueError(
+                "upload action %r: source_url_arg and source_url_label are both required"
+                % action.name
+            )
         if action.source_url_arg is not None:
             names = (action.source_url_arg, action.content_arg, action.filename_arg)
-            if (not all(isinstance(n, str) and n for n in names)
-                    or len(set(names)) != len(names)):
-                raise ValueError("upload action %r: source_url_arg, content_arg and filename_arg "
-                                 "must be different argument names" % action.name)
+            if not all(isinstance(n, str) and n for n in names) or len(set(names)) != len(names):
+                raise ValueError(
+                    "upload action %r: source_url_arg, content_arg and filename_arg "
+                    "must be different argument names" % action.name
+                )
             if not isinstance(action.source_url_label, str) or not action.source_url_label.strip():
                 raise ValueError("upload action %r: source_url_label is required" % action.name)
         if tools is not None and tool[0] not in tools.remote_servers:
@@ -274,8 +277,12 @@ class Documents:
 
 def valid_source_url(value):
     """An explicit absolute HTTP(S) source URL, at most 2048 characters."""
-    if (not isinstance(value, str) or not value or len(value) > 2048
-            or any(char.isspace() or ord(char) < 32 for char in value)):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or any(char.isspace() or ord(char) < 32 for char in value)
+    ):
         return False
     try:
         parsed = urlsplit(value)
@@ -340,8 +347,18 @@ def _current_context(callback):
 
 
 async def run(
-    action, upload, human, args, *, broker, server, publish, queue_note, documents,
-    action_store=None, remote_action_context=None,
+    action,
+    upload,
+    human,
+    args,
+    *,
+    broker,
+    server,
+    publish,
+    queue_note,
+    documents,
+    action_store=None,
+    remote_action_context=None,
     dispatch_allowed=None,
 ):
     """Apply the broker policy, then call, recording upload writes durably."""
@@ -410,17 +427,25 @@ async def run(
                 ended(ACTION_DENIED, decision.message or "not permitted")
                 return
         result = await remote.call(
-            server, tool_name, arguments, action_store=action_store, source="upload:" + action.name,
+            server,
+            tool_name,
+            arguments,
+            action_store=action_store,
+            source="upload:" + action.name,
             allowed_writes=(tool_name,),
             approval=(
-                None if getattr(broker, "automatically_allows", lambda _tool: False)(tool)
+                None
+                if getattr(broker, "automatically_allows", lambda _tool: False)(tool)
                 else human.login
             ),
-            context=current_context, expected_context=approved_context,
+            context=current_context,
+            expected_context=approved_context,
             context_callback=remote_action_context,
         )
     except Exception as exc:
-        sys.stderr.write("error: upload action %s failed (%s)\n" % (action.name, type(exc).__name__))
+        sys.stderr.write(
+            "error: upload action %s failed (%s)\n" % (action.name, type(exc).__name__)
+        )
         ended(
             ACTION_FAILED,
             "%s failed inside %s itself (%s), which is a bug; it may or may not have reached "

@@ -113,14 +113,13 @@ def register_settings_routes(
             if settings_module.USER not in key.layers:
                 raise ValueError("administrator model controls require user-writable keys")
     hidden_runtime_keys = (
-        {"backend", "model", "effort"} - control_keys
-        if not browser_runtime_controls else set()
+        {"backend", "model", "effort"} - control_keys if not browser_runtime_controls else set()
     )
     control_startup = None
     if controls:
-        control_startup = controls.get("startup") or settings_module.resolve(
-            None, flags=settings.flags
-        ).to_wire()
+        control_startup = (
+            controls.get("startup") or settings_module.resolve(None, flags=settings.flags).to_wire()
+        )
 
     async def _payload():
         """The response body both routes return, built off the event loop.
@@ -153,8 +152,7 @@ def register_settings_routes(
         if hosted_mode:
             wire = {name: entry for name, entry in wire.items() if _hosted_visible(name)}
         if hidden_runtime_keys:
-            wire = {name: entry for name, entry in wire.items()
-                    if name not in hidden_runtime_keys}
+            wire = {name: entry for name, entry in wire.items() if name not in hidden_runtime_keys}
         if mounted:
             for name in BIND_KEYS:
                 if name in wire:
@@ -167,15 +165,15 @@ def register_settings_routes(
                 {
                     "title": section["title"],
                     "keys": [
-                        name for name in section["keys"]
+                        name
+                        for name in section["keys"]
                         if (not hosted_mode or _hosted_visible(name))
                         and name not in hidden_runtime_keys
                     ],
                 }
                 for section in settings_module.sections()
                 if any(
-                    (not hosted_mode or _hosted_visible(name))
-                    and name not in hidden_runtime_keys
+                    (not hosted_mode or _hosted_visible(name)) and name not in hidden_runtime_keys
                     for name in section["keys"]
                 )
             ],
@@ -264,9 +262,7 @@ def register_settings_routes(
         if not changes:
             return {"ok": False, "error": "changes is empty; nothing to write"}, 400
         if not browser_runtime_controls:
-            restricted = sorted(
-                name for name in changes if name in hidden_runtime_keys
-            )
+            restricted = sorted(name for name in changes if name in hidden_runtime_keys)
             if restricted:
                 return {
                     "ok": False,
@@ -307,7 +303,7 @@ def register_settings_routes(
                     changes,
                     flags=settings.flags,
                     layer="project" if hosted_mode else None,
-                    layer_overrides={name: settings_module.USER for name in control_keys},
+                    layer_overrides=dict.fromkeys(control_keys, settings_module.USER),
                 ),
             )
         except settings_module.SettingsError as exc:

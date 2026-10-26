@@ -140,14 +140,18 @@ def test_segments_keep_text_and_contiguous_tool_runs_in_event_order(observed):
     segments = observed["orderedSegments"]
     assert [s["kind"] for s in segments] == ["text", "tools", "text", "tools", "text"]
     assert [s["text"] for s in segments if s["kind"] == "text"] == [
-        "Alpha.", "Beta.", "Gamma.",
+        "Alpha.",
+        "Beta.",
+        "Gamma.",
     ]
     assert [[t["tool_use_id"] for t in s["tools"]] for s in segments if s["kind"] == "tools"] == [
-        ["a1", "a2"], ["b1"],
+        ["a1", "a2"],
+        ["b1"],
     ]
     assert segments[1]["tools"][0]["input"] == {"file": "first"}
     assert segments[1]["tools"][0]["result"] == {
-        "isError": True, "text": "late earlier result",
+        "isError": True,
+        "text": "late earlier result",
     }
     assert observed["originalResultUnchanged"] == {"isError": False, "text": "early"}
     assert observed["onlyOriginalRunUpdated"] == [True, False, True, True, True]

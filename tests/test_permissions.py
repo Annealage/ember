@@ -94,10 +94,10 @@ async def test_a_changed_authority_denies_a_delayed_allow():
 
 async def test_automatic_included_tools_have_no_cards_or_persisted_human_grants(tmp_path):
     path = tmp_path / "permissions.toml"
-    included = {"mcp__loom__export_pack", "ds-wiki__submit_datasheet",
-                "mcp__loom__resolve_comment"}
+    included = {"mcp__loom__export_pack", "ds-wiki__submit_datasheet", "mcp__loom__resolve_comment"}
     broker, events = _broker(
-        automatic_tools=lambda: included, permissions_path=path,
+        automatic_tools=lambda: included,
+        permissions_path=path,
         never_remembered=included,
     )
     for name in included:

@@ -617,7 +617,6 @@ def test_a_document_s_chip_says_how_its_action_ended(observed):
     }
 
 
-
 def test_a_datum_upload_prompts_for_and_sends_the_source_url(observed):
     assert observed["sourceUrlPrompt"] == "Original URL"
     assert observed["uploadActionRequest"] == {
@@ -628,6 +627,7 @@ def test_a_datum_upload_prompts_for_and_sends_the_source_url(observed):
             "source_url": "https://manufacturer.example/sheet.pdf",
         },
     }
+
 
 def test_a_card_whose_decision_could_not_be_sent_stays_answerable(observed):
     assert observed["cardWhileOffline"]["pending"] == [["pr_a_1", None]]
@@ -668,8 +668,6 @@ def test_the_pane_root_says_whether_a_turn_runs_since_when_and_what_waits(observ
     assert observed["paneAfterReset"] == idle
 
 
-
-
 def test_delivery_tracking_does_not_add_metadata_to_the_transcript(observed):
     queued = observed["queuedDelivery"]
     assert [(turn["turn"], turn["state"], turn["complete"]) for turn in queued] == [
@@ -681,7 +679,9 @@ def test_delivery_tracking_does_not_add_metadata_to_the_transcript(observed):
     ]
     final = observed["finalDelivery"]
     assert [(turn["turn"], turn["state"]) for turn in final] == [
-        (1, "provider_ack"), (2, "uncertain"), (3, "rejected")
+        (1, "provider_ack"),
+        (2, "uncertain"),
+        (3, "rejected"),
     ]
     assert all(not turn["deliveryVisible"] for turn in final)
     assert all(turn["cost"] is None for turn in final)
@@ -740,7 +740,11 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
 
 def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
     assert observed["inlineOrder"] == [
-        "text:Alpha.", "tools:a1,a2", "text:Beta.", "tools:b1", "text:Gamma.",
+        "text:Alpha.",
+        "tools:a1,a2",
+        "text:Beta.",
+        "tools:b1",
+        "text:Gamma.",
     ]
     assert observed["inlineLateResult"] == {
         "sameNodes": True,

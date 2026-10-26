@@ -321,7 +321,6 @@ async def test_a_fresh_connection_after_a_live_model_switch_sees_the_new_model(s
     assert hello["session"]["agent"] == "unavailable"
 
 
-
 async def test_a_fresh_connection_gets_backend_reported_runtime_metadata(served_dir):
     from annealage_ember.session.base import AgentRuntimeResolved
 
@@ -345,6 +344,7 @@ async def test_a_fresh_connection_gets_backend_reported_runtime_metadata(served_
         "effort": None,
         "provenance": "assistant_message",
     }
+
 
 async def test_a_fresh_connection_gets_the_models_the_backend_listed(served_dir):
     """The list is published once, at session start, usually before any tab
@@ -442,7 +442,8 @@ async def test_backend_activity_clears_the_error_for_reconnecting_clients(served
     session.emit(InputState("retry", 2, "queued"))
     session.emit(TextDelta(turn=2, text=""))
     assert (await _hello_of(app))["session"]["agent_error"] == {
-        "remediation": "Check credentials", "stderr": "No API key found",
+        "remediation": "Check credentials",
+        "stderr": "No API key found",
     }
     event = {
         "provider_ack": InputState("retry", 2, "provider_ack"),
@@ -452,13 +453,15 @@ async def test_backend_activity_clears_the_error_for_reconnecting_clients(served
     session.emit(event)
     assert (await _hello_of(app))["session"]["agent_error"] is None
     errors = [
-        wire for _seq, wire in app.agent_event_log.replay(0).events
-        if wire["kind"] == "agent_error"
+        wire for _seq, wire in app.agent_event_log.replay(0).events if wire["kind"] == "agent_error"
     ]
-    assert errors == [{
-        "kind": "agent_error", "stderr": "No API key found",
-        "remediation": "Check credentials",
-    }]
+    assert errors == [
+        {
+            "kind": "agent_error",
+            "stderr": "No API key found",
+            "remediation": "Check credentials",
+        }
+    ]
 
 
 async def test_the_hello_carries_the_conversation_s_usage_across_a_restart(served_dir):

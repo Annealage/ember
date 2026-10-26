@@ -225,6 +225,7 @@ def test_turn_run_outside_a_task_is_refused():
         TurnRun()
 
 
+@needs_cancelling
 def test_a_turn_is_never_replayed_and_a_late_complete_cannot_make_it_succeed():
     async def main():
         run = TurnRun()

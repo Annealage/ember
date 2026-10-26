@@ -216,12 +216,12 @@ from .base import (
     AGENT_CONNECTING,
     AGENT_READY,
     AGENT_UNAVAILABLE,
+    CLOSE_CHILD_EXITED,
+    AgentClosed,
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
     AgentRuntimeResolved,
-    AgentClosed,
-    CLOSE_CHILD_EXITED,
     AgentStatus,
     InputState,
     RequestUsage,
@@ -539,17 +539,27 @@ class OmpSession:
         }
 
     async def submit_automated_turn(
-        self, blocks: list, *, attempt_id: str, on_admitted,
-        viewer=None, dispatch_context_factory=None,
+        self,
+        blocks: list,
+        *,
+        attempt_id: str,
+        on_admitted,
+        viewer=None,
+        dispatch_context_factory=None,
     ) -> dict:
         """Submit one scope-bound turn and await its real terminal boundary."""
         if not isinstance(attempt_id, str) or not attempt_id:
             raise ValueError("attempt_id must be a non-empty string")
         if not callable(on_admitted):
             raise ValueError("on_admitted must be callable")
-        if (self._client is None or self._status != AGENT_READY or self._closing
-                or self._running or self._input_queue
-                or self._automation_attempt_id is not None):
+        if (
+            self._client is None
+            or self._status != AGENT_READY
+            or self._closing
+            or self._running
+            or self._input_queue
+            or self._automation_attempt_id is not None
+        ):
             raise RuntimeError("OMP session is not idle for automated work")
         if self._broker is not None and self._broker.pending_requests():
             raise RuntimeError("human permission cards are pending")
@@ -850,9 +860,7 @@ class OmpSession:
                 env = {}
                 if self._profile_dir is not None:
                     env["PI_CODING_AGENT_DIR"] = self._profile_dir
-                model_arg = (
-                    "@%s" % self._model_role if self._model_role else self._model
-                )
+                model_arg = "@%s" % self._model_role if self._model_role else self._model
                 # `RpcClient.start()` merges `env` onto `os.environ`.
             if self._config_rel is not None:
                 env["PI_CONFIG_DIR"] = self._config_rel
@@ -954,9 +962,7 @@ class OmpSession:
                     if selected_model is not None:
                         await self._run_blocking(self._client.set_model, *selected_model)
                     if self._thinking is not None:
-                        await self._run_blocking(
-                            self._client.set_thinking_level, self._thinking
-                        )
+                        await self._run_blocking(self._client.set_thinking_level, self._thinking)
             except Exception as exc:
                 self._fail(exc)
                 return
@@ -975,12 +981,15 @@ class OmpSession:
             if resumed:
                 if selected_model is not None and selected_model != (actual_provider, actual_model):
                     raise RuntimeError("OMP did not apply the requested model after resume")
-                if (self._thinking is not None
-                        and getattr(state, "thinking_level", None) != self._thinking):
-                    raise RuntimeError("OMP did not apply the requested thinking level after resume")
-            role_resolved = (
-                self._model_role is not None
-                and (actual_provider is not None or actual_model is not None)
+                if (
+                    self._thinking is not None
+                    and getattr(state, "thinking_level", None) != self._thinking
+                ):
+                    raise RuntimeError(
+                        "OMP did not apply the requested thinking level after resume"
+                    )
+            role_resolved = self._model_role is not None and (
+                actual_provider is not None or actual_model is not None
             )
             runtime = AgentRuntimeResolved(
                 backend="omp",
@@ -990,11 +999,13 @@ class OmpSession:
                 provenance="get_state",
                 requested_role=self._model_role,
                 resolved_role=self._model_role if role_resolved else None,
-                role_provenance=(
-                    "omp_cli_model_role_alias" if role_resolved else None
-                ),
+                role_provenance=("omp_cli_model_role_alias" if role_resolved else None),
             )
-            if runtime.provider is not None or runtime.model is not None or runtime.effort is not None:
+            if (
+                runtime.provider is not None
+                or runtime.model is not None
+                or runtime.effort is not None
+            ):
                 self._record_resolved_runtime(runtime)
             self._remember_session_file(state.session_file)
         except Exception as exc:
@@ -1111,6 +1122,7 @@ class OmpSession:
             )
             return False
         return True
+
     def _start_usage_epoch(self, conversation_id: Optional[str] = None) -> None:
         self._usage_epoch += 1
         self._conversation_id = str(conversation_id or uuid.uuid4().hex)
@@ -1359,10 +1371,19 @@ class OmpSession:
             value = getattr(event, field, None) or previous.get(field)
             if value is not None:
                 runtime[field] = value
-        identity = tuple(runtime.get(key) for key in (
-            "backend", "provider", "model", "effort", "provenance",
-            "requested_role", "resolved_role", "role_provenance",
-        ))
+        identity = tuple(
+            runtime.get(key)
+            for key in (
+                "backend",
+                "provider",
+                "model",
+                "effort",
+                "provenance",
+                "requested_role",
+                "resolved_role",
+                "role_provenance",
+            )
+        )
         if identity == self._runtime_identity:
             return
         self._runtime_identity = identity
@@ -1391,7 +1412,9 @@ class OmpSession:
                 self._loop.call_soon_threadsafe(self._emit, TextDelta(turn=turn, text=text))
         elif kind == "thinking_delta":
             text = assistant_event.get("delta")
-            thought = self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            thought = (
+                self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            )
             if thought is not None:
                 self._loop.call_soon_threadsafe(self._emit, thought)
         elif kind == "error":
@@ -1410,7 +1433,8 @@ class OmpSession:
                         "host_timeout_abort"
                         if self._timeout_interrupt_turn == self._turn
                         and assistant_event.get("reason") == "aborted"
-                        and isinstance(error, dict) and error.get("stopReason") == "aborted"
+                        and isinstance(error, dict)
+                        and error.get("stopReason") == "aborted"
                         else None
                     ),
                 ),
@@ -1521,10 +1545,7 @@ class OmpSession:
         except Exception as exc:
             sys.stderr.write("warning: could not read the omp session's usage: %r\n" % (exc,))
             return None
-        usage = {
-            key: _token_count(getattr(stats.tokens, key, None))
-            for key in _TOKEN_KEYS
-        }
+        usage = {key: _token_count(getattr(stats.tokens, key, None)) for key in _TOKEN_KEYS}
         raw_cost = getattr(stats, "cost", None)
         usage["cost"] = (
             float(raw_cost)
@@ -1576,7 +1597,8 @@ class OmpSession:
         """Reported whatever the turn; the turn is closed only if it is still
         the current one (a later message has otherwise already moved on)."""
         self._refused(
-            reason, turn,
+            reason,
+            turn,
             ends_turn=self._running and turn == self._turn and self._settling_turn is None,
         )
 
@@ -1652,9 +1674,7 @@ class OmpSession:
                 try:
                     self._on_sdk_session_id(session_id)
                 except Exception as exc:
-                    sys.stderr.write(
-                        "warning: could not record the omp session id: %r\n" % (exc,)
-                    )
+                    sys.stderr.write("warning: could not record the omp session id: %r\n" % (exc,))
 
     def _remember_session_file(self, session_file: Optional[str]) -> None:
         """Record `omp`'s conversation file, what a later ``-c`` resumes."""
@@ -1742,6 +1762,7 @@ class OmpSession:
 #: ``TokenUsage`` names them.
 _TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 
+
 def _usage_delta(current, previous):
     if current is None or previous is None or current < previous:
         return None
@@ -1750,6 +1771,8 @@ def _usage_delta(current, previous):
 
 def _nonempty_string(value) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _token_count(value) -> Optional[int]:
     """A token count omp reported, or ``None`` for anything else: an unknown
     figure is never turned into 0."""

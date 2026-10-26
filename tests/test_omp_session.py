@@ -50,11 +50,11 @@ from annealage_ember.session.base import (
     InputState,
     PermissionRequest,
     PermissionResolved,
+    RequestUsage,
     SessionReset,
     TextDelta,
     ToolResult,
     ToolUse,
-    RequestUsage,
     TurnEnd,
     Usage,
 )
@@ -343,25 +343,36 @@ async def test_automated_turn_completes_with_unknown_cost_and_scoped_callbacks()
     table = {
         "inspect_authority": ToolSpec(
             schema={"type": "object", "properties": {}},
-            description="observe callback context", handler=inspect_authority, write=False,
+            description="observe callback context",
+            handler=inspect_authority,
+            write=False,
         )
     }
     session, fake, recorder, broker = await _started_session(
-        model=None, base_url=None, tool_table=table,
+        model=None,
+        base_url=None,
+        tool_table=table,
     )
     fake.cost = None
     admitted = asyncio.Event()
-    execution = asyncio.create_task(session.submit_automated_turn(
-        _text("continue"), attempt_id="root-attempt", on_admitted=admitted.set,
-        dispatch_context_factory=dispatch_context,
-    ))
+    execution = asyncio.create_task(
+        session.submit_automated_turn(
+            _text("continue"),
+            attempt_id="root-attempt",
+            on_admitted=admitted.set,
+            dispatch_context_factory=dispatch_context,
+        )
+    )
     try:
         await asyncio.wait_for(admitted.wait(), 2)
-        while not fake.prompt_calls:
+        while not fake.prompt_calls:  # noqa: ASYNC110 - the fake has no event for a prompt call
             await asyncio.sleep(0)
         assert session.automation_metadata()["inflight"]
         await asyncio.get_running_loop().run_in_executor(
-            None, fake.tool("inspect_authority").execute, {}, SimpleNamespace(tool_call_id="read"),
+            None,
+            fake.tool("inspect_authority").execute,
+            {},
+            SimpleNamespace(tool_call_id="read"),
         )
         assert seen == ["grant"]
         fake.push_agent_end()
@@ -405,11 +416,16 @@ async def test_unsettled_automated_abort_keeps_expired_scope_on_late_write(monke
     table = {
         "late_write": ToolSpec(
             schema={"type": "object", "properties": {}},
-            description="scoped mutation", handler=write, write=True,
+            description="scoped mutation",
+            handler=write,
+            write=True,
         )
     }
     session, fake, recorder, broker = await _started_session(
-        model=None, base_url=None, tool_table=table, broker=None,
+        model=None,
+        base_url=None,
+        tool_table=table,
+        broker=None,
     )
 
     async def timed_out_interrupt():
@@ -417,13 +433,17 @@ async def test_unsettled_automated_abort_keeps_expired_scope_on_late_write(monke
 
     monkeypatch.setattr(session, "interrupt", timed_out_interrupt)
     admitted = asyncio.Event()
-    execution = asyncio.create_task(session.submit_automated_turn(
-        _text("continue"), attempt_id="interrupted-attempt", on_admitted=admitted.set,
-        dispatch_context_factory=dispatch_context,
-    ))
+    execution = asyncio.create_task(
+        session.submit_automated_turn(
+            _text("continue"),
+            attempt_id="interrupted-attempt",
+            on_admitted=admitted.set,
+            dispatch_context_factory=dispatch_context,
+        )
+    )
     try:
         await asyncio.wait_for(admitted.wait(), 2)
-        while not fake.prompt_calls:
+        while not fake.prompt_calls:  # noqa: ASYNC110 - the fake has no event for a prompt call
             await asyncio.sleep(0)
         execution.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -433,7 +453,10 @@ async def test_unsettled_automated_abort_keeps_expired_scope_on_late_write(monke
         assert session.automation_metadata()["attempt_id"] == "interrupted-attempt"
         with pytest.raises(RuntimeError, match="attempt has ended"):
             await asyncio.get_running_loop().run_in_executor(
-                None, fake.tool("late_write").execute, {}, SimpleNamespace(tool_call_id="late"),
+                None,
+                fake.tool("late_write").execute,
+                {},
+                SimpleNamespace(tool_call_id="late"),
             )
         assert writes == []
     finally:
@@ -1255,6 +1278,8 @@ async def _next_of(recorder, kind):
         event = await recorder.next()
         if isinstance(event, kind):
             return event
+
+
 async def _next_input_state(recorder, turn, state):
     while True:
         event = await recorder.next()
@@ -1278,9 +1303,7 @@ async def test_inflight_messages_queue_until_terminal_and_keep_their_turn_identi
         await session.submit_turn(_text("use the LDO instead"))
         assert [c.message for c in fake.prompt_calls] == ["draw the regulator"]
         assert [
-            (event.turn, event.state)
-            for event in recorder.all
-            if isinstance(event, InputState)
+            (event.turn, event.state) for event in recorder.all if isinstance(event, InputState)
         ] == [(1, "received"), (1, "provider_ack"), (2, "received"), (2, "queued")]
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
@@ -1360,8 +1383,11 @@ async def test_queue_admission_refuses_only_when_all_local_slots_are_occupied():
             await session.submit_turn(_text("queued %d" % index))
         assert session.turn_refusal() is not None
         assert [call.message for call in fake.prompt_calls] == ["active"]
-        assert [event.turn for event in recorder.all if isinstance(event, InputState)
-                and event.state == "queued"] == list(range(2, 10))
+        assert [
+            event.turn
+            for event in recorder.all
+            if isinstance(event, InputState) and event.state == "queued"
+        ] == list(range(2, 10))
 
         fake.push_agent_end()
         await _next_input_state(recorder, 2, "provider_ack")
@@ -1574,7 +1600,10 @@ async def test_each_provider_request_reports_its_own_tokens_with_a_deterministic
         fake.push_message_end(
             _assistant(
                 {
-                    "input": 900, "output": 40, "cacheRead": 0, "cacheWrite": 120,
+                    "input": 900,
+                    "output": 40,
+                    "cacheRead": 0,
+                    "cacheWrite": 120,
                     "cost": {"total": 0.0042},
                 },
                 response_id="resp-a",
@@ -1601,6 +1630,7 @@ async def test_each_provider_request_reports_its_own_tokens_with_a_deterministic
         assert (reported[1]["tokens_input"], reported[1]["tokens_cache_read"]) == (30, 1020)
     finally:
         await session.close()
+
 
 @pytest.mark.asyncio
 async def test_resolved_runtime_uses_the_omp_get_state_model_and_thinking_level():
@@ -1638,7 +1668,7 @@ async def test_a_request_whose_usage_omp_did_not_report_is_null_not_zero():
         (partial, missing) = reported
         assert (partial["tokens_input"], partial["tokens_output"]) == (12, None)
         assert (partial["tokens_cache_read"], partial["tokens_cache_write"]) == (None, None)
-        assert set((k, v) for k, v in missing.items() if k.startswith("tokens_")) >= {
+        assert {(k, v) for k, v in missing.items() if k.startswith("tokens_")} >= {
             ("tokens_input", None),
             ("tokens_output", None),
             ("tokens_cache_read", None),
@@ -1677,9 +1707,7 @@ async def test_terminal_assistant_error_message_emits_agent_error_and_keeps_usag
 
         usage = await _next_of(recorder, RequestUsage)
         error = await _next_of(recorder, AgentError)
-        assert error.stderr == (
-            "Codex error event: Invalid schema for function create_footprint"
-        )
+        assert error.stderr == ("Codex error event: Invalid schema for function create_footprint")
         assert usage.tokens_input == 5
         assert usage.cost_usd == pytest.approx(0.001)
         assert session.agent_status() == AGENT_READY
@@ -2193,7 +2221,11 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
             if ("turn_end", 6, "end") in kinds:
                 break
             await asyncio.sleep(0.01)
-        assert [k for k in kinds[10:] if k[1] is not None and k[0] in {"user_turn", "text_delta", "turn_end"}] == [
+        assert [
+            k
+            for k in kinds[10:]
+            if k[1] is not None and k[0] in {"user_turn", "text_delta", "turn_end"}
+        ] == [
             ("user_turn", 6, None),
             ("text_delta", 6, None),
             ("turn_end", 6, "end"),
@@ -2204,7 +2236,9 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
 
 
 @pytest.mark.asyncio
-async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(tmp_path, monkeypatch):
+async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(
+    tmp_path, monkeypatch
+):
     """A queued input keeps its own turn identity after the previous run ends."""
     from annealage_ember.http import ws as ws_module
     from annealage_ember.session.events import read_records
@@ -2261,10 +2295,7 @@ async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(tm
         fake.push_message_update({"type": "text_delta", "delta": "Switching"})
         fake.push_agent_end()
         turns = await logged_until(("turn_end", 3, "end"))
-        assert [
-            item for item in turns
-            if item[0] in {"user_turn", "text_delta", "turn_end"}
-        ] == [
+        assert [item for item in turns if item[0] in {"user_turn", "text_delta", "turn_end"}] == [
             ("user_turn", 2, None),
             ("text_delta", 2, None),
             ("user_turn", 3, None),
@@ -2605,12 +2636,15 @@ async def test_backend_logs_of_a_running_omp_are_its_own_log_and_conversation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("actual_model,actual_effort", [
-    ("selected", "high"),
-    ("substituted", "high"),
-    ("selected", "low"),
-    (None, None),
-])
+@pytest.mark.parametrize(
+    "actual_model,actual_effort",
+    [
+        ("selected", "high"),
+        ("substituted", "high"),
+        ("selected", "low"),
+        (None, None),
+    ],
+)
 async def test_operator_model_and_effort_metadata_are_observational(
     tmp_path, actual_model, actual_effort
 ):
@@ -2618,16 +2652,22 @@ async def test_operator_model_and_effort_metadata_are_observational(
 
     def factory(**kwargs):
         client = FakeRpcClient(**kwargs)
-        client.model = SimpleNamespace(id=actual_model,
-                                       provider="provider" if actual_model is not None else None)
+        client.model = SimpleNamespace(
+            id=actual_model, provider="provider" if actual_model is not None else None
+        )
         client.thinking_level = actual_effort
         clients.append(client)
         return client
 
     recorder = EventRecorder()
-    session = OmpSession(recorder, cwd=tmp_path, session_id="startup",
-                         model="provider/selected", thinking="high",
-                         client_factory=factory)
+    session = OmpSession(
+        recorder,
+        cwd=tmp_path,
+        session_id="startup",
+        model="provider/selected",
+        thinking="high",
+        client_factory=factory,
+    )
     try:
         await session.start()
         assert session.agent_status() == AGENT_READY
@@ -2650,8 +2690,7 @@ async def test_launch_forwards_operator_effort_to_omp_thinking(tmp_path, monkeyp
         return client
 
     monkeypatch.setattr(omp_module, "RpcClient", factory)
-    session = _omp_launch(tmp_path, EventRecorder(), resumed=False, base_url=None,
-                          effort="high")
+    session = _omp_launch(tmp_path, EventRecorder(), resumed=False, base_url=None, effort="high")
     try:
         await session.start()
         assert clients[0].kwargs["extra_args"][-2:] == ("--thinking", "high")
@@ -2681,8 +2720,13 @@ class ResumingModelClient(FakeRpcClient):
 
     def prompt(self, message, **kwargs):
         self.prompt_runtimes.append(
-            (self.session_id, self.session_file, self.model.provider,
-             self.model.id, self.thinking_level)
+            (
+                self.session_id,
+                self.session_file,
+                self.model.provider,
+                self.model.id,
+                self.thinking_level,
+            )
         )
         return super().prompt(message, **kwargs)
 
@@ -2695,8 +2739,11 @@ async def test_resume_operator_selection_wins_on_the_same_native_conversation(tm
     model = "openai-codex/gpt-6.1-sol" if base_url is None else "gpt-6.1-sol"
     provider = "openai-codex" if base_url is None else _provider_id()
     session, fake, recorder, _broker = await _started_session(
-        model=model, thinking="low", base_url=base_url,
-        resume=str(conversation), strict_resume=True,
+        model=model,
+        thinking="low",
+        base_url=base_url,
+        resume=str(conversation),
+        strict_resume=True,
         client_class=ResumingModelClient,
     )
     try:
@@ -2728,18 +2775,24 @@ async def test_resume_operator_selection_wins_on_the_same_native_conversation(tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model,thinking,expected", [
-    (None, None, ("anthropic", "claude-opus-4-6", "high")),
-    (None, "low", ("anthropic", "claude-opus-4-6", "low")),
-    ("openai-codex/gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
-    ("gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
-])
+@pytest.mark.parametrize(
+    "model,thinking,expected",
+    [
+        (None, None, ("anthropic", "claude-opus-4-6", "high")),
+        (None, "low", ("anthropic", "claude-opus-4-6", "low")),
+        ("openai-codex/gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
+        ("gpt-6.1-sol", None, ("openai-codex", "gpt-6.1-sol", "high")),
+    ],
+)
 async def test_resume_only_reapplies_explicit_operator_choices(tmp_path, model, thinking, expected):
     conversation = tmp_path / "saved.jsonl"
     conversation.touch()
     session, fake, _recorder, _broker = await _started_session(
-        model=model, thinking=thinking, base_url=None,
-        resume=str(conversation), client_class=ResumingModelClient,
+        model=model,
+        thinking=thinking,
+        base_url=None,
+        resume=str(conversation),
+        client_class=ResumingModelClient,
     )
     try:
         assert (fake.model.provider, fake.model.id, fake.thinking_level) == expected
@@ -2755,8 +2808,11 @@ async def test_resume_reapplies_the_model_omp_resolved_for_the_role(tmp_path, ro
     conversation = tmp_path / "saved.jsonl"
     conversation.touch()
     session, fake, _recorder, _broker = await _started_session(
-        model_role=role, thinking="low", base_url=None,
-        resume=str(conversation), client_class=ResumingModelClient,
+        model_role=role,
+        thinking="low",
+        base_url=None,
+        resume=str(conversation),
+        client_class=ResumingModelClient,
     )
     try:
         assert fake.kwargs["model"] == "@" + role
@@ -2769,10 +2825,17 @@ async def test_resume_reapplies_the_model_omp_resolved_for_the_role(tmp_path, ro
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [
-    "model_rpc", "thinking_rpc", "model_not_applied", "thinking_not_applied", "state_rpc",
-    "role_unresolved",
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "model_rpc",
+        "thinking_rpc",
+        "model_not_applied",
+        "thinking_not_applied",
+        "state_rpc",
+        "role_unresolved",
+    ],
+)
 async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
     class FailedSelection(ResumingModelClient):
         def set_model(self, provider, model_id):
@@ -2780,6 +2843,7 @@ async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
                 raise RuntimeError("selection rejected")
             if failure != "model_not_applied":
                 return super().set_model(provider, model_id)
+            return None
 
         def set_thinking_level(self, level):
             if failure == "thinking_rpc":
@@ -2806,10 +2870,14 @@ async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
     conversation.write_text("existing history\n")
     recorder = EventRecorder()
     session = OmpSession(
-        recorder, cwd=tmp_path, session_id="ember-existing",
+        recorder,
+        cwd=tmp_path,
+        session_id="ember-existing",
         model=None if failure == "role_unresolved" else "openai-codex/gpt-6.1-sol",
         model_role="smol" if failure == "role_unresolved" else None,
-        thinking="low", resume=str(conversation), client_factory=factory,
+        thinking="low",
+        resume=str(conversation),
+        client_factory=factory,
     )
     try:
         await session.start()
@@ -2886,7 +2954,9 @@ async def test_omp_dying_mid_turn_ends_the_session_the_turn_and_the_queue(monkey
         while not any(isinstance(e, AgentError) for e in seen):
             seen.append(await recorder.next(include_status=True))
         closed = [e for e in seen if isinstance(e, AgentClosed)]
-        assert [(e.reason, e.detail) for e in closed] == [("child_exited", "omp exited with status 1")]
+        assert [(e.reason, e.detail) for e in closed] == [
+            ("child_exited", "omp exited with status 1")
+        ]
         assert session.agent_status() == "unavailable"
         ends = [(e.turn, e.stop_reason) for e in seen if isinstance(e, TurnEnd)]
         assert ends == [(1, "backend_exited"), (2, "rejected")]

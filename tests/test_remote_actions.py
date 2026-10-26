@@ -4,7 +4,6 @@ import pytest
 
 from annealage_ember.remote_actions import RemoteActionStore
 
-
 CONTEXT = {
     "project_id": "a" * 64,
     "source_manifest": "b" * 64,
@@ -20,8 +19,12 @@ def test_intent_digest_excludes_arguments_and_blocks_uncertain_across_sessions(t
     path = tmp_path / "actions.json"
     first = _store(path)
     invocation, blocked = first.begin(
-        "datum", "submit", {"token": "secret", "document": "private"},
-        source="upload:submit", approval="human-1", context=CONTEXT,
+        "datum",
+        "submit",
+        {"token": "secret", "document": "private"},
+        source="upload:submit",
+        approval="human-1",
+        context=CONTEXT,
     )
     assert blocked is None
     first.dispatching(invocation)
@@ -29,8 +32,12 @@ def test_intent_digest_excludes_arguments_and_blocks_uncertain_across_sessions(t
 
     restarted = _store(path, session="new-session")
     retry, blocked = restarted.begin(
-        "datum", "submit", {"document": "private", "token": "secret"},
-        source="upload:submit", approval="new-human", context=CONTEXT,
+        "datum",
+        "submit",
+        {"document": "private", "token": "secret"},
+        source="upload:submit",
+        approval="new-human",
+        context=CONTEXT,
     )
     assert retry is None
     assert blocked["id"] == invocation["id"]
@@ -53,12 +60,19 @@ def test_not_sent_can_be_retried_and_reconciliation_requires_explicit_context(tm
 
     with pytest.raises(ValueError):
         store.reconcile(
-            retry["id"], operator="human", risk_reason="unknown", confirm_unverified=False,
-            expected_digest=retry["argument_digest"], expected_context=retry["context"],
+            retry["id"],
+            operator="human",
+            risk_reason="unknown",
+            confirm_unverified=False,
+            expected_digest=retry["argument_digest"],
+            expected_context=retry["context"],
         )
     reconciled = store.reconcile(
-        retry["id"], operator="human", risk_reason="Checked manually; effect remains unknown",
-        confirm_unverified=True, expected_digest=retry["argument_digest"],
+        retry["id"],
+        operator="human",
+        risk_reason="Checked manually; effect remains unknown",
+        confirm_unverified=True,
+        expected_digest=retry["argument_digest"],
         expected_context=retry["context"],
     )
     assert reconciled["outcome"] == "reported_result"
@@ -71,7 +85,11 @@ def test_status_is_bounded_and_omits_approval_and_remote_arguments(tmp_path):
     path = tmp_path / "actions.json"
     store = _store(path)
     invocation, _ = store.begin(
-        "s", "write", {"password": "hidden"}, source="agent", approval="secret-login",
+        "s",
+        "write",
+        {"password": "hidden"},
+        source="agent",
+        approval="secret-login",
         context=CONTEXT,
     )
     store.dispatching(invocation)

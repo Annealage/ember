@@ -118,8 +118,12 @@ async def test_an_approved_action_sends_the_bytes_from_the_server_and_tells_the_
         "application/pdf",
     )
     assert upload["actions"] == [
-        {"name": "datum", "label": "Submit to Datum", "accepts": "application/pdf",
-         "source_url_label": "Original HTTP(S) source URL (max 2048 characters)"}
+        {
+            "name": "datum",
+            "label": "Submit to Datum",
+            "accepts": "application/pdf",
+            "source_url_label": "Original HTTP(S) source URL (max 2048 characters)",
+        }
     ]
     # Kept outside the served tree, and never served.
     kept = app.agent_documents.directory / upload["upload"]
@@ -321,9 +325,7 @@ async def test_an_action_naming_a_remote_the_tool_server_does_not_declare_is_ref
         )
 
 
-async def test_authority_context_change_while_upload_card_is_open_prevents_dispatch(
-    app, remote
-):
+async def test_authority_context_change_while_upload_card_is_open_prevents_dispatch(app, remote):
     client = make_test_client(app)
     calls = 0
 
@@ -350,9 +352,13 @@ async def test_authority_context_change_while_upload_card_is_open_prevents_dispa
 
 async def test_backend_selected_automatic_upload_has_no_card_or_viewer(served_dir, remote):
     app = create_toy_app(
-        served_dir, token=TOKEN, agent_token=AGENT_TOKEN,
-        session_id=sessions.create_session(served_dir), external_agents=True,
-        auto_approve_included_tools=True, upload_actions=(DATUM,),
+        served_dir,
+        token=TOKEN,
+        agent_token=AGENT_TOKEN,
+        session_id=sessions.create_session(served_dir),
+        external_agents=True,
+        auto_approve_included_tools=True,
+        upload_actions=(DATUM,),
     )
     app.events = []
     app.agent_event_log.observers.append(app.events.append)

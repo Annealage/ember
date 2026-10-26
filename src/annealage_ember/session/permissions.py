@@ -303,7 +303,9 @@ class PermissionBroker:
             if self.automatically_allows(tool_name):
                 return Decision(allow=True)
         except Exception as exc:
-            sys.stderr.write("warning: automatic tool policy failed for %r: %r\n" % (tool_name, exc))
+            sys.stderr.write(
+                "warning: automatic tool policy failed for %r: %r\n" % (tool_name, exc)
+            )
             return Decision(allow=False, message="the included tool policy could not be verified")
         if self._viewer_count == 0 and not (
             action is None
@@ -317,8 +319,7 @@ class PermissionBroker:
                 guard_token = await self._guard_call("capture", tool_name, input_data)
             except Exception as exc:
                 sys.stderr.write(
-                    "warning: failed to capture request authority for %r: %r\n"
-                    % (tool_name, exc)
+                    "warning: failed to capture request authority for %r: %r\n" % (tool_name, exc)
                 )
                 return Decision(
                     allow=False, message="the tool call's authority could not be verified"
@@ -360,9 +361,7 @@ class PermissionBroker:
                 return Decision(allow=False, message=_DENY_EMIT_FAILED_TEMPLATE)
             try:
                 decision = await asyncio.wait_for(future, timeout=self._timeout)
-                return await self._validate_guard(
-                    decision, guard_token, tool_name, input_data
-                )
+                return await self._validate_guard(decision, guard_token, tool_name, input_data)
             except asyncio.TimeoutError:
                 self._outcomes[request_id] = OUTCOME_TIMEOUT
                 return Decision(
@@ -400,8 +399,7 @@ class PermissionBroker:
             valid = await self._guard_call("validate", token, tool_name, input_data)
         except Exception as exc:
             sys.stderr.write(
-                "warning: failed to revalidate request authority for %r: %r\n"
-                % (tool_name, exc)
+                "warning: failed to revalidate request authority for %r: %r\n" % (tool_name, exc)
             )
             valid = False
         if not valid:

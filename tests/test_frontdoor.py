@@ -428,4 +428,11 @@ async def test_an_unmounted_app_is_stopped_gone_from_the_routes_and_its_id_free_
     res = await client.get("/p/a")
     assert res.status_code == 302 and res.headers["Location"] == "/p/a/"
     assert (await client.get("/p/a/")).status_code == 200
-    assert sum(1 for entry in front.app.url_map if entry[2] is not None and entry[1].url_pattern == "/p/a") == 1
+    assert (
+        sum(
+            1
+            for entry in front.app.url_map
+            if entry[2] is not None and entry[1].url_pattern == "/p/a"
+        )
+        == 1
+    )

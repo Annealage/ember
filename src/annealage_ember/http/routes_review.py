@@ -93,7 +93,8 @@ def register_review_routes(app, *, store, auth, recorder=None):
                     comment.id: {
                         "id": notifications.ledger.identity(comment.id),
                         "status": "error",
-                        "error": "Notification status unavailable; saved comment is intact. " + str(exc),
+                        "error": "Notification status unavailable; saved comment is intact. "
+                        + str(exc),
                     }
                     for comment in listing.comments
                     if comment.author == HUMAN and comment.id is not None
@@ -103,9 +104,10 @@ def register_review_routes(app, *, store, auth, recorder=None):
             "anchor_space": store.anchor_space.name,
             "capabilities": store.capabilities.to_wire(),
             "comments": [
-                {**comment.to_wire(), **(
-                    {"notification": delivery[comment.id]} if comment.id in delivery else {}
-                )}
+                {
+                    **comment.to_wire(),
+                    **({"notification": delivery[comment.id]} if comment.id in delivery else {}),
+                }
                 for comment in listing.comments
             ],
         }, 200
@@ -121,15 +123,27 @@ def register_review_routes(app, *, store, auth, recorder=None):
         if error is not None:
             return error
         if not isinstance(data, dict) or set(data) != {"comment_ids"}:
-            return {"ok": False, "error": 'body must be {"comment_ids": [saved comment id, ...]}'}, 400
+            return {
+                "ok": False,
+                "error": 'body must be {"comment_ids": [saved comment id, ...]}',
+            }, 400
         ids = data["comment_ids"]
-        if (not isinstance(ids, list) or not 1 <= len(ids) <= 100
-                or any(type(value) is not int or value < 1 for value in ids)
-                or len(set(ids)) != len(ids)):
-            return {"ok": False, "error": "comment_ids must contain 1 to 100 unique positive integer ids"}, 400
+        if (
+            not isinstance(ids, list)
+            or not 1 <= len(ids) <= 100
+            or any(type(value) is not int or value < 1 for value in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            return {
+                "ok": False,
+                "error": "comment_ids must contain 1 to 100 unique positive integer ids",
+            }, 400
         notifications = getattr(app, "agent_review_notifications", None)
         if notifications is None:
-            return {"ok": False, "error": "No coordinator is attached; start an agent session, then retry notification."}, 409
+            return {
+                "ok": False,
+                "error": "No coordinator is attached; start an agent session, then retry notification.",
+            }, 409
         try:
             return await notifications.notify(sorted(ids), human), 200
         except (ReviewError, OSError) as exc:

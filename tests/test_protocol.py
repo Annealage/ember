@@ -160,9 +160,7 @@ def test_build_hello_round_trips():
 
 def test_build_hello_carries_host_upload_actions():
     actions = [{"name": "review", "label": "Review", "accepts": ["application/pdf"]}]
-    frame = build_hello(
-        7, "sess-1", "sdk-1", "/tmp/proj", "ready", upload_actions=actions
-    )
+    frame = build_hello(7, "sess-1", "sdk-1", "/tmp/proj", "ready", upload_actions=actions)
     assert frame["session"]["upload_actions"] == actions
     assert _roundtrip(frame) == frame
 
@@ -190,9 +188,7 @@ def test_build_hello_carries_backend_reported_runtime_metadata():
         "effort": None,
         "provenance": "assistant_message",
     }
-    frame = build_hello(
-        7, "sess-1", None, "/tmp/proj", "ready", resolved_runtime=runtime
-    )
+    frame = build_hello(7, "sess-1", None, "/tmp/proj", "ready", resolved_runtime=runtime)
 
     assert frame["session"]["resolved_runtime"] == runtime
     assert _roundtrip(frame) == frame

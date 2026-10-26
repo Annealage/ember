@@ -454,7 +454,9 @@ class SdkSession:
                 if self._closing or self._interrupt_epoch != interrupt_epoch:
                     completion.set_result(None)
                     self._emit(TurnEnd(turn=self._turn, stop_reason="not_sent", cost_usd=None))
-                    raise RuntimeError("SDK automated prompt was stopped before submission; not sent")
+                    raise RuntimeError(
+                        "SDK automated prompt was stopped before submission; not sent"
+                    )
                 submission_started = True
                 try:
                     await self._client.query(
@@ -1425,7 +1427,9 @@ class SdkSession:
         delta = event.get("delta") or {}
         if delta.get("type") == "thinking_delta":
             text = delta.get("thinking")
-            thought = self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            thought = (
+                self._thinking_budget.take(self._turn, text) if isinstance(text, str) else None
+            )
             if thought is not None:
                 self._emit(thought)
             return

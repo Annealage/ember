@@ -43,8 +43,8 @@ invoice; the proxy remains the authoritative meter.
 import asyncio
 import collections
 import hashlib
-import re
 import math
+import re
 import sys
 import threading
 import unicodedata
@@ -390,9 +390,7 @@ def usage_event(
 ) -> dict:
     """Build one positional request-local usage observation."""
     conversation_id = str(conversation_id or session_id)
-    event_id = "%s:%s:%s:%s:%s" % (
-        session_id, conversation_id, usage_epoch, turn_index, request_n
-    )
+    event_id = "%s:%s:%s:%s:%s" % (session_id, conversation_id, usage_epoch, turn_index, request_n)
     raw_cost = cost_usd
     if (
         isinstance(raw_cost, (int, float))

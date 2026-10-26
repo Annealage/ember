@@ -19,8 +19,8 @@ adding anything to the question of what this layer does with the frame.
 import json
 
 import pytest
-from annealage_ember import protocol
 
+from annealage_ember import protocol
 from annealage_ember.http import ws as ws_module
 from annealage_ember.session.fake import FakeSession
 
@@ -58,7 +58,13 @@ def _frame(model="claude-haiku-5"):
 async def _dispatch(session, frame, *, browser_runtime_controls=True):
     sock = RecordingSocket()
     await ws_module._dispatch(
-        sock, _Conn(), StubRegistry(), None, "tok", frame, session,
+        sock,
+        _Conn(),
+        StubRegistry(),
+        None,
+        "tok",
+        frame,
+        session,
         browser_runtime_controls=browser_runtime_controls,
     )
     return sock.sent
@@ -105,7 +111,12 @@ async def test_restricted_model_frame_is_refused_before_resuming_the_session():
     sock = IncomingSocket(_frame())
     with pytest.raises(ConnectionError, match="end test connection"):
         await ws_module._serve_connection(
-            sock, _Conn(), StubRegistry(), None, "tok", holder,
+            sock,
+            _Conn(),
+            StubRegistry(),
+            None,
+            "tok",
+            holder,
             browser_runtime_controls=False,
         )
     assert holder.ensure_calls == 0

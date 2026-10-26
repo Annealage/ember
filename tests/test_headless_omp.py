@@ -190,7 +190,10 @@ async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
         "high",
     )
 
-async def test_an_explicit_omp_session_dir_is_where_omp_keeps_the_conversation(omp_client, tmp_path):
+
+async def test_an_explicit_omp_session_dir_is_where_omp_keeps_the_conversation(
+    omp_client, tmp_path
+):
     usage = tmp_path / "usage"
     usage.mkdir()
     omp_client.script = lambda client: client.end()
@@ -210,15 +213,13 @@ async def test_model_role_uses_omp_alias_and_reports_backend_model(
 
     result = await run_prompt(
         "do it",
-        **make_args(
-            tmp_path, model=None, model_role=model_role, on_runtime=runtime.append
-        ),
+        **make_args(tmp_path, model=None, model_role=model_role, on_runtime=runtime.append),
     )
 
     assert result.error is None
     (client,) = omp_client.instances
     assert client.kwargs["model"] == "@%s" % model_role
-    event, = runtime
+    (event,) = runtime
     assert (event.provider, event.model) == ("configured", "actual-model")
     assert (event.requested_role, event.resolved_role) == (model_role, model_role)
     assert event.provenance == "get_state"
@@ -239,9 +240,7 @@ async def test_only_preflight_failure_for_the_requested_role_is_fallback_safe(
     omp_client.start_error = start_error
     omp_client.stderr_output = stderr
 
-    result = await run_prompt(
-        "do it", **make_args(tmp_path, model=None, model_role="smol")
-    )
+    result = await run_prompt("do it", **make_args(tmp_path, model=None, model_role="smol"))
 
     assert result.role_resolution_error is expected
     assert result.calls == ()
@@ -280,7 +279,9 @@ async def test_provider_affinity_and_cache_retention_reach_omp(omp_client, tmp_p
     assert os.environ["PI_CACHE_RETENTION"] == "short"
 
 
-async def test_default_cache_retention_leaves_child_override_unset(omp_client, tmp_path, monkeypatch):
+async def test_default_cache_retention_leaves_child_override_unset(
+    omp_client, tmp_path, monkeypatch
+):
     monkeypatch.setenv("PI_CACHE_RETENTION", "short")
     omp_client.script = lambda client: client.end()
     await run_prompt("do it", **make_args(tmp_path))
@@ -726,16 +727,29 @@ class DurableRpcClient(FakeRpcClient):
         self.abort_message()
 
     def abort_message(
-        self, *, stop_reason="aborted", reason="aborted",
-        error="Interrupted by user", terminal=True,
+        self,
+        *,
+        stop_reason="aborted",
+        reason="aborted",
+        error="Interrupted by user",
+        terminal=True,
     ):
         message = {
-            "role": "assistant", "stopReason": stop_reason, "errorMessage": error,
-            "provider": "anthropic", "model": "claude-sonnet-5-5",
+            "role": "assistant",
+            "stopReason": stop_reason,
+            "errorMessage": error,
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
         }
-        self._listeners["message_update"](SimpleNamespace(assistant_message_event={
-            "type": "error", "reason": reason, "error": message,
-        }))
+        self._listeners["message_update"](
+            SimpleNamespace(
+                assistant_message_event={
+                    "type": "error",
+                    "reason": reason,
+                    "error": message,
+                }
+            )
+        )
         self._listeners["message_end"](SimpleNamespace(message=message))
         if terminal:
             self.end()
@@ -757,13 +771,19 @@ async def test_native_timeout_recovery_uses_one_client_and_conversation(
             client.end()
 
     omp_client.script = script
-    result = await run_prompt("original", **make_args(
-        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.05,
-        interrupt_timeout=1, max_timeout_recoveries=1,
-        on_timeout=lambda context: contexts.append(context) or "diagnose",
-        on_turn_result=lambda turn: "continue" if turn.text == "clear_path" else None,
-    ))
-    client, = omp_client.instances
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            state_dir=tmp_path / "conversation",
+            work_timeout=0.05,
+            interrupt_timeout=1,
+            max_timeout_recoveries=1,
+            on_timeout=lambda context: contexts.append(context) or "diagnose",
+            on_turn_result=lambda turn: "continue" if turn.text == "clear_path" else None,
+        ),
+    )
+    (client,) = omp_client.instances
     assert client.messages == ["original", "diagnose", "continue"]
     assert client.aborts == 1 and client.switches == []
     assert contexts[0].interruption == "safe" and result.text == "finished"
@@ -777,23 +797,39 @@ async def test_native_explicit_resume_switches_before_new_input_and_keeps_usage_
     reports = []
 
     def script(client):
-        client._listeners["message_end"](SimpleNamespace(message={
-            "role": "assistant", "model": client.model.id, "provider": client.model.provider,
-            "responseId": "possibly-repeated-id",
-            "usage": {"input": 5, "output": 3, "cost": {"total": 0.01}},
-        }))
+        client._listeners["message_end"](
+            SimpleNamespace(
+                message={
+                    "role": "assistant",
+                    "model": client.model.id,
+                    "provider": client.model.provider,
+                    "responseId": "possibly-repeated-id",
+                    "usage": {"input": 5, "output": 3, "cost": {"total": 0.01}},
+                }
+            )
+        )
         client.end()
 
     omp_client.script = script
     state_dir = tmp_path / "conversation"
-    first = await run_prompt("original", **make_args(
-        tmp_path, state_dir=state_dir, usage_sink=reports.append,
-    ))
+    first = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            state_dir=state_dir,
+            usage_sink=reports.append,
+        ),
+    )
     second = await run_prompt(
-        "explicit new turn", **make_args(
-            tmp_path, state_dir=state_dir, resume=True, usage_sink=reports.append,
-            model="openai-codex/gpt-6.1-sol", thinking="low",
-        )
+        "explicit new turn",
+        **make_args(
+            tmp_path,
+            state_dir=state_dir,
+            resume=True,
+            usage_sink=reports.append,
+            model="openai-codex/gpt-6.1-sol",
+            thinking="low",
+        ),
     )
     original, resumed = omp_client.instances
     assert resumed.switches == [first.recovery.conversation_file]
@@ -823,9 +859,14 @@ async def test_native_resume_failure_never_submits_into_fresh_conversation(
         return SimpleNamespace(cancelled=failure == "cancelled")
 
     monkeypatch.setattr(DurableRpcClient, "switch_session", refuse)
-    second = await run_prompt("must not run", **make_args(
-        tmp_path, state_dir=state_dir, resume=True,
-    ))
+    second = await run_prompt(
+        "must not run",
+        **make_args(
+            tmp_path,
+            state_dir=state_dir,
+            resume=True,
+        ),
+    )
     assert second.error is not None
     assert omp_client.instances[-1].messages == []
     assert Path(first.recovery.conversation_file).read_text() == "original\n"
@@ -842,10 +883,15 @@ async def test_native_prompt_rpc_timeout_is_not_provider_work_timeout(
 
     monkeypatch.setattr(FakeRpcClient, "prompt", prompt)
     contexts = []
-    result = await run_prompt("original", **make_args(
-        tmp_path, on_timeout=lambda context: contexts.append(context) or "never retry",
-        work_timeout=1, max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            on_timeout=lambda context: contexts.append(context) or "never retry",
+            work_timeout=1,
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.timeout_kind == "rpc_request_timeout"
     assert contexts[0].kind == "rpc_request_timeout" and contexts[0].rpc_operation == "prompt"
     assert result.error is not None and len(omp_client.instances) == 1
@@ -878,12 +924,18 @@ async def test_owned_native_abort_errors_are_expected_only_after_acknowledgement
     monkeypatch.setattr(DurableRpcClient, "abort", abort)
     monkeypatch.setattr(omp_module.OmpSession, "interrupt_for_timeout", interrupt)
     omp_client.script = script
-    result = await run_prompt("original", **make_args(
-        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.03,
-        interrupt_timeout=1, max_timeout_recoveries=1,
-        on_timeout=lambda context: contexts.append(context) or "diagnose",
-    ))
-    client, = omp_client.instances
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            state_dir=tmp_path / "conversation",
+            work_timeout=0.03,
+            interrupt_timeout=1,
+            max_timeout_recoveries=1,
+            on_timeout=lambda context: contexts.append(context) or "diagnose",
+        ),
+    )
+    (client,) = omp_client.instances
     assert result.error is None and result.text == "original context retained"
     assert client.messages == ["original", "diagnose"] and client.aborts == 1
     assert contexts[0].interruption == "safe"
@@ -902,9 +954,9 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
     def abort(client):
         client.aborts += 1
         client.abort_message(
-            stop_reason="error" if failure == "provider_error" else (
-                None if failure == "unknown_shape" else "aborted"
-            ),
+            stop_reason="error"
+            if failure == "provider_error"
+            else (None if failure == "unknown_shape" else "aborted"),
             reason="error" if failure == "provider_error" else "aborted",
             error="Authentication failed" if failure == "provider_error" else "Interrupted by user",
             terminal=failure != "no_boundary",
@@ -913,12 +965,18 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
             raise RpcTimeoutError("abort acknowledgement expired")
 
     monkeypatch.setattr(DurableRpcClient, "abort", abort)
-    result = await run_prompt("original", **make_args(
-        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.03,
-        interrupt_timeout=0.1, max_timeout_recoveries=1,
-        on_timeout=lambda context: contexts.append(context) or "must not submit",
-    ))
-    client, = omp_client.instances
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            state_dir=tmp_path / "conversation",
+            work_timeout=0.03,
+            interrupt_timeout=0.1,
+            max_timeout_recoveries=1,
+            on_timeout=lambda context: contexts.append(context) or "must not submit",
+        ),
+    )
+    (client,) = omp_client.instances
     assert result.error is not None and client.messages == ["original"]
     assert Path(result.recovery.conversation_file).is_file()
     if failure in ("provider_error", "unknown_shape"):
@@ -933,10 +991,14 @@ async def test_native_abort_without_timeout_ownership_remains_an_error(
     monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
     omp_client.script = lambda client: client.abort_message()
     contexts = []
-    result = await run_prompt("original", **make_args(
-        tmp_path, on_timeout=lambda context: contexts.append(context) or "never retry",
-        max_timeout_recoveries=1,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            on_timeout=lambda context: contexts.append(context) or "never retry",
+            max_timeout_recoveries=1,
+        ),
+    )
     assert "Interrupted by user" in result.error
     assert result.timeout_kind is None and contexts == []
     assert len(omp_client.instances[0].messages) == 1

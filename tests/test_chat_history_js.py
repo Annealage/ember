@@ -11,7 +11,9 @@ from test_chat_js import STATIC
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH")
 
 # Reuse the pane tests' browser globals and DOM, without running their scenarios.
-HARNESS = CHAT_HARNESS.split("const sent = [];")[0] + r"""
+HARNESS = (
+    CHAT_HARNESS.split("const sent = [];")[0]
+    + r"""
 const frames = new Map();
 let nextFrame = 1;
 globalThis.requestAnimationFrame = (fn) => { const id = nextFrame++; frames.set(id, fn); return id; };
@@ -211,6 +213,7 @@ out.lazyReopenedRun = {cards:lazyTools.children.length,sameCard:lazyTools.childr
   open:lazyCard.open,last:lazyTools.children.at(-1).dataset.toolId,formatted};
 console.log(JSON.stringify(out)); process.exit(0);
 """
+)
 
 
 @pytest.fixture(scope="module")
@@ -233,12 +236,21 @@ def test_recent_history_is_batched_and_keeps_only_current_permissions(observed):
 
 def test_scrolling_loads_full_older_turns_and_preserves_reader_inspectors(observed):
     assert observed["scrollRequest"] == {
-        "type": "history", "session_id": "s", "before": 90, "limit": 1, "v": 2,
+        "type": "history",
+        "session_id": "s",
+        "before": 90,
+        "limit": 1,
+        "v": 2,
     }
     assert observed["prepend"] == {
-        "turns": [18, 19, 20, 21, 22, 23], "rows": [18, 19, 20, 21, 22, 23],
-        "scrollTop": 350, "sameGroup": True, "inspector": [True, True, 37],
-        "pending": ["pending"], "banner": None, "running": [23],
+        "turns": [18, 19, 20, 21, 22, 23],
+        "rows": [18, 19, 20, 21, 22, 23],
+        "scrollTop": 350,
+        "sameGroup": True,
+        "inspector": [True, True, 37],
+        "pending": ["pending"],
+        "banner": None,
+        "running": [23],
     }
     assert observed["oldRowUntouched"] is True
     assert observed["oldText"] == "older"
@@ -266,33 +278,50 @@ def test_initial_read_retry_merges_older_deltas_before_live_output(observed):
     assert observed["liveDuringFailure"] == "new"
     assert observed["initialRetryFrame"]["before"] is None
     assert observed["initialRetry"] == {
-        "text": "oldnew", "pending": ["waiting"], "model": "current", "usage": 2,
+        "text": "oldnew",
+        "pending": ["waiting"],
+        "model": "current",
+        "usage": 2,
     }
 
 
 def test_long_collapsed_runs_do_not_materialize_cards_or_format_payloads(observed):
     assert observed["lazyCollapsed"] == {
-        "cards": 0, "formatted": 0, "summary": "300 tool calls · 1 failed",
+        "cards": 0,
+        "formatted": 0,
+        "summary": "300 tool calls · 1 failed",
     }
     assert observed["lazyRunOpen"] == {
-        "cards": 300, "formatted": 0, "summariesOnly": True,
+        "cards": 300,
+        "formatted": 0,
+        "summariesOnly": True,
         "order": [f"lazy-{i}" for i in range(300)],
     }
     assert observed["lazyCardOpen"] == {
-        "formatted": 1, "children": 3, "resultLength": 100000,
+        "formatted": 1,
+        "children": 3,
+        "resultLength": 100000,
     }
 
 
 def test_lazy_disclosures_keep_identity_live_results_and_reading_state(observed):
     assert observed["lazyLiveResult"] == {
-        "sameCard": True, "open": True, "formatted": 1,
-        "result": "live result", "scroll": [77, 31, 75],
+        "sameCard": True,
+        "open": True,
+        "formatted": 1,
+        "result": "live result",
+        "scroll": [77, 31, 75],
     }
     assert observed["lazyClosedResult"] == "live result"
     assert observed["lazyReopenedResult"] == "deferred result"
     assert observed["lazyClosedRunUpdate"] == {
-        "cards": 300, "summary": "301 tool calls · 1 running · 1 failed",
+        "cards": 300,
+        "summary": "301 tool calls · 1 running · 1 failed",
     }
     assert observed["lazyReopenedRun"] == {
-        "cards": 301, "sameCard": True, "open": True, "last": "lazy-300", "formatted": 1,
+        "cards": 301,
+        "sameCard": True,
+        "open": True,
+        "last": "lazy-300",
+        "formatted": 1,
     }

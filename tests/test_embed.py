@@ -2,8 +2,8 @@
 there, nothing in it needs an inline script or style, and the prefix and
 frame policy are what a product mounting it relies on."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 
@@ -13,14 +13,21 @@ STATIC = Path(embed.__file__).resolve().parent / "static"
 # Looked up by other modules than the pane (pause, settings, ui, ws) or by the
 # bootstrap itself.
 PAGE_LEVEL = {
-    "pauseBtn", "settingsBtn", "settingsModal", "toast", "err", "connIndicator",
-    "chatWorkingTime", "chatMore", "sessionStart",
+    "pauseBtn",
+    "settingsBtn",
+    "settingsModal",
+    "toast",
+    "err",
+    "connIndicator",
+    "chatWorkingTime",
+    "chatMore",
+    "sessionStart",
 }
 
 
 def pane_ids():
     source = (STATIC / "chat.js").read_text(encoding="utf-8")
-    block = source[source.index("export const DEFAULT_IDS"):]
+    block = source[source.index("export const DEFAULT_IDS") :]
     return set(re.findall(r':\s*"([A-Za-z]+)"', block[: block.index("});")]))
 
 
@@ -42,7 +49,9 @@ def test_a_pane_without_a_model_control_drops_only_that_row():
 
 
 def test_the_page_needs_no_inline_script_or_style():
-    page = embed.render_agent_page(product="x", title="X", hosted=True, session_url="/p/a/agent/session")
+    page = embed.render_agent_page(
+        product="x", title="X", hosted=True, session_url="/p/a/agent/session"
+    )
     assert not re.search(r"<script\b(?![^>]*\bsrc=)[^>]*>", page)
     assert not re.search(r"<style\b|\sstyle=", page)
     assert "'unsafe-inline'" not in embed.agent_page_csp()
@@ -51,13 +60,21 @@ def test_the_page_needs_no_inline_script_or_style():
 
 def test_assets_are_linked_under_the_mount_prefix_and_theme_order_is_kept():
     page = embed.render_agent_page(
-        product="x", title="X", url_prefix="/p/demo/", scripts=["/s/scheme.js"],
-        tokens=["/s/tokens.css"], stylesheets=["/s/theme.css"],
+        product="x",
+        title="X",
+        url_prefix="/p/demo/",
+        scripts=["/s/scheme.js"],
+        tokens=["/s/tokens.css"],
+        stylesheets=["/s/theme.css"],
     )
     hrefs = re.findall(r'(?:href|src)="([^"]+)"', page)
     assert hrefs == [
-        "/s/scheme.js", "/s/tokens.css", "/p/demo/agent/static/agent.css",
-        "/p/demo/agent/static/agent-page.css", "/s/theme.css", "/p/demo/agent/static/agent-page.js",
+        "/s/scheme.js",
+        "/s/tokens.css",
+        "/p/demo/agent/static/agent.css",
+        "/p/demo/agent/static/agent-page.css",
+        "/s/theme.css",
+        "/p/demo/agent/static/agent-page.js",
     ]
 
 
@@ -68,7 +85,10 @@ def test_a_page_with_its_own_entry_replaces_the_shared_one():
 
 def test_hosted_configuration_is_data_on_the_pane_and_escaped():
     page = embed.render_agent_page(
-        product='x"y', title="<b>", hosted=True, session_url='/p/a"b/agent/session',
+        product='x"y',
+        title="<b>",
+        hosted=True,
+        session_url='/p/a"b/agent/session',
     )
     assert 'data-ember-hosted="true"' in page
     assert 'data-ember-session-url="/p/a&quot;b/agent/session"' in page

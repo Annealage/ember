@@ -38,6 +38,7 @@ provider key variables in the environment (``AMBIENT_CREDENTIAL_ENV``; omp would
 use them, so a worker must not carry them). The list is the known names, not a
 proof that nothing else in the environment is a credential.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -92,21 +93,29 @@ class HostedProfile:
 
 def refuse_ambient_credentials(env: Optional[Mapping[str, str]] = None) -> None:
     """Raise when ``env`` (default ``os.environ``) holds a credential variable omp would use."""
-    present = [name for name in AMBIENT_CREDENTIAL_ENV if (os.environ if env is None else env).get(name)]
+    present = [
+        name for name in AMBIENT_CREDENTIAL_ENV if (os.environ if env is None else env).get(name)
+    ]
     if present:
-        raise HostedProfileError("a hosted worker must not carry credentials in its environment: " + ", ".join(present))
+        raise HostedProfileError(
+            "a hosted worker must not carry credentials in its environment: " + ", ".join(present)
+        )
 
 
 def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def auth_file_from_env(env: Optional[Mapping[str, str]] = None, *, mount: Union[str, Path] = AUTH_MOUNT) -> Path:
+def auth_file_from_env(
+    env: Optional[Mapping[str, str]] = None, *, mount: Union[str, Path] = AUTH_MOUNT
+) -> Path:
     """The mounted auth file named by ``ANNEALAGE_OMP_AUTH_FILE``, resolved; ``HostedProfileError`` unless it is
     set, absolute, an existing regular file, and (symlinks resolved) inside ``mount``."""
     value = (os.environ if env is None else env).get(AUTH_FILE_ENV, "").strip()
     if not value:
-        raise HostedProfileError(f"{AUTH_FILE_ENV} is not set; a hosted run has no other credential source")
+        raise HostedProfileError(
+            f"{AUTH_FILE_ENV} is not set; a hosted run has no other credential source"
+        )
     path = Path(value)
     if not path.is_absolute():
         raise HostedProfileError(f"{AUTH_FILE_ENV} must be an absolute path")
@@ -141,7 +150,9 @@ def models_file_from_env(
     resolved = path.resolve()
     roots = [Path(mount).resolve()] + ([Path(models_mount).resolve()] if models_mount else [])
     if not any(_inside(resolved, root) for root in roots):
-        raise HostedProfileError(f"{MODELS_FILE_ENV} is outside the mounts " + ", ".join(map(str, roots)))
+        raise HostedProfileError(
+            f"{MODELS_FILE_ENV} is outside the mounts " + ", ".join(map(str, roots))
+        )
     if not resolved.is_file():
         raise HostedProfileError(f"{MODELS_FILE_ENV} is not an existing file")
     return resolved

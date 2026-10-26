@@ -140,8 +140,13 @@ async def test_every_discovered_capability_runs_without_an_approval_card(fake, t
     tools = _tools(tmp_path, fake.url)
     proxied = tools.remote_tables()["ds-wiki"]
     names = {
-        *LOOKUPS, *WRITES, *VIEWS, *FORMERLY_DENIED,
-        "new_read_tool", "new_write_tool", "brand_new_tool",
+        *LOOKUPS,
+        *WRITES,
+        *VIEWS,
+        *FORMERLY_DENIED,
+        "new_read_tool",
+        "new_write_tool",
+        "brand_new_tool",
     }
     # The HTTP server reveals these capabilities only after getting_started.
     assert fake.calls == [("getting_started", {})]
@@ -267,7 +272,6 @@ async def test_request_and_polling_tools_run_without_approval(fake, tmp_path, na
     assert fake.calls[-1] == (name, arguments)
 
 
-
 def test_datum_upload_action_requires_an_exact_source_url():
     action = datum.upload_action("some-tag")
     assert isinstance(action, uploads.UploadAction)
@@ -285,7 +289,12 @@ def test_datum_upload_action_requires_an_exact_source_url():
     prefix = "https://manufacturer.example/"
     boundary = prefix + "x" * (2048 - len(prefix))
     assert uploads.call_args(action, None, None, source_url=boundary)["original_url"] == boundary
-    for invalid in (None, "file:///tmp/part.pdf", "https://", "https://maker.example/" + "x" * 2040):
+    for invalid in (
+        None,
+        "file:///tmp/part.pdf",
+        "https://",
+        "https://maker.example/" + "x" * 2040,
+    ):
         with pytest.raises(ValueError, match="original absolute HTTP"):
             uploads.call_args(action, None, None, source_url=invalid)
 

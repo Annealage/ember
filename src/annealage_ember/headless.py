@@ -190,6 +190,7 @@ class ToolSet:
                 "in the set are granted" % name
             )
 
+
 @dataclasses.dataclass(frozen=True)
 class RecoveryInfo:
     """Observed recovery capability, never a promise that a file is complete.
@@ -223,7 +224,6 @@ class TimeoutContext:
     interruption: str
     recovery: RecoveryInfo
     rpc_operation: Optional[str] = None
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -414,13 +414,20 @@ class _Run:
         elif isinstance(event, ToolUse):
             name = event.name
             if name.startswith(self._prefix):
-                name = name[len(self._prefix):]
-            activity = {"kind": "tool_use", "name": name,
-                        "tool_use_id": event.tool_use_id, "turn": event.turn}
+                name = name[len(self._prefix) :]
+            activity = {
+                "kind": "tool_use",
+                "name": name,
+                "tool_use_id": event.tool_use_id,
+                "turn": event.turn,
+            }
         elif isinstance(event, ToolResult):
             if not self._completed or event.tool_use_id in self._by_id:
-                activity = {"kind": "tool_result", "tool_use_id": event.tool_use_id,
-                            "is_error": event.is_error}
+                activity = {
+                    "kind": "tool_result",
+                    "tool_use_id": event.tool_use_id,
+                    "is_error": event.is_error,
+                }
         if activity is not None and self._on_activity is not None:
             try:
                 self._on_activity(activity)
@@ -463,7 +470,8 @@ class _Run:
             message = (event.stderr or event.remediation or "").strip()
             errors = (
                 self._timeout_interrupt_errors
-                if event.interruption_reason == "host_timeout_abort" else self.errors
+                if event.interruption_reason == "host_timeout_abort"
+                else self.errors
             )
             if message and message not in errors:
                 errors.append(message)
@@ -523,28 +531,38 @@ class _Run:
             return current
         turns = [*self._completed, current]
         token_keys = {key for turn in turns for key in (turn.tokens or {})}
-        tokens = {
-            key: (
-                sum(turn.tokens[key] for turn in turns)
-                if all(turn.tokens is not None and turn.tokens.get(key) is not None for turn in turns)
-                else None
-            )
-            for key in token_keys
-        } if token_keys else None
+        tokens = (
+            {
+                key: (
+                    sum(turn.tokens[key] for turn in turns)
+                    if all(
+                        turn.tokens is not None and turn.tokens.get(key) is not None
+                        for turn in turns
+                    )
+                    else None
+                )
+                for key in token_keys
+            }
+            if token_keys
+            else None
+        )
         return dataclasses.replace(
             current,
             cost_usd=(
                 sum(turn.cost_usd for turn in turns)
-                if all(turn.cost_usd is not None for turn in turns) else None
+                if all(turn.cost_usd is not None for turn in turns)
+                else None
             ),
             tokens=tokens,
             calls=tuple(call for turn in turns for call in turn.calls),
             tool_errors=tuple(item for turn in turns for item in turn.tool_errors),
             native_num_turns=(
                 sum(turn.native_num_turns for turn in turns)
-                if all(turn.native_num_turns is not None for turn in turns) else None
+                if all(turn.native_num_turns is not None for turn in turns)
+                else None
             ),
         )
+
 
 def _check_arguments(
     prompt,
@@ -620,18 +638,27 @@ def _check_arguments(
         if backend != "omp":
             raise ValueError("model_role is currently supported only with backend='omp'")
     if max_budget_usd is not None:
-        if (backend != "claude" or isinstance(max_budget_usd, bool)
-                or not isinstance(max_budget_usd, (int, float))
-                or not math.isfinite(max_budget_usd) or max_budget_usd <= 0):
+        if (
+            backend != "claude"
+            or isinstance(max_budget_usd, bool)
+            or not isinstance(max_budget_usd, (int, float))
+            or not math.isfinite(max_budget_usd)
+            or max_budget_usd <= 0
+        ):
             raise ValueError("max_budget_usd requires a finite positive Claude-native budget")
     if native_max_turns is not None:
-        if (backend != "claude" or isinstance(native_max_turns, bool)
-                or not isinstance(native_max_turns, int) or native_max_turns <= 0):
+        if (
+            backend != "claude"
+            or isinstance(native_max_turns, bool)
+            or not isinstance(native_max_turns, int)
+            or native_max_turns <= 0
+        ):
             raise ValueError("native_max_turns requires a positive integer and backend='claude'")
     levels = BACKEND_THINKING_LEVELS[backend]
     if thinking is not None and thinking not in levels:
         raise ValueError(
-            "thinking must be one of %s or None for %s, not %r" % (", ".join(levels), backend, thinking)
+            "thinking must be one of %s or None for %s, not %r"
+            % (", ".join(levels), backend, thinking)
         )
     if isinstance(builtin_tools, (str, bytes)) or not isinstance(builtin_tools, (list, tuple)):
         raise ValueError("builtin_tools must be a list or tuple of tool names")
@@ -645,9 +672,15 @@ def _check_arguments(
                 )
         if len(set(builtin_tools)) != len(builtin_tools):
             raise ValueError("builtin_tools names a tool twice")
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or timeout <= 0):
-        raise ValueError("timeout must be a finite number of seconds greater than 0, not %r" % (timeout,))
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError(
+            "timeout must be a finite number of seconds greater than 0, not %r" % (timeout,)
+        )
     if omp_request_timeout is not None:
         if backend != "omp":
             raise ValueError("omp_request_timeout is only supported with backend='omp'")
@@ -742,6 +775,7 @@ def _build_session(
         )
 
     from .session.sdk import SdkSession
+
     return SdkSession(
         on_event,
         cwd=cwd,
@@ -778,11 +812,21 @@ async def _timeout_callback(callback, context):
 
 
 async def _drive(
-    session, run: _Run, prompt: str, on_turn_result, max_followups: int, *,
-    work_timeout=None, interrupt_timeout=10, on_timeout=None,
-    max_timeout_recoveries=0, timeout_context=None, deadline=float("inf"),
+    session,
+    run: _Run,
+    prompt: str,
+    on_turn_result,
+    max_followups: int,
+    *,
+    work_timeout=None,
+    interrupt_timeout=10,
+    on_timeout=None,
+    max_timeout_recoveries=0,
+    timeout_context=None,
+    deadline=float("inf"),
 ) -> None:
     """Drive bounded turns without replacing the session or replaying tools."""
+
     async def deadline_gate():
         if run.over:
             raise asyncio.CancelledError
@@ -799,7 +843,9 @@ async def _drive(
                 await session.start()
             await deadline_gate()
             if run.over or session.agent_status() != AGENT_READY:
-                run._stopped("the agent did not start" if start else "the agent stopped before follow-up")
+                run._stopped(
+                    "the agent did not start" if start else "the agent stopped before follow-up"
+                )
                 return
             if run.reserve_turn is not None:
                 run.reserve_turn()
@@ -820,8 +866,16 @@ async def _drive(
             return
         await run.settle_tools()
 
-    ordinary = {"end", "end_turn", "success", "stop", "stop_sequence",
-                "max_tokens", "length", "ended_by_tool"}
+    ordinary = {
+        "end",
+        "end_turn",
+        "success",
+        "stop",
+        "stop_sequence",
+        "max_tokens",
+        "length",
+        "ended_by_tool",
+    }
     submission = asyncio.ensure_future(submit(prompt, start=True))
     settled = None
     followups = recoveries = 0
@@ -839,8 +893,11 @@ async def _drive(
                 interrupt = getattr(session, "interrupt_for_timeout", None)
                 outcome = "unsupported" if interrupt is None else "unsafe"
                 if interrupt is not None:
+
                     async def stop_and_settle(
-                        interrupt=interrupt, settled=settled, submission=submission,
+                        interrupt=interrupt,
+                        settled=settled,
+                        submission=submission,
                     ):
                         # A host write may already have committed. Let its
                         # result enter the native conversation BEFORE abort,
@@ -856,7 +913,9 @@ async def _drive(
                         await asyncio.shield(submission)
                         await asyncio.shield(settled)
                         return (
-                            not run.over and not run.error() and not run._pending_calls
+                            not run.over
+                            and not run.error()
+                            and not run._pending_calls
                             and session.agent_status() == AGENT_READY
                             and run.stop_reason in ordinary | {"interrupted", "aborted"}
                         )
@@ -872,9 +931,9 @@ async def _drive(
                                 pass
                     finally:
                         await _cancelled(stopping)
-                if (run.errors or (
+                if run.errors or (
                     run.finished and run.stop_reason not in ordinary | {"interrupted", "aborted"}
-                )):
+                ):
                     return
                 await deadline_gate()
                 run.timeout_kind = "work_interval"
@@ -882,9 +941,14 @@ async def _drive(
                     on_timeout, timeout_context("work_interval", outcome)
                 )
                 await deadline_gate()
-                if (outcome != "safe" or diagnostic is None
-                        or recoveries >= max_timeout_recoveries or run.over or run.error()
-                        or session.agent_status() != AGENT_READY):
+                if (
+                    outcome != "safe"
+                    or diagnostic is None
+                    or recoveries >= max_timeout_recoveries
+                    or run.over
+                    or run.error()
+                    or session.agent_status() != AGENT_READY
+                ):
                     run.stop_reason = "timeout"
                     if not run.error():
                         run.errors.append("timeout")
@@ -951,12 +1015,16 @@ class _ConversationState:
         if resume:
             try:
                 self.data = json.loads(read_fixed_file(self.path, self.manifest.name))
-                if (self.data["version"] != 1 or self.data["backend"] != backend
-                        or self.data["cwd"] != os.path.realpath(cwd)
-                        or type(self.data["turn"]) is not int or self.data["turn"] < 0
-                        or not isinstance(self.data["session_id"], str)
-                        or not self.data["session_id"].startswith("headless-")
-                        or not isinstance(self.data["conversation_file"], str)):
+                if (
+                    self.data["version"] != 1
+                    or self.data["backend"] != backend
+                    or self.data["cwd"] != os.path.realpath(cwd)
+                    or type(self.data["turn"]) is not int
+                    or self.data["turn"] < 0
+                    or not isinstance(self.data["session_id"], str)
+                    or not self.data["session_id"].startswith("headless-")
+                    or not isinstance(self.data["conversation_file"], str)
+                ):
                     raise ValueError("incompatible headless state")
                 conversation = Path(self.data["conversation_file"])
                 conversation.resolve().relative_to((self.path / "omp").resolve())
@@ -968,9 +1036,12 @@ class _ConversationState:
             if durable and self.manifest.exists():
                 raise ValueError("state_dir already contains a run; use resume=True explicitly")
             self.data = {
-                "version": 1, "backend": backend, "cwd": os.path.realpath(cwd),
+                "version": 1,
+                "backend": backend,
+                "cwd": os.path.realpath(cwd),
                 "session_id": "headless-%s" % secrets.token_hex(8),
-                "turn": 0, "conversation_file": None,
+                "turn": 0,
+                "conversation_file": None,
             }
             self.save()
 
@@ -1019,8 +1090,7 @@ def _conversation_state(state_dir, *, resume, backend, cwd):
             fd = os.open(lock_path, flags, 0o600)
             lock = stack.enter_context(os.fdopen(fd, "a+b"))
             info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or info.st_uid != os.geteuid()):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
                 raise ValueError("headless lock is not privately owned")
             os.fchmod(fd, 0o600)
             try:
@@ -1259,13 +1329,20 @@ async def run_prompt(
     for name, value in (("work_timeout", work_timeout), ("interrupt_timeout", interrupt_timeout)):
         if value is None and name == "work_timeout":
             continue
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value) or value <= 0):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
             raise ValueError("%s must be a finite positive number of seconds" % name)
     if on_timeout is not None and not callable(on_timeout):
         raise ValueError("on_timeout must be a callable taking one TimeoutContext")
-    if (isinstance(max_timeout_recoveries, bool) or not isinstance(max_timeout_recoveries, int)
-            or max_timeout_recoveries < 0):
+    if (
+        isinstance(max_timeout_recoveries, bool)
+        or not isinstance(max_timeout_recoveries, int)
+        or max_timeout_recoveries < 0
+    ):
         raise ValueError("max_timeout_recoveries must be a nonnegative integer")
     if not isinstance(resume, bool):
         raise ValueError("resume must be a bool")
@@ -1280,8 +1357,12 @@ async def run_prompt(
 
     with _conversation_state(state_dir, resume=resume, backend=backend, cwd=cwd) as state:
         bus = ViewerBus(ViewerRegistry(), url="")
-        run = _Run(namespaced(product.current().mcp_server_name, ""),
-                   on_runtime=on_runtime, on_activity=on_activity)
+        run = _Run(
+            namespaced(product.current().mcp_server_name, ""),
+            on_runtime=on_runtime,
+            on_activity=on_activity,
+        )
+
         def recovery_info():
             return RecoveryInfo(
                 backend=backend,
@@ -1297,11 +1378,13 @@ async def run_prompt(
             return TimeoutContext(
                 kind=kind,
                 result=(
-                    run.turn_result() if kind == "rpc_request_timeout"
+                    run.turn_result()
+                    if kind == "rpc_request_timeout"
                     else run.turn_result(stop_reason="timeout", error="timeout")
                 ),
                 elapsed=elapsed,
-                remaining=max(0, timeout - elapsed), interruption=interruption,
+                remaining=max(0, timeout - elapsed),
+                interruption=interruption,
                 recovery=recovery_info(),
                 rpc_operation=getattr(run.session, "last_request_timeout", None),
             )
@@ -1368,9 +1451,15 @@ async def run_prompt(
 
             task = asyncio.ensure_future(
                 _drive(
-                    session, run, prompt, on_turn_result, max_followups,
-                    work_timeout=work_timeout, interrupt_timeout=interrupt_timeout,
-                    on_timeout=on_timeout, max_timeout_recoveries=max_timeout_recoveries,
+                    session,
+                    run,
+                    prompt,
+                    on_turn_result,
+                    max_followups,
+                    work_timeout=work_timeout,
+                    interrupt_timeout=interrupt_timeout,
+                    on_timeout=on_timeout,
+                    max_timeout_recoveries=max_timeout_recoveries,
                     timeout_context=timeout_context,
                     deadline=started + timeout,
                 )
@@ -1392,7 +1481,9 @@ async def run_prompt(
                     await _cancelled(task)
                     if on_timeout is not None and task.done():
                         observer = asyncio.ensure_future(
-                            _timeout_callback(on_timeout, timeout_context("hard_deadline", "not_attempted"))
+                            _timeout_callback(
+                                on_timeout, timeout_context("hard_deadline", "not_attempted")
+                            )
                         )
                         try:
                             await asyncio.wait({observer}, timeout=interrupt_timeout)
@@ -1415,9 +1506,7 @@ async def run_prompt(
                 # or a callback's deliberately bounded cancellation handler.
                 if not driver_cancelled:
                     await _cancelled(task)
-                await _close(
-                    session, kill=unfinished or run.timeout_kind is not None or run.paused
-                )
+                await _close(session, kill=unfinished or run.timeout_kind is not None or run.paused)
                 if backend != "claude" and on_owner is not None and owner_context is not None:
                     try:
                         on_owner({"event": "native_termination", "outcome": "unverified"})

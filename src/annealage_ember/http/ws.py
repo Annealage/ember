@@ -403,17 +403,21 @@ async def _greet(ws, event_log, token, session_id=None):
             try:
                 page = await event_log.history_async(limit=recent)
             except ValueError as exc:
-                await ws.send(json.dumps(protocol.build_history_page(
-                    session_id, fallback, initial=True
-                )))
-                await ws.send(json.dumps(protocol.build_history_error(
-                    session_id, None, str(exc), initial=True, through=position
-                )))
+                await ws.send(
+                    json.dumps(protocol.build_history_page(session_id, fallback, initial=True))
+                )
+                await ws.send(
+                    json.dumps(
+                        protocol.build_history_error(
+                            session_id, None, str(exc), initial=True, through=position
+                        )
+                    )
+                )
             else:
                 position = page.through
-                await ws.send(json.dumps(protocol.build_history_page(
-                    session_id, page, initial=True
-                )))
+                await ws.send(
+                    json.dumps(protocol.build_history_page(session_id, page, initial=True))
+                )
         told = False
         while True:
             replay = await event_log.replay_async(position)
@@ -533,9 +537,11 @@ async def _serve_connection(
                 continue
         if kind == "set_model" and not browser_runtime_controls:
             await ws.send(
-                json.dumps(protocol.build_refused(
-                    "model selection is configured by the operator, not in the browser"
-                ))
+                json.dumps(
+                    protocol.build_refused(
+                        "model selection is configured by the operator, not in the browser"
+                    )
+                )
             )
             continue
         if kind in _AGENT_FRAMES:
@@ -560,13 +566,30 @@ async def _serve_connection(
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
         await _dispatch(
-            ws, conn, registry, event_log, token, frame, session, bus, records,
+            ws,
+            conn,
+            registry,
+            event_log,
+            token,
+            frame,
+            session,
+            bus,
+            records,
             browser_runtime_controls,
             history_session_id=history_session_id,
         )
 
+
 async def _dispatch(
-    ws, conn, registry, event_log, token, frame, session=None, bus=None, records=None,
+    ws,
+    conn,
+    registry,
+    event_log,
+    token,
+    frame,
+    session=None,
+    bus=None,
+    records=None,
     browser_runtime_controls=True,
     history_session_id=None,
 ):
@@ -574,17 +597,23 @@ async def _dispatch(
     kind = frame["type"]
     if kind == "set_model" and not browser_runtime_controls:
         await ws.send(
-            json.dumps(protocol.build_refused(
-                "model selection is configured by the operator, not in the browser"
-            ))
+            json.dumps(
+                protocol.build_refused(
+                    "model selection is configured by the operator, not in the browser"
+                )
+            )
         )
         return
     if kind == "history":
         requested = frame["before"]
         if frame["session_id"] != history_session_id:
-            await ws.send(json.dumps(protocol.build_history_error(
-                frame["session_id"], requested, "history session does not match"
-            )))
+            await ws.send(
+                json.dumps(
+                    protocol.build_history_error(
+                        frame["session_id"], requested, "history session does not match"
+                    )
+                )
+            )
             return
         initial = requested is None
         fallback = event_log.history_pending() if initial else None
@@ -592,17 +621,30 @@ async def _dispatch(
             page = await event_log.history_async(requested, frame.get("limit", 20))
         except ValueError as exc:
             if initial:
-                await ws.send(json.dumps(protocol.build_history_page(
-                    history_session_id, fallback, initial=True
-                )))
-            await ws.send(json.dumps(protocol.build_history_error(
-                history_session_id, requested, str(exc), initial=initial,
-                through=fallback.through if initial else None,
-            )))
+                await ws.send(
+                    json.dumps(
+                        protocol.build_history_page(history_session_id, fallback, initial=True)
+                    )
+                )
+            await ws.send(
+                json.dumps(
+                    protocol.build_history_error(
+                        history_session_id,
+                        requested,
+                        str(exc),
+                        initial=initial,
+                        through=fallback.through if initial else None,
+                    )
+                )
+            )
         else:
-            await ws.send(json.dumps(protocol.build_history_page(
-                history_session_id, page, initial=initial, requested_before=requested
-            )))
+            await ws.send(
+                json.dumps(
+                    protocol.build_history_page(
+                        history_session_id, page, initial=initial, requested_before=requested
+                    )
+                )
+            )
         return
     if kind == "hello":
         # The opening hello is answered by _greet, before this connection was
@@ -736,9 +778,7 @@ async def _dispatch(
 async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, records=None):
     if bus is not None:
         async with bus.turn_submission_lock:
-            await _submit_turn_locked(
-                ws, conn, registry, event_log, frame, session, bus, records
-            )
+            await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
     else:
         await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
 
@@ -753,13 +793,17 @@ def turn_refusal(session, bus=None, *, starting_ok=False):
     if blocked_reason is None and callable(automation_reader):
         automation = automation_reader()
         if isinstance(automation, dict) and automation.get("inflight") is True:
-            blocked_reason = "Automatic continuation is active; pause it or wait before sending a message."
+            blocked_reason = (
+                "Automatic continuation is active; pause it or wait before sending a message."
+            )
     admission_reader = getattr(session, "turn_refusal", None)
     if blocked_reason is None and callable(admission_reader):
         blocked_reason = admission_reader()
     status = session.agent_status()
-    if blocked_reason is None and status != AGENT_READY and not (
-        starting_ok and status == AGENT_CONNECTING
+    if (
+        blocked_reason is None
+        and status != AGENT_READY
+        and not (starting_ok and status == AGENT_CONNECTING)
     ):
         blocked_reason = "the agent is %s, so this message was not sent" % status
     return blocked_reason
@@ -798,8 +842,10 @@ async def _submit_turn_locked(
     blocks = frame["blocks"]
     client_id = frame.get("client_id")
     holder = getattr(bus, "agent_holder", None)
-    defer = holder is not None and bus is not None and (
-        session.agent_status() == AGENT_CONNECTING or holder.has_deferred()
+    defer = (
+        holder is not None
+        and bus is not None
+        and (session.agent_status() == AGENT_CONNECTING or holder.has_deferred())
     )
     blocked_reason = (
         turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)

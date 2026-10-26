@@ -42,16 +42,19 @@ def test_profile_is_cleaned_when_the_body_raises(tmp_path, mounts):
     assert not profile.agent_dir.exists()
 
 
-@pytest.mark.parametrize("change", [
-    lambda mount, usage, env: env.pop(AUTH_FILE_ENV),
-    lambda mount, usage, env: env.update({AUTH_FILE_ENV: ""}),
-    lambda mount, usage, env: env.update({AUTH_FILE_ENV: "agent.db"}),
-    lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "missing" / "agent.db")}),
-    lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "other.db")}),
-    lambda mount, usage, env: env.pop(USAGE_DIR_ENV),
-    lambda mount, usage, env: env.update({USAGE_DIR_ENV: "usage"}),
-    lambda mount, usage, env: env.update({USAGE_DIR_ENV: str(usage / "absent")}),
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda mount, usage, env: env.pop(AUTH_FILE_ENV),
+        lambda mount, usage, env: env.update({AUTH_FILE_ENV: ""}),
+        lambda mount, usage, env: env.update({AUTH_FILE_ENV: "agent.db"}),
+        lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "missing" / "agent.db")}),
+        lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "other.db")}),
+        lambda mount, usage, env: env.pop(USAGE_DIR_ENV),
+        lambda mount, usage, env: env.update({USAGE_DIR_ENV: "usage"}),
+        lambda mount, usage, env: env.update({USAGE_DIR_ENV: str(usage / "absent")}),
+    ],
+)
 def test_missing_or_malformed_mounts_are_refused(tmp_path, mounts, change):
     mount, usage, env = mounts
     change(mount, usage, env)
@@ -77,7 +80,10 @@ def test_an_auth_file_outside_the_mount_is_refused_even_through_a_symlink(tmp_pa
             pass
 
 
-@pytest.mark.parametrize("name", ["ANNEALAGE_INFERENCE_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PI_CODING_AGENT_DIR"])
+@pytest.mark.parametrize(
+    "name",
+    ["ANNEALAGE_INFERENCE_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PI_CODING_AGENT_DIR"],
+)
 def test_ambient_credentials_are_refused_not_ignored(tmp_path, mounts, name):
     mount, _, env = mounts
     with pytest.raises(HostedProfileError, match=name):
@@ -100,7 +106,9 @@ def test_defaults_read_the_process_environment(tmp_path, mounts, monkeypatch):
 def test_a_mounted_models_file_is_linked_beside_the_auth_file(tmp_path, mounts):
     mount, usage, env = mounts
     (mount / "models.yml").write_text("providers: {}\n")
-    with hosted_profile({**env, MODELS_FILE_ENV: str(mount / "models.yml")}, mount=mount, parent=tmp_path) as profile:
+    with hosted_profile(
+        {**env, MODELS_FILE_ENV: str(mount / "models.yml")}, mount=mount, parent=tmp_path
+    ) as profile:
         assert sorted(p.name for p in profile.agent_dir.iterdir()) == ["agent.db", "models.yml"]
         assert (profile.agent_dir / "models.yml").read_text() == "providers: {}\n"
     assert (mount / "models.yml").exists()

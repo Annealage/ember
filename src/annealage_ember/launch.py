@@ -100,7 +100,9 @@ def build_session(
         # their requests are never remembered, and a grant for one of their
         # names already in permissions.toml is ignored. A bus with no tool
         # server has none.
-        never_remembered=getattr(bus.tools, "never_remembered", ()) if bus.tools is not None else (),
+        never_remembered=getattr(bus.tools, "never_remembered", ())
+        if bus.tools is not None
+        else (),
         request_guard=getattr(bus.tools, "request_guard", None) if bus.tools is not None else None,
         automatic_tools=(
             bus.tools.included_permission_names

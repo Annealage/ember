@@ -195,6 +195,7 @@ class ThinkingBudget:
         self._used = THINKING_CAP
         return ThinkingDelta(turn=turn, text=text[:room], truncated=True)
 
+
 @dataclasses.dataclass(frozen=True)
 class ToolUse(AgentEvent):
     kind: ClassVar[str] = "tool_use"
@@ -365,7 +366,6 @@ class RequestUsage(AgentEvent):
         return data
 
 
-
 @dataclasses.dataclass(frozen=True)
 class InputState(AgentEvent):
     """Lifecycle of a human input sent to a backend."""
@@ -375,6 +375,8 @@ class InputState(AgentEvent):
     turn: int
     state: str
     detail: Optional[str] = None
+
+
 #: The token counts a ``Usage`` reports.
 USAGE_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 
@@ -564,6 +566,7 @@ class AgentRuntimeResolved(AgentEvent):
     requested_role: Optional[str] = None
     resolved_role: Optional[str] = None
     role_provenance: Optional[str] = None
+
 
 @dataclasses.dataclass(frozen=True)
 class SessionReset(AgentEvent):

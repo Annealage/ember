@@ -202,9 +202,13 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
             )
         grading = Grading(
             tuple(n for n in server.grading.read if n in listed and n not in denied)
-            + tuple(sorted(n for n in explicit_read if n in listed and n not in server.grading.read)),
+            + tuple(
+                sorted(n for n in explicit_read if n in listed and n not in server.grading.read)
+            ),
             tuple(n for n in server.grading.view if n in listed and n not in denied)
-            + tuple(sorted(n for n in explicit_view if n in listed and n not in server.grading.view)),
+            + tuple(
+                sorted(n for n in explicit_view if n in listed and n not in server.grading.view)
+            ),
             tuple(n for n in server.grading.write if n in listed and n not in denied),
         )
         gated = set(grading.pause_gated)
@@ -358,6 +362,8 @@ def _reason(exc, timeout):
     if isinstance(leaf, (httpx.TransportError, httpx2.TransportError, OSError)):
         return "%s: %s" % (type(leaf).__name__, leaf) if str(leaf) else type(leaf).__name__
     return None
+
+
 def _action_context(bus):
     return _read_context(getattr(bus, "remote_action_context", None))
 
@@ -370,7 +376,6 @@ def _read_context(callback, *args):
     except Exception:
         return None
     return value if isinstance(value, dict) else None
-
 
 
 # -- proxied tools -------------------------------------------------------------
@@ -388,7 +393,8 @@ def _proxied(server, tool, bus=None):
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
-        tool.name, server.name,
+        tool.name,
+        server.name,
     )
     name = tool.name
 
@@ -398,20 +404,29 @@ def _proxied(server, tool, bus=None):
         if name in server.grading.write:
             approval_context = getattr(bus, "remote_approval_context", None)
             if callable(approval_context):
-                expected_context = _read_context(
-                    approval_context, server.name + "__" + name, args
-                )
+                expected_context = _read_context(approval_context, server.name + "__" + name, args)
                 store = getattr(bus, "remote_action_store", None)
-                if expected_context is None or store is None or not remote_actions.safe_context(
-                    expected_context, store.project
-                )["context_verified"]:
-                    return fail("remote write refused: its approved source context is unavailable or invalid")
+                if (
+                    expected_context is None
+                    or store is None
+                    or not remote_actions.safe_context(expected_context, store.project)[
+                        "context_verified"
+                    ]
+                ):
+                    return fail(
+                        "remote write refused: its approved source context is unavailable or invalid"
+                    )
         return await call(
-            server, name, args, action_store=getattr(bus, "remote_action_store", None),
-            source="agent", read_only=name in server.grading.read,
+            server,
+            name,
+            args,
+            action_store=getattr(bus, "remote_action_store", None),
+            source="agent",
+            read_only=name in server.grading.read,
             allowed_reads=(name,) if name in server.grading.read else (),
             allowed_writes=() if name in server.grading.read else (name,),
-            context=context, expected_context=expected_context,
+            context=context,
+            expected_context=expected_context,
             context_callback=getattr(bus, "remote_action_context", None),
         )
 
@@ -419,9 +434,20 @@ def _proxied(server, tool, bus=None):
 
 
 async def call(
-    server, name, arguments, *, action_store=None, source="agent", read_only=False,
-    approval=None, context=None, expected_context=None, context_callback=None,
-    allowed_reads=(), allowed_writes=(), timeout=None,  # noqa: ASYNC109
+    server,
+    name,
+    arguments,
+    *,
+    action_store=None,
+    source="agent",
+    read_only=False,
+    approval=None,
+    context=None,
+    expected_context=None,
+    context_callback=None,
+    allowed_reads=(),
+    allowed_writes=(),
+    timeout=None,  # noqa: ASYNC109
 ):
     """Call a remote tool, enforcing its read policy and recording writes."""
     timeout = CALL_TIMEOUT if timeout is None else timeout
@@ -467,12 +493,13 @@ async def call(
     try:
         with anyio.fail_after(timeout):
             async with _session(server) as (session, _):
-                current_context = _read_context(context_callback) if callable(context_callback) else context
+                current_context = (
+                    _read_context(context_callback) if callable(context_callback) else context
+                )
                 if invocation and expected_context is not None:
-                    stale_context = (
-                        remote_actions.safe_context(expected_context, action_store.project)
-                        != remote_actions.safe_context(current_context, action_store.project)
-                    )
+                    stale_context = remote_actions.safe_context(
+                        expected_context, action_store.project
+                    ) != remote_actions.safe_context(current_context, action_store.project)
                 if not stale_context:
                     if invocation:
                         action_store.dispatching(invocation)
@@ -485,7 +512,9 @@ async def call(
             raise
         if result is not None:
             if invocation:
-                action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
+                action_store.outcome(
+                    invocation, "uncertain" if result.is_error else "reported_result"
+                )
             return _result(server.name, name, result)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):

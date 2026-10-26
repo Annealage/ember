@@ -35,7 +35,9 @@ def recoverable(monkeypatch, script, *, interrupt=None):
     return built
 
 
-async def test_safe_diagnostic_and_continuation_keep_session_writes_and_budgets(monkeypatch, tmp_path):
+async def test_safe_diagnostic_and_continuation_keep_session_writes_and_budgets(
+    monkeypatch, tmp_path
+):
     saved, observed = [], []
 
     async def script(session):
@@ -57,18 +59,28 @@ async def test_safe_diagnostic_and_continuation_keep_session_writes_and_budgets(
         return "continue original task" if result.text == "clear_path" else None
 
     built = recoverable(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, tools=make_toolset(grant=("save",), saved=saved),
-        work_timeout=0.01, interrupt_timeout=0.2, on_timeout=on_timeout,
-        max_timeout_recoveries=1, max_followups=0, on_turn_result=on_turn,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            tools=make_toolset(grant=("save",), saved=saved),
+            work_timeout=0.01,
+            interrupt_timeout=0.2,
+            on_timeout=on_timeout,
+            max_timeout_recoveries=1,
+            max_followups=0,
+            on_turn_result=on_turn,
+        ),
+    )
     assert result.error is None and result.text == "complete"
     assert saved == ["kept"] and result.calls == (("save", True),)
     assert built.session.started == built.session.closed == 1
     assert [blocks[0]["text"] for blocks, _ in built.session.submitted_turns] == [
-        "original", "diagnose progress without restarting", "continue original task",
+        "original",
+        "diagnose progress without restarting",
+        "continue original task",
     ]
-    context, = observed
+    (context,) = observed
     assert isinstance(context, TimeoutContext) and isinstance(context.recovery, RecoveryInfo)
     assert (context.kind, context.interruption) == ("work_interval", "safe")
     assert context.result.calls == (("save", True),)
@@ -87,10 +99,16 @@ async def test_recovery_count_is_a_hard_bound(monkeypatch, tmp_path):
         contexts.append(context)
         return "diagnostic"
 
-    result = await run_prompt("original", **make_args(
-        tmp_path, work_timeout=0.01, interrupt_timeout=0.2,
-        on_timeout=timeout, max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            work_timeout=0.01,
+            interrupt_timeout=0.2,
+            on_timeout=timeout,
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.timeout_kind == "work_interval" and result.error == "timeout"
     assert len(contexts) == 3 and len(built.session.submitted_turns) == 3
     assert built.session.started == 1
@@ -112,11 +130,17 @@ async def test_uncertain_interruption_never_submits_next_turn(monkeypatch, tmp_p
 
     contexts = []
     built = recoverable(monkeypatch, script, interrupt=interrupt)
-    result = await run_prompt("original", **make_args(
-        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.01, interrupt_timeout=0.01,
-        on_timeout=lambda context: contexts.append(context) or "must not submit",
-        max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            state_dir=tmp_path / "conversation",
+            work_timeout=0.01,
+            interrupt_timeout=0.01,
+            on_timeout=lambda context: contexts.append(context) or "must not submit",
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.error == "timeout" and result.timeout_kind == "work_interval"
     assert contexts[0].interruption == "unsafe"
     assert len(built.session.submitted_turns) == 1
@@ -131,11 +155,16 @@ async def test_unsupported_backend_reports_capability_without_retry(monkeypatch,
 
     contexts = []
     built = script_session(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, backend="claude", work_timeout=0.01,
-        on_timeout=lambda context: contexts.append(context) or "no",
-        max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            backend="claude",
+            work_timeout=0.01,
+            on_timeout=lambda context: contexts.append(context) or "no",
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.error == "timeout"
     assert contexts[0].interruption == "unsupported"
     assert contexts[0].recovery.live_recovery_supported is False
@@ -148,11 +177,16 @@ async def test_hard_deadline_does_not_accept_observer_prompt(monkeypatch, tmp_pa
 
     contexts = []
     built = recoverable(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, timeout=0.02, work_timeout=1,
-        on_timeout=lambda context: contexts.append(context) or "never submit",
-        max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            timeout=0.02,
+            work_timeout=1,
+            on_timeout=lambda context: contexts.append(context) or "never submit",
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.timeout_kind == "hard_deadline" and result.error == "timeout"
     assert contexts[0].kind == "hard_deadline" and contexts[0].remaining == 0
     assert contexts[0].interruption == "not_attempted"
@@ -166,9 +200,15 @@ async def test_native_error_does_not_invoke_timeout_callback(monkeypatch, tmp_pa
 
     contexts = []
     built = recoverable(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, work_timeout=0.01, on_timeout=contexts.append, max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            work_timeout=0.01,
+            on_timeout=contexts.append,
+            max_timeout_recoveries=2,
+        ),
+    )
     assert "authentication failed" in result.error
     assert result.timeout_kind is None and contexts == [] and built.session.interrupted == 0
 
@@ -181,10 +221,14 @@ async def test_rpc_timeout_is_observational_not_a_generation_retry(monkeypatch, 
 
     contexts = []
     built = recoverable(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, on_timeout=lambda context: contexts.append(context) or "never submit",
-        max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            on_timeout=lambda context: contexts.append(context) or "never submit",
+            max_timeout_recoveries=2,
+        ),
+    )
     assert result.timeout_kind == "rpc_request_timeout"
     assert contexts[0].rpc_operation == "prompt"
     assert contexts[0].interruption == "not_attempted"
@@ -206,7 +250,9 @@ async def test_durable_explicit_resume_preserves_identity_and_reserves_turns(mon
     first = await run_prompt("original", **make_args(tmp_path, state_dir=state_dir))
     first_kwargs = built.kwargs
     first_state = json.loads((state_dir / "headless.json").read_text())
-    second = await run_prompt("new explicit input", **make_args(tmp_path, state_dir=state_dir, resume=True))
+    second = await run_prompt(
+        "new explicit input", **make_args(tmp_path, state_dir=state_dir, resume=True)
+    )
     second_state = json.loads((state_dir / "headless.json").read_text())
     assert first.recovery.session_id == second.recovery.session_id
     assert first_kwargs["session_id"] == built.kwargs["session_id"]
@@ -220,7 +266,9 @@ async def test_durable_explicit_resume_preserves_identity_and_reserves_turns(mon
         await run_prompt("no implicit replacement", **make_args(tmp_path, state_dir=state_dir))
     Path(second.recovery.conversation_file).unlink()
     with pytest.raises(ValueError, match="missing"):
-        await run_prompt("no cold fallback", **make_args(tmp_path, state_dir=state_dir, resume=True))
+        await run_prompt(
+            "no cold fallback", **make_args(tmp_path, state_dir=state_dir, resume=True)
+        )
 
 
 async def test_cancellation_retains_state_and_never_calls_timeout_policy(monkeypatch, tmp_path):
@@ -232,9 +280,17 @@ async def test_cancellation_retains_state_and_never_calls_timeout_policy(monkeyp
         entered.set()
 
     built = recoverable(monkeypatch, script)
-    task = asyncio.create_task(run_prompt("original", **make_args(
-        tmp_path, state_dir=state_dir, work_timeout=10, on_timeout=contexts.append,
-    )))
+    task = asyncio.create_task(
+        run_prompt(
+            "original",
+            **make_args(
+                tmp_path,
+                state_dir=state_dir,
+                work_timeout=10,
+                on_timeout=contexts.append,
+            ),
+        )
+    )
     await entered.wait()
     with pytest.raises(ValueError, match="already in use"):
         await run_prompt("concurrent", **make_args(tmp_path, state_dir=state_dir))
@@ -253,19 +309,33 @@ async def test_callback_failure_never_retries(monkeypatch, tmp_path):
         raise RuntimeError("policy failed")
 
     built = recoverable(monkeypatch, script)
-    result = await run_prompt("original", **make_args(
-        tmp_path, work_timeout=0.01, on_timeout=timeout, max_timeout_recoveries=2,
-    ))
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            work_timeout=0.01,
+            on_timeout=timeout,
+            max_timeout_recoveries=2,
+        ),
+    )
     assert "policy failed" in result.error and result.stop_reason == "error"
     assert len(built.session.submitted_turns) == 1
 
 
-@pytest.mark.parametrize("extra", (
-    {"work_timeout": 0}, {"work_timeout": float("inf")}, {"interrupt_timeout": False},
-    {"max_timeout_recoveries": -1}, {"on_timeout": "not callable"},
-    {"resume": True}, {"state_dir": ""}, {"state_dir": "state", "backend": "claude"},
-    {"timeout": float("inf")},
-))
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"work_timeout": 0},
+        {"work_timeout": float("inf")},
+        {"interrupt_timeout": False},
+        {"max_timeout_recoveries": -1},
+        {"on_timeout": "not callable"},
+        {"resume": True},
+        {"state_dir": ""},
+        {"state_dir": "state", "backend": "claude"},
+        {"timeout": float("inf")},
+    ),
+)
 async def test_invalid_recovery_configuration_fails_before_start(tmp_path, extra):
     with pytest.raises(ValueError):
         await run_prompt("original", **make_args(tmp_path, **extra))
@@ -319,13 +389,23 @@ async def test_write_result_is_in_native_history_before_abort(monkeypatch, tmp_p
         await original_settle(run)
 
     monkeypatch.setattr(headless._Run, "settle_tool_results", settle)
-    task = asyncio.create_task(run_prompt("original", **make_args(
-        tmp_path, tools=ToolSet(
-            tools=[commit_value], grading=Grading(read=(), view=(), write=("commit_value",)),
-            grant=("commit_value",),
-        ), work_timeout=0.01, interrupt_timeout=1, max_timeout_recoveries=1,
-        on_timeout=lambda context: contexts.append(context) or "diagnose",
-    )))
+    task = asyncio.create_task(
+        run_prompt(
+            "original",
+            **make_args(
+                tmp_path,
+                tools=ToolSet(
+                    tools=[commit_value],
+                    grading=Grading(read=(), view=(), write=("commit_value",)),
+                    grant=("commit_value",),
+                ),
+                work_timeout=0.01,
+                interrupt_timeout=1,
+                max_timeout_recoveries=1,
+                on_timeout=lambda context: contexts.append(context) or "diagnose",
+            ),
+        )
+    )
     await paused.wait()
     assert saved == [] and built.session.interrupted == 0
     refused = await built.kwargs["server"].host_tool_table()["commit_value"].handler({})
@@ -350,10 +430,18 @@ async def test_cancel_during_diagnostic_policy_never_authorizes_next_input(monke
         return "never sent"
 
     built = recoverable(monkeypatch, script)
-    task = asyncio.create_task(run_prompt("original", **make_args(
-        tmp_path, state_dir=tmp_path / "conversation", work_timeout=0.01,
-        on_timeout=timeout, max_timeout_recoveries=1,
-    )))
+    task = asyncio.create_task(
+        run_prompt(
+            "original",
+            **make_args(
+                tmp_path,
+                state_dir=tmp_path / "conversation",
+                work_timeout=0.01,
+                on_timeout=timeout,
+                max_timeout_recoveries=1,
+            ),
+        )
+    )
     await entered.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -381,10 +469,16 @@ async def test_expired_callback_cannot_admit_turn_before_timer_is_serviced(monke
     built = recoverable(monkeypatch, script)
     with monkeypatch.context() as clock:
         clock.setattr(loop, "time", lambda: real_time() + advance[0])
-        result = await run_prompt("original", **make_args(
-            tmp_path, timeout=1, on_turn_result=on_turn, max_followups=2,
-            on_timeout=lambda context: contexts.append(context),
-        ))
+        result = await run_prompt(
+            "original",
+            **make_args(
+                tmp_path,
+                timeout=1,
+                on_turn_result=on_turn,
+                max_followups=2,
+                on_timeout=lambda context: contexts.append(context),
+            ),
+        )
     assert result.timeout_kind == "hard_deadline" and result.error == "timeout"
     assert len(built.session.submitted_turns) == 1
     assert contexts[0].kind == "hard_deadline"

@@ -36,10 +36,9 @@ from typing import Optional
 
 from microdot import Microdot, Request
 
-from . import files, net, product, protocol, sessions, uploads
-from .agent_lock import AgentAlreadyOpen, AgentLock
-from . import remote_actions
+from . import files, net, product, protocol, remote_actions, sessions, uploads
 from . import settings as settings_module
+from .agent_lock import AgentAlreadyOpen, AgentLock
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
 from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
@@ -64,17 +63,17 @@ from .session.base import (
     AgentClosed,
     AgentError,
     AgentModelChanged,
-    AgentRuntimeResolved,
     AgentModelsAvailable,
+    AgentRuntimeResolved,
     AgentStatus,
     InputState,
     PermissionResolved,
     SessionReset,
-    TurnEnd,
-    UserTurn,
     TextDelta,
     ToolUse,
+    TurnEnd,
     Usage,
+    UserTurn,
 )
 from .session.events import EventLog
 from .session.permissions import OUTCOME_SHUTDOWN
@@ -860,8 +859,13 @@ def create_app(
         scope = str(Path(getattr(review_store, "path", serve_dir)).resolve())
         scope_key = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
         app.agent_review_notifications = ReviewNotifications(
-            app, store=review_store, auth=auth, recorder=recorder, scope=scope,
-            path=sessions.state_dir(state_project_dir) / ("review-notifications-%s.json" % scope_key),
+            app,
+            store=review_store,
+            auth=auth,
+            recorder=recorder,
+            scope=scope,
+            path=sessions.state_dir(state_project_dir)
+            / ("review-notifications-%s.json" % scope_key),
         )
     # A tool result's end_turn (tools.ok) reaches whichever session is live
     # then; a session that cannot stop a turn has nothing to call.
@@ -935,7 +939,9 @@ def create_app(
                     documents=documents,
                     remote_action_context=bus.remote_action_context,
                     action_store=bus.remote_action_store,
-                    dispatch_allowed=(lambda: not bus.paused) if auto_approve_included_tools else None,
+                    dispatch_allowed=(lambda: not bus.paused)
+                    if auto_approve_included_tools
+                    else None,
                 )
             )
             running_actions.add(task)
@@ -1199,9 +1205,12 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
                 "stderr": event.stderr,
             }
         recovered = (
-            isinstance(event, AgentStatus) and event.status == AGENT_READY
-            or isinstance(event, InputState) and event.state == "provider_ack"
-            or isinstance(event, TextDelta) and bool(event.text)
+            isinstance(event, AgentStatus)
+            and event.status == AGENT_READY
+            or isinstance(event, InputState)
+            and event.state == "provider_ack"
+            or isinstance(event, TextDelta)
+            and bool(event.text)
             or isinstance(event, ToolUse)
         )
         if session_info is not None and recovered:
@@ -1611,11 +1620,13 @@ class AgentHolder:
             self._agent_lock.acquire()
         except AgentAlreadyOpen as exc:
             sys.stderr.write("error: could not open the agent session: %s\n" % (exc,))
-            self._publish(AgentError(
-                stderr=str(exc),
-                remediation="the agent is already running in another process for this "
-                "project; stop that one first",
-            ))
+            self._publish(
+                AgentError(
+                    stderr=str(exc),
+                    remediation="the agent is already running in another process for this "
+                    "project; stop that one first",
+                )
+            )
             return False
         if self._agent_lock.reaped is not None:
             sys.stderr.write(
@@ -1652,10 +1663,14 @@ class AgentHolder:
         resumed conversation can take a long time to come up. A start that
         fails ends it as rejected, with the reason."""
         self._deferred.append((session, blocks, viewer, turn))
-        self._publish(InputState(
-            input_id="starting-%d" % turn, turn=turn, state="queued",
-            detail="waiting for the agent to start",
-        ))
+        self._publish(
+            InputState(
+                input_id="starting-%d" % turn,
+                turn=turn,
+                state="queued",
+                detail="waiting for the agent to start",
+            )
+        )
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = asyncio.ensure_future(self._drain_deferred())
 
@@ -1669,10 +1684,14 @@ class AgentHolder:
             # replaced it; the next one starts with this input unsent.)
             self._deferred.pop(0)
             if session is not self.session or session.agent_status() != AGENT_READY:
-                self._publish(InputState(
-                    input_id="starting-%d" % turn, turn=turn, state="rejected",
-                    detail="the agent did not start, so this message was not sent",
-                ))
+                self._publish(
+                    InputState(
+                        input_id="starting-%d" % turn,
+                        turn=turn,
+                        state="rejected",
+                        detail="the agent did not start, so this message was not sent",
+                    )
+                )
                 self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
                 continue
             try:
@@ -1703,23 +1722,32 @@ class AgentHolder:
                 source = fields.get("automation_source")
                 blocks = fields.get("blocks") or []
                 sent = bus.begin_turn(
-                    blocks, by=fields.get("by"),
+                    blocks,
+                    by=fields.get("by"),
                     automation_source=source if source == "loom_root_continuation" else None,
                 )
                 turn = bus.turn
-                self._publish(UserTurn(
-                    turn=turn, blocks=blocks, client_id=fields.get("client_id"),
-                    by=fields.get("by"), principal_id=fields.get("principal_id"),
-                    display=fields.get("display"), automation_source=source,
-                    review_notification_ids=fields.get("review_notification_ids"),
-                    redelivery_of=original,
-                ))
+                self._publish(
+                    UserTurn(
+                        turn=turn,
+                        blocks=blocks,
+                        client_id=fields.get("client_id"),
+                        by=fields.get("by"),
+                        principal_id=fields.get("principal_id"),
+                        display=fields.get("display"),
+                        automation_source=source,
+                        review_notification_ids=fields.get("review_notification_ids"),
+                        redelivery_of=original,
+                    )
+                )
                 bus.mark_turn_submitted(turn)
                 if session.agent_status() == AGENT_READY:
                     try:
                         await session.submit_turn(sent, viewer=None)
                     except Exception as exc:
-                        sys.stderr.write("warning: could not re-send turn %d: %r\n" % (original, exc))
+                        sys.stderr.write(
+                            "warning: could not re-send turn %d: %r\n" % (original, exc)
+                        )
                         self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
                 else:
                     self.defer_turn(session, sent, None, turn)

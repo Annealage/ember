@@ -19,8 +19,11 @@ from annealage_ember.provider_login import LoginError, ProviderLogin
 from annealage_ember.session.fake import FakeSession
 
 TOKEN = "browser-token-for-login_123"
+
+
 def JSON():
     return {"Content-Type": "application/json"}
+
 
 SECRET = "super-secret-pasted-code-xyz"
 
@@ -58,8 +61,13 @@ class FakeOmp:
 
     def _ui(self, **fields):
         base = {
-            "id": "r%d" % len(self.commands), "method": "", "url": None, "launch_url": None,
-            "instructions": None, "title": None, "requires_response": lambda: False,
+            "id": "r%d" % len(self.commands),
+            "method": "",
+            "url": None,
+            "launch_url": None,
+            "instructions": None,
+            "title": None,
+            "requires_response": lambda: False,
         }
         base.update(fields)
         return SimpleNamespace(**base)
@@ -67,23 +75,38 @@ class FakeOmp:
     def request_raw(self, command, **payload):
         self.commands.append((command, payload))
         if command == "get_login_providers":
-            return {"providers": [
-                {"id": "anthropic", "name": "Anthropic", "available": True, "authenticated": True},
-                {"id": "zai", "name": "Z.AI", "available": True, "authenticated": False},
-            ]}
+            return {
+                "providers": [
+                    {
+                        "id": "anthropic",
+                        "name": "Anthropic",
+                        "available": True,
+                        "authenticated": True,
+                    },
+                    {"id": "zai", "name": "Z.AI", "available": True, "authenticated": False},
+                ]
+            }
         if command == "get_logout_accounts":
             return {"accounts": [{"id": "cred-1"}]}
         if command == "logout":
             return {}
         assert command == "login"
-        self.handler(self._ui(
-            method="open_url", url="https://claude.ai/oauth/authorize?x=1",
-            launch_url="http://localhost:54545/launch", instructions="Sign in.",
-        ))
+        self.handler(
+            self._ui(
+                method="open_url",
+                url="https://claude.ai/oauth/authorize?x=1",
+                launch_url="http://localhost:54545/launch",
+                instructions="Sign in.",
+            )
+        )
         while True:
-            self.handler(self._ui(
-                method="input", title="Paste the code", requires_response=lambda: True,
-            ))
+            self.handler(
+                self._ui(
+                    method="input",
+                    title="Paste the code",
+                    requires_response=lambda: True,
+                )
+            )
             if self.stopped.is_set():
                 raise RuntimeError("omp stopped")
             with self.sent:
@@ -171,8 +194,12 @@ def test_an_omp_that_cannot_start_is_a_reason_not_a_hang():
 def _app(served_dir, login):
     sid = sessions.create_session(served_dir)
     return create_toy_app(
-        served_dir, token=TOKEN, agent_token="agent-token-for-login_456",
-        host=TEST_HOST, port=DEFAULT_PORT, session_id=sid,
+        served_dir,
+        token=TOKEN,
+        agent_token="agent-token-for-login_456",
+        host=TEST_HOST,
+        port=DEFAULT_PORT,
+        session_id=sid,
         build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
         provider_login=login,
     )
@@ -187,10 +214,14 @@ async def test_the_routes_run_a_login_and_never_echo_the_code(served_dir, capsys
     res = await client.get("/agent/login/providers" + q)
     assert [p["id"] for p in res.json["providers"]] == ["anthropic", "zai"]
 
-    res = await client.post("/agent/login/begin" + q, body='{"provider_id": "anthropic"}', headers=JSON())
+    res = await client.post(
+        "/agent/login/begin" + q, body='{"provider_id": "anthropic"}', headers=JSON()
+    )
     assert res.json["state"] == "awaiting_code"
 
-    res = await client.post("/agent/login/submit" + q, body='{"code": "%s"}' % SECRET, headers=JSON())
+    res = await client.post(
+        "/agent/login/submit" + q, body='{"code": "%s"}' % SECRET, headers=JSON()
+    )
     assert res.json["state"] == "awaiting_code" and res.json["attempts"] == 2
     res = await client.post("/agent/login/submit" + q, body='{"code": "good"}', headers=JSON())
     assert res.json["state"] == "done"
@@ -208,8 +239,11 @@ async def test_the_routes_refuse_the_agent_token_and_a_foreign_page(served_dir):
             assert (await client.get(path + query)).status_code == 403
         res = await client.get(path + "?t=" + TOKEN, headers={"Origin": "http://evil.example"})
         assert res.status_code == 403
-    res = await client.post("/agent/login/begin?t=agent-token-for-login_456",
-                            body='{"provider_id": "anthropic"}', headers=JSON())
+    res = await client.post(
+        "/agent/login/begin?t=agent-token-for-login_456",
+        body='{"provider_id": "anthropic"}',
+        headers=JSON(),
+    )
     assert res.status_code == 403
 
 
@@ -226,8 +260,11 @@ async def test_logout_names_each_stored_credential(served_dir):
     q = "?t=" + TOKEN
     res = await client.get("/agent/login/accounts" + q + "&provider_id=anthropic")
     assert res.json["accounts"] == [{"id": "cred-1"}]
-    res = await client.post("/agent/login/logout" + q,
-                            body='{"provider_id": "anthropic", "credential_id": "cred-1"}', headers=JSON())
+    res = await client.post(
+        "/agent/login/logout" + q,
+        body='{"provider_id": "anthropic", "credential_id": "cred-1"}',
+        headers=JSON(),
+    )
     assert res.json == {"ok": True}
     assert ("logout", {"providerId": "anthropic", "credentialId": "cred-1"}) in [
         c for client_, _ in made for c in client_.commands

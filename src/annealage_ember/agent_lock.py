@@ -55,7 +55,7 @@ def _identity(pid: int) -> Optional[dict]:
         with open("/proc/%d/stat" % pid, "rb") as stat:
             raw = stat.read().decode("utf-8", "replace")
         # The command name is in parentheses and may contain spaces or ')'.
-        fields = raw[raw.rindex(")") + 2:].split()
+        fields = raw[raw.rindex(")") + 2 :].split()
         if fields[0] == "Z":
             return None
         start = int(fields[19])
@@ -112,7 +112,11 @@ class AgentLock:
         agent = self._read(fd).get("agent")
         if isinstance(agent, dict):
             live = _identity(agent.get("pid")) if isinstance(agent.get("pid"), int) else None
-            if live is not None and live["start"] == agent.get("start") and live["cmd"] == agent.get("cmd"):
+            if (
+                live is not None
+                and live["start"] == agent.get("start")
+                and live["cmd"] == agent.get("cmd")
+            ):
                 self.reaped = live["pid"]
                 _end_process(live["pid"])
         self._write({"pid": os.getpid()})

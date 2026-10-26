@@ -145,11 +145,22 @@ class _Registry:
 async def _send_turn(app, text, client_id="c-1"):
     """What a turn frame does after the holder opens the agent for it."""
     session = await app.agent_holder.ensure(retry=True)
-    frame = {"v": 2, "type": "turn", "blocks": [{"type": "text", "text": text}], "client_id": client_id}
+    frame = {
+        "v": 2,
+        "type": "turn",
+        "blocks": [{"type": "text", "text": text}],
+        "client_id": client_id,
+    }
     sock = _Socket()
     await ws_module._dispatch(
-        sock, _Conn(), _Registry(app.agent_registry), app.agent_event_log, "tok", frame,
-        session, app.agent_bus,
+        sock,
+        _Conn(),
+        _Registry(app.agent_registry),
+        app.agent_event_log,
+        "tok",
+        frame,
+        session,
+        app.agent_bus,
     )
     return sock.sent
 
@@ -196,7 +207,9 @@ async def test_the_idle_sweep_keeps_an_agent_with_a_running_turn_or_an_open_requ
         await app.agent_stop()
 
 
-async def test_an_input_accepted_while_the_agent_starts_is_kept_and_delivered_when_ready(served_dir):
+async def test_an_input_accepted_while_the_agent_starts_is_kept_and_delivered_when_ready(
+    served_dir,
+):
     built = []
     _Session.gate = asyncio.Event()
     app = _app(served_dir, built, start_closed=True, idle_timeout=None)
@@ -218,7 +231,9 @@ async def test_an_input_accepted_while_the_agent_starts_is_kept_and_delivered_wh
         await app.agent_stop()
 
 
-async def test_an_input_waiting_for_an_agent_that_never_starts_is_rejected_with_a_reason(served_dir):
+async def test_an_input_waiting_for_an_agent_that_never_starts_is_rejected_with_a_reason(
+    served_dir,
+):
     built = []
     _Session.gate = asyncio.Event()
     _Session.fails = True
@@ -228,7 +243,9 @@ async def test_an_input_waiting_for_an_agent_that_never_starts_is_rejected_with_
         await _send_turn(app, "carry on")
         _Session.gate.set()
         await _until(lambda: _logged(app, "turn_end"))
-        assert [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")] == [(1, "rejected")]
+        assert [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")] == [
+            (1, "rejected")
+        ]
         rejected = [e for e in _logged(app, "input_state") if e["state"] == "rejected"]
         assert rejected and "did not start" in rejected[0]["detail"]
     finally:
@@ -361,7 +378,10 @@ async def test_a_turn_already_resent_once_is_never_resent_again(served_dir):
     )
     built = []
     app = _app(served_dir, built, session_id=sid, idle_timeout=None)
-    assert [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")][-1] == (2, "interrupted")
+    assert [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")][-1] == (
+        2,
+        "interrupted",
+    )
     await app.agent_start()
     try:
         await asyncio.sleep(0.1)

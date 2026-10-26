@@ -6,9 +6,9 @@ wiring: how many WebSocket controllers it makes, when it asks for admission,
 and what it shows."""
 
 import json
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -181,8 +181,10 @@ def results(tmp_path_factory):
 def test_a_missing_session_is_admitted_once_and_then_only_read(results):
     r = results["admit"]
     assert r["calls"] == [
-        "GET /p/a/agent/session", "POST /p/a/agent/session",
-        "GET /p/a/agent/session", "GET /p/a/agent/session",
+        "GET /p/a/agent/session",
+        "POST /p/a/agent/session",
+        "GET /p/a/agent/session",
+        "GET /p/a/agent/session",
     ]
     assert r["error"] is None and r["slept"] == [2000]
     assert results["ended"]["calls"][:2] == ["GET /p/a/agent/session", "POST /p/a/agent/session"]
@@ -216,7 +218,13 @@ def test_waiting_for_a_worker_is_bounded(results):
 
 
 def test_hosted_start_waits_for_the_button_and_admits_once_for_a_double_click(results):
-    assert results["hostedStart"] == {"text": "Start session", "hidden": False, "err": "", "ws": 0, "admissions": 0}
+    assert results["hostedStart"] == {
+        "text": "Start session",
+        "hidden": False,
+        "err": "",
+        "ws": 0,
+        "admissions": 0,
+    }
     assert results["hostedConnected"]["admissions"] == ["/p/a/agent/session"]
     assert results["hostedConnected"]["ws"] == 1
 
@@ -224,11 +232,26 @@ def test_hosted_start_waits_for_the_button_and_admits_once_for_a_double_click(re
 def test_the_button_stays_until_the_socket_is_live_not_just_admitted(results):
     # admitted, but the (new or reused) socket has not said live yet: a send
     # now would be refused as not connected, so no resumed-ready state shows
-    assert results["hostedPending"] == {"text": "Starting…", "hidden": False, "err": "", "disabled": True}
-    assert results["hostedResumePending"] == {"text": "Starting…", "hidden": False, "err": "", "disabled": True}
+    assert results["hostedPending"] == {
+        "text": "Starting…",
+        "hidden": False,
+        "err": "",
+        "disabled": True,
+    }
+    assert results["hostedResumePending"] == {
+        "text": "Starting…",
+        "hidden": False,
+        "err": "",
+        "disabled": True,
+    }
     # a controller that never reports live (it will not report downtime twice)
     # does not leave a dead button: Resume comes back after the wait
-    assert results["hostedNeverLive"] == {"text": "Resume session", "hidden": False, "err": "", "disabled": False}
+    assert results["hostedNeverLive"] == {
+        "text": "Resume session",
+        "hidden": False,
+        "err": "",
+        "disabled": False,
+    }
     assert results["hostedLive"]["hidden"] is True
 
 
@@ -253,9 +276,14 @@ def test_standalone_connects_at_once_with_no_admission(results):
 def test_retry_after_is_honoured_in_full_never_shortened(results):
     assert results["longWait"]["slept"] == [10000] and results["longWait"]["error"] is None
     # 60 s cannot fit a 30 s deadline: refused before any wait or early poll
-    assert results["tooLong"]["slept"] == [] and results["tooLong"]["calls"] == ["GET /p/a/agent/session"]
+    assert results["tooLong"]["slept"] == [] and results["tooLong"]["calls"] == [
+        "GET /p/a/agent/session"
+    ]
     assert "still starting" in results["tooLong"]["error"]
-    assert results["dateWait"]["slept"] == [pytest.approx(7000, abs=1000)] and results["dateWait"]["calls"] == 2
+    assert (
+        results["dateWait"]["slept"] == [pytest.approx(7000, abs=1000)]
+        and results["dateWait"]["calls"] == 2
+    )
 
 
 def test_a_request_that_never_answers_ends_at_the_deadline(results):
@@ -267,5 +295,7 @@ def test_a_request_that_never_answers_ends_at_the_deadline(results):
     assert post["calls"] == ["GET", "POST"] and "not repeated" in post["error"]
     assert post["aborted"] == [False, True]
     poll = results["hungPoll"]
-    assert poll["calls"] == ["GET", "GET"] and "still starting" in poll["error"] and poll["ms"] < 1500
+    assert (
+        poll["calls"] == ["GET", "GET"] and "still starting" in poll["error"] and poll["ms"] < 1500
+    )
     assert results["signalGiven"] is True

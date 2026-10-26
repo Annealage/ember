@@ -103,7 +103,7 @@ def chat_markup(
         'title="Attach an image (or paste or drop one into the message box)">%s</button>\n'
         '<textarea id="chatInput" rows="2" aria-label="Message" placeholder="Message the agent"></textarea>\n'
         '<div class="chatbtns"><button id="chatInterrupt" type="button" title="Stop the current turn">'
-        'Interrupt</button>\n'
+        "Interrupt</button>\n"
         '<button id="chatSend" type="button" class="primary">Send</button></div>\n'
         "</div></div></div>\n"
         '<div id="settingsModal" class="modal" hidden></div>\n'
@@ -144,7 +144,10 @@ def render_agent_page(
         raise ValueError("unknown layout %r; the layouts are %s" % (layout, ", ".join(LAYOUTS)))
     base = url_prefix.rstrip("/") + _STATIC
     q = html.escape
-    head = ['<meta charset="utf-8">', '<meta name="viewport" content="width=device-width,initial-scale=1">']
+    head = [
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    ]
     head.append("<title>%s</title>" % q(title))
     head += ['<script src="%s"></script>' % q(href, quote=True) for href in scripts]
     head += ['<link rel="stylesheet" href="%s">' % q(href, quote=True) for href in tokens]
@@ -158,7 +161,9 @@ def render_agent_page(
         % (
             q(product, quote=True),
             "\n".join(head),
-            chat_markup(title="Agent", hosted=hosted, session_url=session_url, start=start, **markup),
+            chat_markup(
+                title="Agent", hosted=hosted, session_url=session_url, start=start, **markup
+            ),
             q(entry, quote=True),
         )
     )

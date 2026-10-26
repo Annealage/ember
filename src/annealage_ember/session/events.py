@@ -118,7 +118,6 @@ class HistoryPage:
     pending_request_ids: tuple = ()
 
 
-
 class EventLog:
     """Append-only event history for one session's lifetime.
 
@@ -373,10 +372,8 @@ class EventLog:
             # A late event for an older turn overlaps every group after its
             # first event. Merge those boundaries rather than split that turn.
             first = self._history_turns[turn]
-            i = bisect.bisect_right(
-                self._history_groups, (first, float("inf"), float("inf"))
-            ) - 1
-            del self._history_groups[i + 1:]
+            i = bisect.bisect_right(self._history_groups, (first, float("inf"), float("inf"))) - 1
+            del self._history_groups[i + 1 :]
         if kind == "turn_end":
             self._history_open.discard(turn)
 
@@ -413,14 +410,10 @@ class EventLog:
             # Product notifications before the first conversation turn are
             # not a transcript, however many have accumulated in the log.
             return (
-                self.history_pending()
-                if before is None
-                else HistoryPage([], None, False, through)
+                self.history_pending() if before is None else HistoryPage([], None, False, through)
             )
         count = (
-            len(self._history_turns)
-            if before is None
-            else self._history_boundaries.get(upper, 0)
+            len(self._history_turns) if before is None else self._history_boundaries.get(upper, 0)
         )
         target = max(0, count - limit)
         start = end - 1
@@ -598,14 +591,13 @@ class _ReplayPlan:
     def replay(self, gap: Optional[_ReplayGap]) -> Replay:
         if self.before is None:
             return Replay(events=self.ring, truncated=False, through=self.through)
-        return Replay(
-            events=gap.events + self.ring, truncated=gap.truncated, through=self.through
-        )
+        return Replay(events=gap.events + self.ring, truncated=gap.truncated, through=self.through)
 
 
 def _usage_identity(event: dict) -> dict:
     """Compare positional usage payloads without volatile observation time."""
     return {key: value for key, value in event.items() if key != "ts"}
+
 
 def _coalesce(records: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
     """``records`` with each run of consecutive same-turn ``text_delta``
@@ -635,8 +627,12 @@ def _coalesce(records: List[Tuple[int, dict]]) -> List[Tuple[int, dict]]:
     for seq, event in records:
         kind = event.get("kind")
         is_delta = kind in _DELTA_KINDS
-        if (run and is_delta and kind == out[-1][1].get("kind")
-                and event.get("turn") == out[-1][1].get("turn")):
+        if (
+            run
+            and is_delta
+            and kind == out[-1][1].get("kind")
+            and event.get("turn") == out[-1][1].get("turn")
+        ):
             run.append(event.get("text", ""))
             cut[0] = cut[0] or bool(event.get("truncated"))
             out[-1] = (seq, out[-1][1])
@@ -740,9 +736,13 @@ def _human_lines(blocks, automation_source=None) -> List[str]:
             body.extend(str(block.get("text", "")).splitlines() or [""])
         elif block.get("type") == "image_path":
             body.append("[image: %s]" % block.get("path", ""))
-    author = ("Automatic workflow continuation"
-              if automation_source == "loom_root_continuation"
-              else "Automatic turn" if automation_source else "Human")
+    author = (
+        "Automatic workflow continuation"
+        if automation_source == "loom_root_continuation"
+        else "Automatic turn"
+        if automation_source
+        else "Human"
+    )
     return ["> **%s:**" % author] + [("> " + line) if line else ">" for line in body]
 
 
@@ -788,8 +788,10 @@ def _render_markdown(kept: list, include: str, session_id, project_dir, exported
             # The same message, re-sent after a restart; not a second thing the
             # human said.
             lines.append("")
-            lines.append("(Turn %s re-sent after a restart; it is turn %s's message.)"
-                         % (turn, event["redelivery_of"]))
+            lines.append(
+                "(Turn %s re-sent after a restart; it is turn %s's message.)"
+                % (turn, event["redelivery_of"])
+            )
         elif kind == "user_turn":
             lines.append("")
             lines.extend(_human_lines(event.get("blocks"), event.get("automation_source")))

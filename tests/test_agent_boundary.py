@@ -447,7 +447,10 @@ def agent_route_prefixes():
 
     with tempfile.TemporaryDirectory() as d:
         app = agent_app.create_app(
-            d, page_html=TOY_PAGE, port=DEFAULT_PORT, register_routes=None,
+            d,
+            page_html=TOY_PAGE,
+            port=DEFAULT_PORT,
+            register_routes=None,
             provider_login=ProviderLogin(),
         )
         patterns = {entry[1].url_pattern for entry in app.url_map}
@@ -466,9 +469,10 @@ def _project_route_patterns():
     (registered, with the fake stores, both as the page's own project's and as
     the path-id form): the shared project page script (``project.js``) calls
     them through ``appUrl``, so they are the agent layer's routes to it."""
+    from fake_project_store import FakeLineage, FakeProjects
+
     from annealage_ember import app as agent_app
     from annealage_ember import projects
-    from fake_project_store import FakeLineage, FakeProjects
 
     patterns = set()
     for project_id in (None, "page"):
@@ -477,8 +481,12 @@ def _project_route_patterns():
 
             def register(app, allowed_origins, store=store, project_id=project_id):
                 projects.register_project_routes(
-                    app, auth=app.agent_auth, directory=store, history=store,
-                    lineage=FakeLineage(store), project_id=project_id,
+                    app,
+                    auth=app.agent_auth,
+                    directory=store,
+                    history=store,
+                    lineage=FakeLineage(store),
+                    project_id=project_id,
                 )
 
             app = agent_app.create_app(

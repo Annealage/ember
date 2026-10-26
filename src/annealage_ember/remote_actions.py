@@ -4,6 +4,7 @@ Records contain canonical argument digests and whitelisted provenance only;
 remote arguments are never persisted. Writes use an atomic snapshot under an
 OS file lock so concurrent workers and restarts share one replay decision.
 """
+
 import contextlib
 import fcntl
 import hashlib
@@ -14,7 +15,6 @@ import secrets
 import stat
 import threading
 from pathlib import Path
-
 
 MAX_RECORDS = 2000
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -38,12 +38,14 @@ RECONCILE_REQUEST_SCHEMA = {
         "confirm_unverified": {"type": "boolean", "const": True},
     },
     "required": [
-        "invocation_id", "expected_digest", "expected_context",
-        "risk_reason", "confirm_unverified",
+        "invocation_id",
+        "expected_digest",
+        "expected_context",
+        "risk_reason",
+        "confirm_unverified",
     ],
     "additionalProperties": False,
 }
-
 
 
 def project_hash(project_id):
@@ -139,7 +141,11 @@ class RemoteActionStore:
             return
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+            ):
                 raise PermissionError("remote action ledger file is not private")
             if info.st_size > MAX_FILE_BYTES:
                 raise OSError("remote action ledger exceeds its size limit")
@@ -149,27 +155,51 @@ class RemoteActionStore:
         finally:
             if fd >= 0:
                 os.close(fd)
-        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("records"), list):
+        if (
+            not isinstance(data, dict)
+            or data.get("version") != 1
+            or not isinstance(data.get("records"), list)
+        ):
             raise OSError("remote action ledger is malformed")
         rows = data["records"]
         if len(rows) > MAX_RECORDS:
             raise OSError("remote action ledger exceeds its record limit")
-        required = {"id", "intent_key", "server", "tool", "argument_digest", "project",
-                    "session", "source", "context", "outcome", "phase", "owner", "owner_pid"}
+        required = {
+            "id",
+            "intent_key",
+            "server",
+            "tool",
+            "argument_digest",
+            "project",
+            "session",
+            "source",
+            "context",
+            "outcome",
+            "phase",
+            "owner",
+            "owner_pid",
+        }
         for row in rows:
-            if not isinstance(row, dict) or not required.issubset(row) or row["project"] != self.project:
+            if (
+                not isinstance(row, dict)
+                or not required.issubset(row)
+                or row["project"] != self.project
+            ):
                 raise OSError("remote action ledger contains an invalid record")
         self._records = rows
 
     def _save(self):
         self._prune()
-        payload = json.dumps({"version": 1, "records": self._records}, sort_keys=True,
-                             separators=(",", ":")).encode("utf-8")
+        payload = json.dumps(
+            {"version": 1, "records": self._records}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
         if len(payload) > MAX_FILE_BYTES:
             raise OSError("remote action ledger exceeds its size limit")
         name = ".%s.%s.tmp" % (self.path.name, secrets.token_hex(8))
         temporary = self.path.parent / name
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(payload)
@@ -191,8 +221,11 @@ class RemoteActionStore:
     def _prune(self):
         if len(self._records) <= MAX_RECORDS:
             return
-        removable = [i for i, row in enumerate(self._records)
-                     if row["phase"] == "finished" and row["outcome"] != "uncertain"]
+        removable = [
+            i
+            for i, row in enumerate(self._records)
+            if row["phase"] == "finished" and row["outcome"] != "uncertain"
+        ]
         remove_count = len(self._records) - MAX_RECORDS
         remove = set(removable[:remove_count])
         self._records = [row for i, row in enumerate(self._records) if i not in remove]
@@ -202,7 +235,9 @@ class RemoteActionStore:
     def _recover_abandoned(self):
         changed = False
         for row in self._records:
-            if row["phase"] in ("preparing", "dispatching") and not _pid_alive(row.get("owner_pid")):
+            if row["phase"] in ("preparing", "dispatching") and not _pid_alive(
+                row.get("owner_pid")
+            ):
                 if row["phase"] == "dispatching":
                     row["outcome"] = "uncertain"
                 else:
@@ -213,7 +248,9 @@ class RemoteActionStore:
             self._save()
 
     def _latest(self, intent_key):
-        return next((row for row in reversed(self._records) if row["intent_key"] == intent_key), None)
+        return next(
+            (row for row in reversed(self._records) if row["intent_key"] == intent_key), None
+        )
 
     def begin(self, server, tool, arguments, *, source, context, approval=None):
         ctx = safe_context(context, self.project)
@@ -225,11 +262,20 @@ class RemoteActionStore:
             if previous and (previous["phase"] != "finished" or previous["outcome"] == "uncertain"):
                 return None, dict(previous)
             row = {
-                "id": secrets.token_hex(16), "intent_key": intent_key,
-                "server": str(server), "tool": str(tool), "argument_digest": digest,
-                "project": self.project, "session": self.session, "source": _label(source),
-                "context": ctx, "approval": _approval(approval), "outcome": "not_sent",
-                "phase": "preparing", "owner": self._owner, "owner_pid": os.getpid(),
+                "id": secrets.token_hex(16),
+                "intent_key": intent_key,
+                "server": str(server),
+                "tool": str(tool),
+                "argument_digest": digest,
+                "project": self.project,
+                "session": self.session,
+                "source": _label(source),
+                "context": ctx,
+                "approval": _approval(approval),
+                "outcome": "not_sent",
+                "phase": "preparing",
+                "owner": self._owner,
+                "owner_pid": os.getpid(),
             }
             self._records.append(row)
             self._save()
@@ -242,7 +288,9 @@ class RemoteActionStore:
         with self._locked():
             self._refresh()
             self._recover_abandoned()
-            index = next((i for i, row in enumerate(self._records) if row["id"] == invocation["id"]), None)
+            index = next(
+                (i for i, row in enumerate(self._records) if row["id"] == invocation["id"]), None
+            )
             if index is None or self._records[index]["owner"] != self._owner:
                 raise OSError("remote action reservation is no longer owned")
             self._records[index].update(outcome=outcome, phase=phase)
@@ -261,7 +309,11 @@ class RemoteActionStore:
             self._refresh()
             self._recover_abandoned()
             row = self._latest(key)
-            return dict(row) if row and (row["phase"] != "finished" or row["outcome"] == "uncertain") else None
+            return (
+                dict(row)
+                if row and (row["phase"] != "finished" or row["outcome"] == "uncertain")
+                else None
+            )
 
     def status(self, *, limit=100):
         limit = max(1, min(int(limit), 100))
@@ -269,10 +321,21 @@ class RemoteActionStore:
             self._refresh()
             self._recover_abandoned()
             rows = self._records[-limit:]
-        fields = ("id", "server", "tool", "argument_digest", "project", "session", "source",
-                  "context", "outcome", "phase", "evidence")
+        fields = (
+            "id",
+            "server",
+            "tool",
+            "argument_digest",
+            "project",
+            "session",
+            "source",
+            "context",
+            "outcome",
+            "phase",
+            "evidence",
+        )
         public = [{key: row.get(key) for key in fields} for row in rows]
-        for item, row in zip(public, rows):
+        for item, row in zip(public, rows, strict=False):
             reconciliation = row.get("reconciliation")
             if reconciliation:
                 item["reconciliation"] = {
@@ -281,8 +344,16 @@ class RemoteActionStore:
                 }
         return public
 
-    def reconcile(self, invocation_id, *, operator, risk_reason, confirm_unverified,
-                  expected_digest, expected_context):
+    def reconcile(
+        self,
+        invocation_id,
+        *,
+        operator,
+        risk_reason,
+        confirm_unverified,
+        expected_digest,
+        expected_context,
+    ):
         """Authenticated host caller records an explicitly unverified outcome."""
         risk = str(risk_reason) if isinstance(risk_reason, str) else ""
         if not operator or not _SAFE_LABEL.fullmatch(str(operator)):
@@ -298,11 +369,20 @@ class RemoteActionStore:
                 raise ValueError("no uncertain invocation to reconcile")
             if expected_digest != row["argument_digest"] or expected_context != row["context"]:
                 raise ValueError("invocation changed; refresh status before reconciling")
-            row.update(outcome="reported_result", evidence="operator_unverified", phase="finished",
-                       reconciliation={"operator": str(operator), "risk_reason": risk.strip(),
-                                       "outcome_unverified": True})
+            row.update(
+                outcome="reported_result",
+                evidence="operator_unverified",
+                phase="finished",
+                reconciliation={
+                    "operator": str(operator),
+                    "risk_reason": risk.strip(),
+                    "outcome_unverified": True,
+                },
+            )
             self._save()
             return dict(row)
+
+
 def _pid_alive(pid):
     if not isinstance(pid, int) or pid < 1:
         return False

@@ -67,9 +67,7 @@ def _system_prompt(tmp_path):
 
 
 def _review_server(store, broker):
-    grading = Grading(
-        ("list_comments", "resolve_comment"), ("add_callout",), ("delete_callout",)
-    )
+    grading = Grading(("list_comments", "resolve_comment"), ("add_callout",), ("delete_callout",))
     bus = _Bus(store, broker)
     return ToolServer(
         review_tools(store, bus=bus), grading=grading, bus=bus, paused_message=TOY_PAUSED_MESSAGE
@@ -91,10 +89,7 @@ async def _results(store, broker):
 
 
 def _tool_descriptions(store):
-    return [
-        t.description + json.dumps(t.input_schema)
-        for t in _review_server(store, None).tools
-    ]
+    return [t.description + json.dumps(t.input_schema) for t in _review_server(store, None).tools]
 
 
 def test_nothing_the_agent_reads_calls_the_owner_the_human(tmp_path):
@@ -128,9 +123,7 @@ def test_nothing_the_agent_reads_calls_the_owner_the_human(tmp_path):
     )
     upload = uploads.Upload("a.pdf", "a.pdf", 1, "application/pdf", tmp_path / "a.pdf")
     for label in (None, "Ada"):
-        texts.append(
-            uploads.note(action, upload, SimpleNamespace(label=label), False, "done")
-        )
+        texts.append(uploads.note(action, upload, SimpleNamespace(label=label), False, "done"))
 
     offenders = [t for t in texts if FORBIDDEN in t.lower()]
     assert offenders == []

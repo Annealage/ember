@@ -154,7 +154,6 @@ def test_a_text_transcript_reads_as_the_conversation_the_human_s_side_included()
     assert "images/wall.png" in text
 
 
-
 def test_automatic_turn_transcript_is_not_attributed_to_a_human():
     event = UserTurn(
         turn=1,
@@ -165,6 +164,7 @@ def test_automatic_turn_transcript_is_not_attributed_to_a_human():
     assert "Automatic workflow continuation" in text
     assert "Human" not in text
     assert "Continue scoped work." in text
+
 
 def test_render_transcript_markdown_full_includes_tool_input_and_result_and_cost():
     records = [
