@@ -1,152 +1,96 @@
-import json
-import os
-
 import pytest
 
 from annealage_ember.hosted_profile import (
     AUTH_FILE_ENV,
-    AUTH_FILE_NAME,
-    DEFAULT_AUTH_FILE,
-    HostedProvider,
-    auth_file_from_env,
+    USAGE_DIR_ENV,
+    HostedProfileError,
     hosted_profile,
-    models_document,
-    provider_model,
-    providers_document,
-    proxy_model,
-    proxy_provider,
 )
 
 
-def test_models_document_is_proxy_only():
-    doc = json.loads(models_document("http://p:1", usage_label="trace"))
-    assert doc == {"providers": {"annealage": {
-        "baseUrl": "http://p:1/v1", "api": "openai-completions",
-        "apiKey": "ANNEALAGE_INFERENCE_TOKEN",
-        "headers": {"X-Annealage-Usage-Label": "trace"},
-        "discovery": {"type": "proxy"}}}}
+@pytest.fixture
+def mounts(tmp_path):
+    mount = tmp_path / "omp-auth"
+    mount.mkdir()
+    (mount / "agent.db").write_bytes(b"credentials")
+    usage = tmp_path / "usage"
+    usage.mkdir()
+    env = {AUTH_FILE_ENV: str(mount / "agent.db"), USAGE_DIR_ENV: str(usage)}
+    return mount, usage, env
 
 
-def test_profile_is_temp_and_cleaned(tmp_path):
-    with hosted_profile("http://p:1", usage_label="x", parent=tmp_path) as d:
-        assert d.parent == tmp_path
-        assert os.listdir(d) == ["models.yml"]
-    assert not d.exists()
-    with pytest.raises(RuntimeError):
-        with hosted_profile("http://p:1", usage_label="x", parent=tmp_path) as d:
-            raise RuntimeError
-    assert not d.exists()
-
-
-def test_proxy_model():
-    assert proxy_model("annealage", {"a": "m"}, "a") == "annealage/m"
-    with pytest.raises(KeyError):
-        proxy_model("annealage", {}, "a")
-
-
-# --- multiple providers and the operator's auth file -------------------------------------------------
-
-
-def test_single_proxy_document_is_byte_identical():
-    # The exact text a single-proxy product (Trace) has always produced.
-    assert models_document("http://p:1", usage_label="trace") == (
-        '{"providers": {"annealage": {"baseUrl": "http://p:1/v1", "api": "openai-completions", '
-        '"apiKey": "ANNEALAGE_INFERENCE_TOKEN", "headers": {"X-Annealage-Usage-Label": "trace"}, '
-        '"discovery": {"type": "proxy"}}}}'
-    )
-    one = providers_document([proxy_provider("http://p:1")], usage_label="trace")
-    assert one == models_document("http://p:1", usage_label="trace")
-
-
-def _two():
-    return [
-        proxy_provider("http://p:1", models={"agent": "canvas-agent"}),
-        HostedProvider("lab", "https://lab.example/v1", api="openai-responses", token_env="LAB_TOKEN",
-                       models={"review": "big", "fast": "big"}, discovery=False, label=False),
-    ]
-
-
-def test_two_providers_document():
-    doc = json.loads(providers_document(_two(), usage_label="canvas"))["providers"]
-    assert list(doc) == ["annealage", "lab"]
-    assert doc["annealage"]["discovery"] == {"type": "proxy"}
-    assert doc["lab"] == {
-        "baseUrl": "https://lab.example/v1", "api": "openai-responses", "apiKey": "LAB_TOKEN",
-        "models": [{"id": "big", "name": "big"}],
-    }
-    assert "headers" not in doc["lab"]  # no usage label to a third party
-
-
-def test_unauthenticated_provider_and_validation():
-    entry = HostedProvider("local", "http://h/v1", token_env=None).entry("x")
-    assert entry["auth"] == "none" and "apiKey" not in entry
-    with pytest.raises(ValueError):
-        HostedProvider("a/b", "http://h/v1")
-    with pytest.raises(ValueError):
-        HostedProvider("x", "http://h/v1", discovery=False)
-    with pytest.raises(ValueError):
-        providers_document([], usage_label="x")
-    with pytest.raises(ValueError):
-        providers_document([proxy_provider("http://a"), proxy_provider("http://b")], usage_label="x")
-
-
-def test_provider_model_takes_first_provider_with_the_tier():
-    providers = _two()
-    assert provider_model(providers, "agent") == "annealage/canvas-agent"
-    assert provider_model(providers, "review") == "lab/big"
-    with pytest.raises(KeyError):
-        provider_model(providers, "other")
-
-
-def test_profile_with_providers_is_temp_and_cleaned(tmp_path):
-    with hosted_profile(providers=_two(), usage_label="canvas", parent=tmp_path) as d:
-        assert os.listdir(d) == ["models.yml"]
-        assert set(json.loads((d / "models.yml").read_text())["providers"]) == {"annealage", "lab"}
-    assert not d.exists()
-    with pytest.raises(ValueError):
-        with hosted_profile(usage_label="x"):
-            pass
-    with pytest.raises(ValueError):
-        with hosted_profile("http://p:1", providers=_two(), usage_label="x"):
-            pass
-
-
-def test_auth_file_present_is_linked_and_target_survives_cleanup(tmp_path):
-    auth = tmp_path / "operator" / "agent.db"
-    auth.parent.mkdir()
-    auth.write_bytes(b"credentials")
+def test_profile_links_only_the_mounted_auth_file_and_names_the_usage_dir(tmp_path, mounts):
+    mount, usage, env = mounts
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    with hosted_profile("http://p:1", usage_label="x", parent=scratch, auth_file=auth) as d:
-        link = d / AUTH_FILE_NAME
-        assert link.is_symlink() and link.resolve() == auth.resolve()
-        assert link.read_bytes() == b"credentials"
-        assert sorted(os.listdir(d)) == [AUTH_FILE_NAME, "models.yml"]
-    assert not d.exists()
-    assert auth.read_bytes() == b"credentials"  # cleanup removed the link, never the operator's file
+    with hosted_profile(env, mount=mount, parent=scratch) as profile:
+        assert [p.name for p in profile.agent_dir.iterdir()] == ["agent.db"]
+        assert (profile.agent_dir / "agent.db").is_symlink()
+        assert (profile.agent_dir / "agent.db").read_bytes() == b"credentials"
+        assert profile.session_dir == usage.resolve()
+        assert profile.agent_dir.parent == scratch
+    assert not profile.agent_dir.exists()
+    assert (mount / "agent.db").read_bytes() == b"credentials"  # the target survives cleanup
+
+
+def test_profile_is_cleaned_when_the_body_raises(tmp_path, mounts):
+    mount, _, env = mounts
     with pytest.raises(RuntimeError):
-        with hosted_profile("http://p:1", usage_label="x", parent=scratch, auth_file=auth) as d:
-            raise RuntimeError
-    assert not d.exists() and auth.read_bytes() == b"credentials"
+        with hosted_profile(env, mount=mount, parent=tmp_path) as profile:
+            raise RuntimeError("boom")
+    assert not profile.agent_dir.exists()
 
 
-def test_auth_file_absent_links_nothing(tmp_path):
-    with hosted_profile("http://p:1", usage_label="x", parent=tmp_path,
-                        auth_file=tmp_path / "missing.db") as d:
-        assert os.listdir(d) == ["models.yml"]
-    with hosted_profile("http://p:1", usage_label="x", parent=tmp_path, auth_file=None) as d:
-        assert os.listdir(d) == ["models.yml"]
-    with pytest.raises(ValueError):
-        with hosted_profile("http://p:1", usage_label="x", parent=tmp_path, auth_file="relative.db"):
+@pytest.mark.parametrize("change", [
+    lambda mount, usage, env: env.pop(AUTH_FILE_ENV),
+    lambda mount, usage, env: env.update({AUTH_FILE_ENV: ""}),
+    lambda mount, usage, env: env.update({AUTH_FILE_ENV: "agent.db"}),
+    lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "missing" / "agent.db")}),
+    lambda mount, usage, env: env.update({AUTH_FILE_ENV: str(mount / "other.db")}),
+    lambda mount, usage, env: env.pop(USAGE_DIR_ENV),
+    lambda mount, usage, env: env.update({USAGE_DIR_ENV: "usage"}),
+    lambda mount, usage, env: env.update({USAGE_DIR_ENV: str(usage / "absent")}),
+])
+def test_missing_or_malformed_mounts_are_refused(tmp_path, mounts, change):
+    mount, usage, env = mounts
+    change(mount, usage, env)
+    with pytest.raises(HostedProfileError):
+        with hosted_profile(env, mount=mount, parent=tmp_path):
             pass
 
 
-def test_auth_file_from_env(monkeypatch, tmp_path):
-    assert auth_file_from_env({}) is None
-    assert auth_file_from_env({AUTH_FILE_ENV: "  "}) is None
-    assert auth_file_from_env({AUTH_FILE_ENV: str(tmp_path / "a.db")}) == tmp_path / "a.db"
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert auth_file_from_env({AUTH_FILE_ENV: "default"}) == tmp_path / ".omp/agent/agent.db"
-    monkeypatch.setenv(AUTH_FILE_ENV, "default")
-    assert auth_file_from_env() == tmp_path / ".omp/agent/agent.db"
-    assert str(DEFAULT_AUTH_FILE) == "~/.omp/agent/agent.db"
+def test_an_auth_file_outside_the_mount_is_refused_even_through_a_symlink(tmp_path, mounts):
+    mount, _, env = mounts
+    elsewhere = tmp_path / "operator"
+    elsewhere.mkdir()
+    (elsewhere / "agent.db").write_bytes(b"operator")
+    direct = {**env, AUTH_FILE_ENV: str(elsewhere / "agent.db")}
+    with pytest.raises(HostedProfileError, match="outside"):
+        with hosted_profile(direct, mount=mount, parent=tmp_path):
+            pass
+    (mount / "sub").mkdir()
+    (mount / "sub" / "agent.db").symlink_to(elsewhere / "agent.db")
+    linked = {**env, AUTH_FILE_ENV: str(mount / "sub" / "agent.db")}
+    with pytest.raises(HostedProfileError, match="outside"):
+        with hosted_profile(linked, mount=mount, parent=tmp_path):
+            pass
+
+
+@pytest.mark.parametrize("name", ["ANNEALAGE_INFERENCE_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PI_CODING_AGENT_DIR"])
+def test_ambient_credentials_are_refused_not_ignored(tmp_path, mounts, name):
+    mount, _, env = mounts
+    with pytest.raises(HostedProfileError, match=name):
+        with hosted_profile({**env, name: "x"}, mount=mount, parent=tmp_path):
+            pass
+
+
+def test_defaults_read_the_process_environment(tmp_path, mounts, monkeypatch):
+    mount, usage, env = mounts
+    from annealage_ember.hosted_profile import AMBIENT_CREDENTIAL_ENV
+
+    for name in AMBIENT_CREDENTIAL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with hosted_profile(mount=mount, parent=tmp_path) as profile:
+        assert profile.session_dir == usage.resolve()

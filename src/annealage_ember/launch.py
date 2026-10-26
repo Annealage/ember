@@ -37,6 +37,7 @@ def build_session(
     agent_token,
     trusted_config_digest=None,
     omp_agent_dir=None,
+    omp_session_dir=None,
     omp_binary=None,
     omp_config_dir=None,
     omp_login_command=None,
@@ -58,6 +59,8 @@ def build_session(
     a parameter here, because no backend is ever given it, and the address a
     refusal names when no browser is attached to decide a permission is
     ``bus.url``, which carries no token either.
+    ``omp_session_dir``, when given, is omp's ``--session-dir`` instead of the
+    project state's own (a hosted worker's usage directory).
     ``trusted_config_digest`` is the Claude configuration digest the startup
     trust gate accepted, if it ran.
 
@@ -200,7 +203,7 @@ def build_session(
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
             binary=omp_binary,
-            session_dir=sessions.state_dir(state_project_dir) / "omp",
+            session_dir=omp_session_dir or sessions.state_dir(state_project_dir) / "omp",
             resume=info.omp_session_file if info is not None else None,
             on_session_file=_record_session_file,
             login_command=omp_login_command,

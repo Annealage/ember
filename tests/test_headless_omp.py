@@ -190,6 +190,16 @@ async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
         "high",
     )
 
+async def test_an_explicit_omp_session_dir_is_where_omp_keeps_the_conversation(omp_client, tmp_path):
+    usage = tmp_path / "usage"
+    usage.mkdir()
+    omp_client.script = lambda client: client.end()
+    result = await run_prompt("do it", **make_args(tmp_path, omp_session_dir=str(usage)))
+    assert result.error is None
+    (client,) = omp_client.instances
+    assert Path(client.kwargs["session_dir"]) == usage
+
+
 @pytest.mark.parametrize("model_role", ("smol", "default", "slow"))
 async def test_model_role_uses_omp_alias_and_reports_backend_model(
     omp_client, tmp_path, model_role

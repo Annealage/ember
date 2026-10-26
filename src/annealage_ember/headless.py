@@ -689,6 +689,7 @@ def _build_session(
     state_dir,
     instructions,
     omp_agent_dir,
+    omp_session_dir,
     omp_binary,
     omp_config_dir,
     omp_request_timeout,
@@ -729,7 +730,7 @@ def _build_session(
             request_timeout=omp_request_timeout,
             # The conversation file goes under the run's own state, and goes
             # with it.
-            session_dir=os.path.join(state_dir, "omp"),
+            session_dir=omp_session_dir or os.path.join(state_dir, "omp"),
             resume=resume,
             turn=resume_turn,
             strict_resume=resume is not None,
@@ -1070,6 +1071,7 @@ async def run_prompt(
     thinking=None,
     model_role=None,
     omp_agent_dir=None,
+    omp_session_dir=None,
     omp_binary=None,
     omp_config_dir=None,
     omp_request_timeout=None,
@@ -1147,7 +1149,9 @@ async def run_prompt(
     ``effort`` option. These are backend-native settings, not calibrated levels
     across providers. ``omp_agent_dir``, ``omp_binary`` and ``omp_config_dir``
     are ``launch.build_session``'s omp profile, executable and config root,
-    ``None`` for omp as installed.
+    ``None`` for omp as installed. ``omp_session_dir`` is omp's ``--session-dir``
+    in place of the run's own state (a hosted worker's usage directory, which
+    the platform reads after the run; nothing removes it here).
     ``provider_session_id`` is an optional opaque OMP provider-affinity ID; it
     is passed to OMP's ``RpcClient`` and is not the run's telemetry
     ``session_id``. ``cache_retention`` optionally sets the OMP child process's
@@ -1339,6 +1343,7 @@ async def run_prompt(
                     state_dir=str(state.path),
                     instructions=system or None,
                     omp_agent_dir=omp_agent_dir,
+                    omp_session_dir=omp_session_dir,
                     omp_binary=omp_binary,
                     omp_config_dir=omp_config_dir,
                     omp_request_timeout=omp_request_timeout,
