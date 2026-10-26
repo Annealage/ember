@@ -11,7 +11,13 @@ A hosted worker is given two mounts and names them in its environment:
     request) lands there and the platform reads it after the job. Ember writes no
     usage file of its own.
 
-Both names are reserved. ``hosted_profile`` builds one throwaway omp agent
+``ANNEALAGE_OMP_MODELS_FILE`` (optional)
+    omp's provider config (``models.yml``: e.g. a local llama-swap endpoint with
+    ``auth: none``), a read-only file in the same mount or a sibling one. When set
+    it is linked into the agent directory too, so omp sees the providers; when
+    unset the run has only the auth store's providers.
+
+All three names are reserved. ``hosted_profile`` builds one throwaway omp agent
 directory per run holding only a symlink to that auth file (a refreshed token is
 refreshed once for everyone; a symlink cannot make the target read-only, so the
 mount does that), and yields it with the session directory::
@@ -23,7 +29,7 @@ mount does that), and yields it with the session directory::
     #                         omp_session_dir=profile.session_dir)
 
 The model is the caller's ``provider/model`` reference against the providers the
-auth store holds; there is no ``models.yml``, proxy URL or token variable.
+auth store and the optional models file hold; there is no proxy URL or token variable.
 
 Every other credential source is refused with ``HostedProfileError`` rather
 than ignored: an auth file outside the mount, a relative, missing or non-file
@@ -45,6 +51,10 @@ from typing import Iterator, Mapping, Optional, Union
 AUTH_FILE_ENV = "ANNEALAGE_OMP_AUTH_FILE"
 #: Environment variable naming the directory omp keeps its session JSONL in.
 USAGE_DIR_ENV = "ANNEALAGE_USAGE_DIR"
+#: Environment variable naming the optional mounted omp ``models.yml``.
+MODELS_FILE_ENV = "ANNEALAGE_OMP_MODELS_FILE"
+#: omp reads its provider config from this file in its agent directory.
+MODELS_FILE_NAME = "models.yml"
 #: omp's auth store is this file in its agent directory.
 AUTH_FILE_NAME = "agent.db"
 #: Where the platform mounts omp's auth directory; the auth file must resolve inside it.
@@ -111,6 +121,32 @@ def auth_file_from_env(env: Optional[Mapping[str, str]] = None, *, mount: Union[
     return resolved
 
 
+def models_file_from_env(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    mount: Union[str, Path] = AUTH_MOUNT,
+    models_mount: Union[str, Path, None] = None,
+) -> Optional[Path]:
+    """The mounted ``models.yml`` named by ``ANNEALAGE_OMP_MODELS_FILE``, resolved, or None when unset;
+    ``HostedProfileError`` unless it is absolute, named ``models.yml``, an existing regular file and (symlinks
+    resolved) inside ``models_mount`` or ``mount``."""
+    value = (os.environ if env is None else env).get(MODELS_FILE_ENV, "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise HostedProfileError(f"{MODELS_FILE_ENV} must be an absolute path")
+    if path.name != MODELS_FILE_NAME:
+        raise HostedProfileError(f"{MODELS_FILE_ENV} must name {MODELS_FILE_NAME}")
+    resolved = path.resolve()
+    roots = [Path(mount).resolve()] + ([Path(models_mount).resolve()] if models_mount else [])
+    if not any(_inside(resolved, root) for root in roots):
+        raise HostedProfileError(f"{MODELS_FILE_ENV} is outside the mounts " + ", ".join(map(str, roots)))
+    if not resolved.is_file():
+        raise HostedProfileError(f"{MODELS_FILE_ENV} is not an existing file")
+    return resolved
+
+
 def usage_dir_from_env(env: Optional[Mapping[str, str]] = None) -> Path:
     """The existing directory named by ``ANNEALAGE_USAGE_DIR``, for omp's ``--session-dir``."""
     value = (os.environ if env is None else env).get(USAGE_DIR_ENV, "").strip()
@@ -129,16 +165,20 @@ def hosted_profile(
     env: Optional[Mapping[str, str]] = None,
     *,
     mount: Union[str, Path] = AUTH_MOUNT,
+    models_mount: Union[str, Path, None] = None,
     parent: Optional[Path] = None,
     prefix: str = "omp-agent-",
 ) -> Iterator[HostedProfile]:
     """Yield a fresh temp omp agent directory holding only the link to the mounted auth file, with the usage
     directory; remove the directory (never the link's target) on exit, normally or not. ``env`` defaults to
-    ``os.environ``; ``mount`` to ``AUTH_MOUNT``; ``parent`` is where the directory is created (a run's scratch)."""
+    ``os.environ``; ``mount`` to ``AUTH_MOUNT``; ``models_mount`` is an extra root the models file may sit in; ``parent`` is where the directory is created (a run's scratch)."""
     refuse_ambient_credentials(env)
     auth = auth_file_from_env(env, mount=mount)
+    models = models_file_from_env(env, mount=mount, models_mount=models_mount)
     session_dir = usage_dir_from_env(env)
     with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as directory:
         agent_dir = Path(directory)
         (agent_dir / AUTH_FILE_NAME).symlink_to(auth)
+        if models is not None:
+            (agent_dir / MODELS_FILE_NAME).symlink_to(models)
         yield HostedProfile(agent_dir=agent_dir, session_dir=session_dir)

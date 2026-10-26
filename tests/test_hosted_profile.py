@@ -2,6 +2,7 @@ import pytest
 
 from annealage_ember.hosted_profile import (
     AUTH_FILE_ENV,
+    MODELS_FILE_ENV,
     USAGE_DIR_ENV,
     HostedProfileError,
     hosted_profile,
@@ -94,3 +95,46 @@ def test_defaults_read_the_process_environment(tmp_path, mounts, monkeypatch):
         monkeypatch.setenv(key, value)
     with hosted_profile(mount=mount, parent=tmp_path) as profile:
         assert profile.session_dir == usage.resolve()
+
+
+def test_a_mounted_models_file_is_linked_beside_the_auth_file(tmp_path, mounts):
+    mount, usage, env = mounts
+    (mount / "models.yml").write_text("providers: {}\n")
+    with hosted_profile({**env, MODELS_FILE_ENV: str(mount / "models.yml")}, mount=mount, parent=tmp_path) as profile:
+        assert sorted(p.name for p in profile.agent_dir.iterdir()) == ["agent.db", "models.yml"]
+        assert (profile.agent_dir / "models.yml").read_text() == "providers: {}\n"
+    assert (mount / "models.yml").exists()
+
+
+def test_a_models_file_in_a_sibling_mount_needs_that_mount_named(tmp_path, mounts):
+    mount, usage, env = mounts
+    sibling = tmp_path / "omp-config"
+    sibling.mkdir()
+    (sibling / "models.yml").write_text("x")
+    env = {**env, MODELS_FILE_ENV: str(sibling / "models.yml")}
+    with pytest.raises(HostedProfileError):
+        with hosted_profile(env, mount=mount, parent=tmp_path):
+            pass
+    with hosted_profile(env, mount=mount, models_mount=sibling, parent=tmp_path) as profile:
+        assert (profile.agent_dir / "models.yml").is_symlink()
+
+
+@pytest.mark.parametrize("where", ["relative", "misnamed", "missing", "outside", "escape"])
+def test_a_bad_models_file_is_refused(tmp_path, mounts, where):
+    mount, usage, env = mounts
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "models.yml").write_text("x")
+    (mount / "other.yml").write_text("x")
+    (mount / "link.yml").mkdir()
+    (mount / "link.yml" / "models.yml").symlink_to(elsewhere / "models.yml")
+    value = {
+        "relative": "models.yml",
+        "misnamed": str(mount / "other.yml"),
+        "missing": str(mount / "models.yml"),
+        "outside": str(elsewhere / "models.yml"),
+        "escape": str(mount / "link.yml" / "models.yml"),
+    }[where]
+    with pytest.raises(HostedProfileError):
+        with hosted_profile({**env, MODELS_FILE_ENV: value}, mount=mount, parent=tmp_path):
+            pass
