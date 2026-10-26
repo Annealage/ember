@@ -98,6 +98,52 @@ const subjects = (st) => st.commits.map((c) => c.subject);
 const restoreCalls = (store) => store.calls.filter((c) => c.route === "api/restore");
 const lastCall = (store, route) => store.calls.filter((c) => c.route === route).at(-1);
 
+// ── a host with send to / derived from ──────────────────────────────────
+
+function lineageHost(options) {
+  const host = {
+    calls: [], answer: options.answer || null, fail: options.fail || null,
+    targets: [
+      { product: "alpha", label: "Alpha", can_create: true, new_label: "A new Alpha", existing: [{ id: "existing_1", title: "One" }] },
+      { product: "beta", label: "Beta", can_create: true, existing: [] },
+      { product: "gamma", label: "Gamma", can_create: true, existing: [], unavailable: "Gamma is not set up here." },
+    ],
+  };
+  host.request = async (route, body) => {
+    host.calls.push({ route, body });
+    if (host.answer) return host.answer;
+    if (route === "api/lineage") {
+      return {
+        status: 200,
+        data: {
+          ok: true, can_send: options.canSend !== false, disabled_reason: options.reason || "",
+          head_revision: options.head === undefined ? "c9" : options.head,
+          send_label: "Pass to", derived_label: "Came from", sent_label: "Went to",
+          targets: host.targets,
+          derived_from: [{ project: "origin", title: "Origin", revision: "r1", local_revision: "c0" }],
+          sent_to: [{ project: "next", title: "Next", revision: "r2", local_revision: "c5" }],
+        },
+      };
+    }
+    if (host.fail) return host.fail;
+    return {
+      status: 200,
+      data: { ok: true, derivation: { target_project: "prj_1", target_title: "Review", created: true, state: "queued", href: "/p/prj_1/" } },
+    };
+  };
+  return host;
+}
+
+function lineageSetup(options = {}) {
+  const host = lineageHost(options);
+  const notes = [];
+  const ctx = P.createProjectContext({
+    client: P.createProjectClient({ request: host.request }),
+    notify: (message, ok) => notes.push({ message, ok }),
+  });
+  return { host, ctx, notes, model: P.createLineageModel(ctx) };
+}
+
 // ── cases ───────────────────────────────────────────────────────────────
 
 const cases = {
@@ -407,6 +453,183 @@ const cases = {
     assert.equal(list.state.creating, false);
     const made = await P.createListModel(ctx, {}).create({ id: "lamp", title: "Lamp" });
     assert.equal(made.id, "lamp");
+  },
+
+  // ── send to / derived from ──────────────────────────────────────────
+
+  async a_host_without_lineage_shows_nothing() {
+    for (const answer of [{ status: 404, data: null }, { status: 404, data: { ok: false, error: "no", unsupported: true } }]) {
+      const { model } = lineageSetup({ answer });
+      await model.refresh();
+      assert.equal(model.state.available, false);
+      assert.equal(model.state.error, "");
+    }
+    // A project that does not exist is the store's answer, not an absent feature.
+    const { model } = lineageSetup({ answer: { status: 404, data: { ok: false, error: "there is no project camera" } } });
+    await model.refresh();
+    assert.equal(model.state.available, null);
+    assert.equal(model.state.error, "there is no project camera");
+  },
+
+  async the_read_gives_the_options_and_both_directions_in_the_hosts_words() {
+    const { model, host } = lineageSetup();
+    await model.refresh();
+    const st = model.state;
+    assert.equal(st.available, true);
+    assert.equal(st.canSend, true);
+    assert.equal(st.headRevision, "c9");
+    assert.deepEqual(st.labels, { send: "Pass to", derived: "Came from", sent: "Went to" });
+    assert.deepEqual(st.targets.map((t) => t.label), ["Alpha", "Beta", "Gamma"]);
+    assert.deepEqual(st.derivedFrom.map((l) => l.project), ["origin"]);
+    assert.deepEqual(st.sentTo.map((l) => l.project), ["next"]);
+    assert.equal(host.calls[0].route, "api/lineage");
+  },
+
+  async the_client_tells_a_hosts_403_from_a_stale_link() {
+    const answers = [
+      { status: 403, data: { ok: false, error: "You may not send this project.", forbidden: true } },
+      { status: 403, data: null },
+    ];
+    const client = P.createProjectClient({ request: async () => answers.shift() });
+    await assert.rejects(client.lineage(), (e) => e instanceof P.ForbiddenError && e.message === "You may not send this project.");
+    await assert.rejects(client.lineage(), (e) => e.constructor === P.ProjectError && e.message === P.REFUSED);
+    const calls = [];
+    const sending = P.createProjectClient({ request: async (r, b) => (calls.push({ r, b }), { status: 200, data: { ok: true } }) });
+    await sending.send({ revision: "c1", targetProduct: "alpha", targetProject: undefined, intent: undefined });
+    assert.deepEqual(calls[0], { r: "api/send", b: { revision: "c1", target_product: "alpha", target_project: null, intent: "" } });
+    assert.equal(P.pathEndpoints("a b").send, "api/projects/a%20b/send");
+    assert.equal(P.pathEndpoints("a b").lineage, "api/projects/a%20b/lineage");
+  },
+
+  async someone_who_may_not_send_gets_nothing_to_send_with() {
+    const { model, host } = lineageSetup({ canSend: false, reason: "Viewers cannot send." });
+    await model.refresh();
+    const st = model.state;
+    assert.equal(st.canSend, false);
+    assert.equal(st.disabledReason, "Viewers cannot send.");
+    model.toggleMenu(true);
+    assert.equal(st.menuOpen, false);
+    model.chooseRevision("c3");
+    assert.equal(st.menuOpen, false);
+    model.begin("alpha");
+    assert.equal(st.draft, null);
+    assert.equal(host.calls.filter((c) => c.route === "api/send").length, 0);
+  },
+
+  async a_send_carries_the_revision_chosen_and_the_target_and_reads_again() {
+    const { model, host, notes } = lineageSetup();
+    await model.refresh();
+    const st = model.state;
+    model.chooseRevision("c3");
+    assert.equal(st.menuOpen, true);
+    model.begin("alpha");
+    assert.equal(st.menuOpen, false);
+    assert.equal(st.draft.revision, "c3");
+    assert.equal(st.draft.project, null); // a new one unless chosen
+    model.setProject("existing_1");
+    model.setIntent("please review");
+    await model.confirm();
+    const sends = () => host.calls.filter((c) => c.route === "api/send");
+    assert.deepEqual(sends().map((c) => c.body), [
+      { revision: "c3", target_product: "alpha", target_project: "existing_1", intent: "please review" }]);
+    assert.equal(st.draft, null);
+    assert.equal(st.revision, null);
+    assert.equal(st.result.label, "Alpha");
+    assert.equal(st.result.target_project, "prj_1");
+    assert.deepEqual(notes.at(-1), { message: "Went to Alpha", ok: true });
+    assert.equal(host.calls.filter((c) => c.route === "api/lineage").length, 2);
+    // The project as it is now is the default revision, and a new target sends null.
+    model.begin("beta");
+    assert.equal(st.draft.revision, "c9");
+    await model.confirm();
+    assert.equal(sends().length, 2);
+    assert.equal(sends().at(-1).body.target_project, null);
+    assert.equal(sends().at(-1).body.revision, "c9");
+  },
+
+  async a_product_that_cannot_be_chosen_and_a_project_with_nothing_to_send_are_refused_locally() {
+    const { model, host } = lineageSetup();
+    await model.refresh();
+    model.begin("gamma"); // listed, unavailable
+    assert.equal(model.state.draft, null);
+    model.begin("nope");
+    assert.equal(model.state.draft, null);
+    const empty = lineageSetup({ head: "" });
+    await empty.model.refresh();
+    empty.model.begin("alpha");
+    await empty.model.confirm();
+    assert.match(empty.model.state.draft.error, /no revision/);
+    assert.equal(empty.host.calls.filter((c) => c.route === "api/send").length, 0);
+    assert.equal(host.calls.filter((c) => c.route === "api/send").length, 0);
+  },
+
+  async a_send_refused_as_busy_or_moved_on_is_kept_and_never_retried() {
+    for (const [fail, busy] of [
+      [{ status: 409, data: { ok: false, error: "the target is being built", busy: true } }, true],
+      [{ status: 409, data: { ok: false, error: "the target moved on", conflict: true, current_etag: "v4" } }, false],
+    ]) {
+      const { model, host } = lineageSetup({ fail });
+      await model.refresh();
+      const st = model.state;
+      model.begin("alpha");
+      model.setIntent("mine");
+      await model.confirm();
+      assert.equal(st.draft, null);
+      assert.equal(st.conflict.busy, busy);
+      assert.equal(st.conflict.message, fail.data.error);
+      assert.equal(st.conflict.label, "Alpha");
+      assert.equal(st.conflict.request.intent, "mine");
+      const sends = () => host.calls.filter((c) => c.route === "api/send").length;
+      assert.equal(sends(), 1);
+      // Not offered again before the person has seen the options as they are.
+      model.sendAgain();
+      assert.ok(st.conflict && st.draft === null);
+      await model.reloadAfterConflict();
+      assert.equal(st.conflict.reloaded, true);
+      assert.equal(sends(), 1, "nothing was sent behind the person's back");
+      host.fail = null;
+      model.sendAgain();
+      assert.equal(st.conflict, null);
+      assert.equal(st.draft.intent, "mine");
+      assert.equal(sends(), 1);
+      await model.confirm(); // their own click
+      assert.equal(sends(), 2);
+      assert.equal(st.result.target_project, "prj_1");
+    }
+  },
+
+  async a_kept_send_is_dropped_with_a_reason_when_the_options_no_longer_have_it() {
+    const { model, host } = lineageSetup({ fail: { status: 409, data: { ok: false, error: "moved", conflict: true } } });
+    await model.refresh();
+    model.begin("alpha");
+    await model.confirm();
+    host.targets = host.targets.filter((t) => t.product !== "alpha");
+    await model.reloadAfterConflict();
+    model.sendAgain();
+    assert.equal(model.state.draft, null);
+    assert.equal(model.state.conflict, null);
+    assert.match(model.state.error, /no longer offered/);
+  },
+
+  async a_forbidden_send_stays_in_the_dialog_with_the_hosts_words() {
+    const { model, host } = lineageSetup({
+      fail: { status: 403, data: { ok: false, error: "You may not send this project.", forbidden: true } },
+    });
+    await model.refresh();
+    model.begin("alpha");
+    await model.confirm();
+    assert.equal(model.state.draft.error, "You may not send this project.");
+    assert.equal(model.state.draft.sending, false);
+    assert.equal(model.state.conflict, null);
+    assert.equal(host.calls.filter((c) => c.route === "api/send").length, 1);
+  },
+
+  async only_one_send_is_in_flight() {
+    const { model, host } = lineageSetup();
+    await model.refresh();
+    model.begin("alpha");
+    await Promise.all([model.confirm(), model.confirm()]);
+    assert.equal(host.calls.filter((c) => c.route === "api/send").length, 1);
   },
 };
 
