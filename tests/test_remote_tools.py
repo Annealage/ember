@@ -259,6 +259,70 @@ async def test_graded_remote_tools_are_proxied_with_the_remote_s_schema_and_call
     assert fake.headers and all(h.get("authorization") == "Bearer remote-key" for h in fake.headers)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_remote_read_observer_is_awaited_before_delivery(
+    fake, bus, tmp_path, monkeypatch, reconnect
+):
+    if reconnect:
+        bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+        await tools.reconnect()
+    else:
+        tools = _tools(bus, tmp_path, _fake(fake))
+    entered, release = asyncio.Event(), asyncio.Event()
+    observed = []
+
+    async def observer(server_name, tool_name, args, result):
+        entered.set()
+        await release.wait()
+        observed.append((server_name, tool_name, args, result))
+
+    # Set after proxy construction, as a product can do for a specialist bus.
+    bus.remote_result_observer = observer
+    args = {"query": "RP2040"}
+    pending = asyncio.create_task(tools.remote_tables()["fake"]["lookup"].handler(args))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not pending.done()
+    finally:
+        release.set()
+    result = await pending
+    assert observed == [("fake", "lookup", args, result)]
+    assert result == {"content": [{"type": "text", "text": "found RP2040"}]}
+
+
+@pytest.mark.asyncio
+async def test_remote_observer_skips_errors_and_non_reads(fake, bus, tmp_path):
+    observed = []
+
+    async def observer(*values):
+        observed.append(values)
+
+    bus.remote_result_observer = observer
+    tools = _tools(bus, tmp_path, _fake(fake))
+    table = tools.remote_tables()["fake"]
+    assert (await table["broken"].handler({}))["is_error"]
+    assert _text(await table["store"].handler({"text": "note"})) == "stored"
+    assert observed == []
+    fake.stop()
+    assert (await table["lookup"].handler({"query": "RP2040"}))["is_error"]
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_remote_observer_failure_fails_delivery(fake, bus, tmp_path):
+    async def observer(*values):
+        await asyncio.sleep(0)
+        raise RuntimeError("receipt unavailable")
+
+    bus.remote_result_observer = observer
+    tools = _tools(bus, tmp_path, _fake(fake))
+    result = await tools.remote_tables()["fake"]["lookup"].handler({"query": "RP2040"})
+    assert result["is_error"]
+    assert "failed inside" in _text(result)
+    assert "found RP2040" not in _text(result)
+
+
 def test_ungraded_and_unlisted_tools_are_left_out_with_a_warning(fake, bus, tmp_path, capsys):
     tools = _tools(bus, tmp_path, _fake(fake))
     assert "extra" not in tools.remote_tables()["fake"]

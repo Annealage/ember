@@ -416,7 +416,7 @@ def _proxied(server, tool, bus=None):
                     return fail(
                         "remote write refused: its approved source context is unavailable or invalid"
                     )
-        return await call(
+        result = await call(
             server,
             name,
             args,
@@ -429,6 +429,10 @@ def _proxied(server, tool, bus=None):
             expected_context=expected_context,
             context_callback=getattr(bus, "remote_action_context", None),
         )
+        observer = getattr(bus, "remote_result_observer", None)
+        if name in server.grading.read and not result.get("is_error") and observer is not None:
+            await observer(server.name, name, args, result)
+        return result
 
     return SdkMcpTool(name=name, description=description, input_schema=schema, handler=handler)
 
