@@ -27,11 +27,18 @@
  *     given up on even if the fetch ignores the abort), the POST included: an
  *     aborted POST is as ambiguous as a lost one, so it is reported, never
  *     repeated.
+ *   - A 409 on the POST (the last job still publishing) started nothing, so it
+ *     is asked again up to BUSY_RETRIES times, BUSY_GAP_MS apart; any other
+ *     failure of the POST is reported and never repeated.
  *   - A refusal (401, 403) ends the call before any mutation.
  */
 
 export const POLL_LIMIT = 30;
-export const DEADLINE_MS = 30000;
+export const DEADLINE_MS = 60000;
+// A 409 on the POST is `busy`: the last job is still publishing, nothing
+// started, so asking again is safe, a couple of times and not for long.
+export const BUSY_RETRIES = 2;
+const BUSY_GAP_MS = 1500;
 const MIN_DELAY_MS = 100;
 const DEFAULT_DELAY_MS = 1000;
 
@@ -110,15 +117,20 @@ export async function ensureHostedSession({
   if (response.status === 401 || response.status === 403) throw refused(response.status);
   if ((response.status === 404 && kind === "no_job") || (response.status === 503 && kind === "job_ended")) {
     let admitted;
-    try {
-      admitted = await request({
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
-      });
-    } catch (failure) {
-      throw new Error(
-        "The agent session request failed and was not repeated; it may or may not have started. "
-        + "Use Resume session to check.",
-      );
+    for (let busy = 0; ; busy++) {
+      try {
+        admitted = await request({
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+      } catch (failure) {
+        throw new Error(
+          "The agent session request failed and was not repeated; it may or may not have started. "
+          + "Use Resume session to check.",
+        );
+      }
+      if (admitted.response.status !== 409 || busy >= BUSY_RETRIES) break;
+      if (now() + BUSY_GAP_MS > deadline) throw stillStarting();
+      await sleep(BUSY_GAP_MS);
     }
     if (admitted.response.status === 401 || admitted.response.status === 403) {
       throw refused(admitted.response.status);

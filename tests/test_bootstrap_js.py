@@ -68,6 +68,8 @@ results.ambiguous = await outcome([noJob(), new Error("network")]);
 results.refusedGet = await outcome([reply(401, {})]);
 results.forbiddenPost = await outcome([noJob(), reply(403, {})]);
 // not-202 admission is an error, not retried
+results.busyThenOk = await outcome([ended(), reply(409, {}), reply(409, {}), reply(202, {}), reply(200, {})]);
+results.busyForever = await outcome([ended(), reply(409, {}), reply(409, {}), reply(409, {})]);
 results.badAdmission = await outcome([noJob(), reply(500, {})]);
 // polling is bounded in count and by the deadline, and honours Retry-After
 results.bounded = await outcome(Array.from({ length: 50 }, () => starting("0.01")), { pollLimit: 3 });
@@ -76,7 +78,7 @@ results.deadline = await outcome(Array.from({ length: 50 }, () => starting("4"))
 // Retry-After is honoured in full, not shortened to a cap
 results.longWait = await outcome([starting("10"), reply(200, {})]);
 // one longer than the deadline allows is refused up front, without polling early
-results.tooLong = await outcome([starting("60")]);
+results.tooLong = await outcome([starting("120")]);
 // an HTTP date counts too, measured on the page's clock
 {
   const base = Date.now(); let offset = 0; const slept = [];
@@ -323,7 +325,7 @@ def test_standalone_connects_at_once_with_no_admission(results):
 
 def test_retry_after_is_honoured_in_full_never_shortened(results):
     assert results["longWait"]["slept"] == [10000] and results["longWait"]["error"] is None
-    # 60 s cannot fit a 30 s deadline: refused before any wait or early poll
+    # 120 s cannot fit a 60 s deadline: refused before any wait or early poll
     assert results["tooLong"]["slept"] == [] and results["tooLong"]["calls"] == [
         "GET /p/a/agent/session"
     ]
@@ -378,3 +380,11 @@ def test_a_message_sent_while_idle_resumes_the_session_and_goes_out_once_live(re
 def test_a_message_that_could_not_resume_the_session_goes_back_to_the_composer(results):
     assert results["idleSendTimedOut"] == {"sent": 0, "refused": ["c1"]}
     assert results["idleSendFailed"] == {"sent": 0, "refused": ["c1"]}
+
+
+def test_a_busy_admission_is_asked_again_a_couple_of_times_and_then_reported(results):
+    ok = results["busyThenOk"]
+    assert ok["error"] is None and ok["slept"] == [1500, 1500]
+    assert [c for c in ok["calls"] if c.startswith("POST")] == ["POST /p/a/agent/session"] * 3
+    bad = results["busyForever"]
+    assert bad["calls"].count("POST /p/a/agent/session") == 3 and "409" in bad["error"]
