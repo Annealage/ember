@@ -142,7 +142,7 @@ const re = await import("data:text/javascript;base64," + Buffer.from(
 const snap = () => ({ text: elements.sessionStart.textContent, hidden: elements.sessionStart.hidden, err: elements.err.textContent });
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
-const page = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80, fetcher: serverFetcher });
+const page = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80, gapMs: 5, fetcher: serverFetcher });
 results.hostedStart = { ...snap(), ws: log.ws, admissions: log.admissions.length };
 elements.sessionStart.click(); elements.sessionStart.click(); // a double click
 await flush();
@@ -166,8 +166,8 @@ stubs.fail = null; stubs.chat = { ...noTurns, turns: [ok] };
 const turn = { type: "turn", blocks: [], client_id: "c1" };
 async function idleSession() {
   log.status.length = 0; log.conn.length = 0; log.sent.length = 0; log.refused.length = 0;
-  const p = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80, fetcher: serverFetcher });
-  p.connect(); await flush(); handlersOf.onLive(); handlersOf.onFallback(); await flush();
+  const p = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80, gapMs: 5, fetcher: serverFetcher });
+  p.connect(); await flush(); handlersOf.onLive(); handlersOf.onFallback(); await new Promise((r) => setTimeout(r, 40));
   return p;
 }
 await idleSession();
@@ -196,6 +196,7 @@ const caseOf = async (chat, ended = true) => {
 };
 results.midTurn = await caseOf({ turns: [{ complete: false, errors: [] }] });
 results.zeroTurns = await caseOf({ turns: [], agentStatus: "unavailable", banner: { text: "RuntimeError: shapes changed" } });
+results.exitedUnavailable = await caseOf({ turns: [ok], agentStatus: "unavailable" });
 results.errorTurn = await caseOf({ turns: [{ ...ok, errors: [{}], stopReason: "end" }] });
 results.rejectedTurn = await caseOf({ turns: [{ ...ok, stopReason: "rejected" }] });
 results.noJobEnded = await caseOf({ turns: [ok] }, false);
@@ -353,6 +354,11 @@ def test_a_finished_turn_then_a_closed_relay_is_idle_and_not_a_failure(results):
     # an unfinished turn lost with the relay is still the failure it was
     for name in ("midTurn", "errorTurn", "rejectedTurn", "noJobEnded"):
         assert results[name]["status"] == [] and results[name]["conn"] == [], name
+
+
+def test_the_workers_own_unavailable_on_exit_after_a_good_turn_is_still_idle(results):
+    r = results["exitedUnavailable"]
+    assert r["status"] == ["idle"] and r["conn"] == ["idle"] and r["err"] == ""
 
 
 def test_a_failed_start_stays_an_explicit_error_with_the_reason_and_a_retry(results):

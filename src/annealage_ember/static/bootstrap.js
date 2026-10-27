@@ -104,6 +104,7 @@ export function bootstrapAgentPage({
   settings: settingsOptions = {},
   hooks = {},
   liveWaitMs = 15000,
+  gapMs = 2000,
 } = {}) {
   const pane = byId(root, "chat");
   const errorEl = byId(root, "err");
@@ -127,20 +128,27 @@ export function bootstrapAgentPage({
   const lastTurnSucceeded = () => {
     const c = store.getState().chat;
     const last = c.turns[c.turns.length - 1];
-    return !!last && c.pendingUser.length === 0 && c.agentStatus !== "unavailable"
+    return !!last && c.pendingUser.length === 0
       && last.complete && last.errors.length === 0
       && !!last.stopReason && !FAILED_STOPS.has(last.stopReason);
   };
-  async function workerEndedNormally() {
+  // The worker can still be shutting down when the socket falls back, so the
+  // answer is asked for a few times (bounded) before it counts as no.
+  async function workerEndedNormally(attempts = 3, gapMs = 2000) {
     if (!lastTurnSucceeded()) return false;
-    try {
-      const response = await (fetcher || fetch)(sessionUrl || appUrl("agent/session"), { cache: "no-store" });
-      if (response.status !== 503) return false;
-      const body = await response.json();
-      return !!body && !!body.error && body.error.type === "job_ended";
-    } catch (failure) {
-      return false;
+    for (let i = 0; i < attempts && !live; i++) {
+      if (i > 0) await new Promise((resolve) => setTimeout(resolve, gapMs));
+      try {
+        const response = await (fetcher || fetch)(sessionUrl || appUrl("agent/session"), { cache: "no-store" });
+        if (response.status === 503) {
+          const body = await response.json();
+          if (body && body.error && body.error.type === "job_ended") return true;
+        }
+      } catch (failure) {
+        // asked again, or no
+      }
     }
+    return false;
   }
   const send = (frame) => {
     if (hosted && idle && !live && frame.type === "turn") {
@@ -210,16 +218,22 @@ export function bootstrapAgentPage({
         if (hosted) {
           setButton("Resume session");
           idle = false;
-          const c = store.getState().chat;
-          if (c.agentStatus === "unavailable") {
-            const why = c.banner && c.banner.text ? ": " + c.banner.text : "";
-            showError("Could not start the session" + why + ". Use Resume session to retry.");
-          }
-          workerEndedNormally().then((ended) => {
-            if (!ended || live) return;
-            idle = true;
-            store.setChatAgentStatus("idle");
-            store.setConnection("idle");
+          // The worker reports itself unavailable as it exits, so that status
+          // alone says nothing; only a worker that did not end after a
+          // successful turn is a failed start.
+          workerEndedNormally(3, gapMs).then((ended) => {
+            if (live) return;
+            if (ended) {
+              idle = true;
+              store.setChatAgentStatus("idle");
+              store.setConnection("idle");
+              return;
+            }
+            const c = store.getState().chat;
+            if (c.agentStatus === "unavailable") {
+              const why = c.banner && c.banner.text ? ": " + c.banner.text : "";
+              showError("Could not start the session" + why + ". Use Resume session to retry.");
+            }
           });
         }
         if (hooks.onFallback) hooks.onFallback();
