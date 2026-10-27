@@ -276,12 +276,13 @@ function renderUserAttachments(container, blocks) {
 }
 
 const AGENT_LABEL = {
-  connecting: "Connecting…", ready: "Ready", unavailable: "Unavailable", closed: "Closed",
+  connecting: "Connecting…", ready: "Ready", idle: "Idle", unavailable: "Unavailable", closed: "Closed",
 };
 // The generic tooltips; `initChat`'s `agentTitles` replaces any of them.
 const AGENT_TITLE = {
   connecting: "The agent process is starting; a message sent now is delivered once it is up.",
   ready: "The agent is ready to receive a message.",
+  idle: "The session is idle after a finished turn. Send a message to continue.",
   closed: "The agent is not running. Sending a message starts it again.",
   unavailable:
     "The agent is not available right now. Sending a message tries to start it again; the rest of the page keeps working regardless.",

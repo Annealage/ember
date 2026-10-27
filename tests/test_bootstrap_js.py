@@ -110,7 +110,7 @@ results.hungPoll = await hung([starting("0.1"), "hang"], 400);
 
 // bootstrap.js, imports replaced
 const source = readFileSync(dir + "/bootstrap.js", "utf8").replace(/^import .*;$/gm, "");
-const log = { ws: 0, admissions: [], chat: 0 };
+const log = { ws: 0, admissions: [], chat: 0, status: [], conn: [], sent: [], refused: [] };
 function element(id) {
   const listeners = {};
   return { id, hidden: false, disabled: false, textContent: "", dataset: {}, listeners,
@@ -120,13 +120,16 @@ const elements = Object.fromEntries(["chat", "err", "sessionStart", "pauseBtn", 
 globalThis.document = { addEventListener() {}, querySelector: (s) => elements[s.slice(1)] || null };
 globalThis.MutationObserver = class { observe() {} };
 const handlersOf = {};
+const noTurns = { turns: [], pendingUser: [] };
 const stubs = {
-  initChat: () => { log.chat++; return { handleHello() {}, handleEvent() {}, handleRefused() {} }; },
+  chat: noTurns,
+  initChat: (o) => { log.chat++; log.chatSend = o.send; return { handleHello() {}, handleEvent() {}, handleRefused: (r, id) => log.refused.push([r, id]) }; },
   initPause: () => ({ setPausedFromServer() {} }),
   initReview: () => ({ onEvent: {}, onLive() {}, onFallback() {} }),
   initSettings: () => ({ load() {} }),
   appUrl: (r) => "/p/a/" + r,
-  initWs: (h) => { log.ws++; Object.assign(handlersOf, h); return { send() {} }; },
+  store: { getState: () => ({ chat: stubs.chat }), setChatAgentStatus: (v) => log.status.push(v), setConnection: (v) => log.conn.push(v) },
+  initWs: (h) => { log.ws++; Object.assign(handlersOf, h); return { send: (f) => { log.sent.push(f); return true; } }; },
   ensureHostedSession: async ({ url }) => { log.admissions.push(url); if (stubs.fail) throw new Error(stubs.fail); },
 };
 const names = Object.keys(stubs);
@@ -154,6 +157,38 @@ results.hostedLive = snap();
 stubs.fail = "refused";
 handlersOf.onFallback(); elements.sessionStart.click(); await flush();
 results.hostedRefused = { ...snap(), ws: log.ws };
+
+// a finished turn then a closed relay is idle, not unavailable; a send resumes
+stubs.fail = null; stubs.chat = { turns: [{ complete: true }], pendingUser: [] };
+const turn = { type: "turn", blocks: [], client_id: "c1" };
+async function idleSession() {
+  log.status.length = 0; log.conn.length = 0; log.sent.length = 0; log.refused.length = 0;
+  const p = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80 });
+  p.connect(); await flush(); handlersOf.onLive(); handlersOf.onFallback();
+  return p;
+}
+await idleSession();
+results.idle = { status: [...log.status], conn: [...log.conn] };
+const before = log.admissions.length;
+results.idleSendReturned = log.chatSend(turn);
+await flush();
+results.idleSendHeld = { admitted: log.admissions.length - before, sent: log.sent.length };
+handlersOf.onLive();
+results.idleSendSent = { sent: log.sent.map((f) => f.client_id), refused: log.refused.length };
+// a resume that never comes back puts the message back in the composer
+await idleSession();
+log.chatSend(turn); await flush();
+await new Promise((r) => setTimeout(r, 150));
+results.idleSendTimedOut = { sent: log.sent.length, refused: log.refused.map((r) => r[1]) };
+// a failed admission does too
+await idleSession();
+stubs.fail = "refused"; log.chatSend(turn); await flush();
+results.idleSendFailed = { sent: log.sent.length, refused: log.refused.map((r) => r[1]) };
+stubs.fail = null;
+// losing the relay mid-turn is still a failure: nothing calms it
+stubs.chat = { turns: [{ complete: false }], pendingUser: [] };
+await idleSession();
+results.midTurn = { status: [...log.status], conn: [...log.conn]};
 
 // standalone: connects at once, never admits, no button
 log.ws = 0; log.admissions.length = 0; elements.sessionStart.hidden = false;
@@ -299,3 +334,20 @@ def test_a_request_that_never_answers_ends_at_the_deadline(results):
         poll["calls"] == ["GET", "GET"] and "still starting" in poll["error"] and poll["ms"] < 1500
     )
     assert results["signalGiven"] is True
+
+
+def test_a_finished_turn_then_a_closed_relay_is_idle_and_not_a_failure(results):
+    assert results["idle"] == {"status": ["idle"], "conn": ["idle"]}
+    # an unfinished turn lost with the relay is still the failure it was
+    assert results["midTurn"]["status"] == [] and results["midTurn"]["conn"] == []
+
+
+def test_a_message_sent_while_idle_resumes_the_session_and_goes_out_once_live(results):
+    assert results["idleSendReturned"] is True
+    assert results["idleSendHeld"] == {"admitted": 1, "sent": 0}
+    assert results["idleSendSent"] == {"sent": ["c1"], "refused": 0}
+
+
+def test_a_message_that_could_not_resume_the_session_goes_back_to_the_composer(results):
+    assert results["idleSendTimedOut"] == {"sent": 0, "refused": ["c1"]}
+    assert results["idleSendFailed"] == {"sent": 0, "refused": ["c1"]}

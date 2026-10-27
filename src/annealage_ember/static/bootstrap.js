@@ -26,6 +26,7 @@ import { initPause } from "./pause.js";
 import { initReview } from "./review.js";
 import { initSettings } from "./settings.js";
 import { appUrl } from "./url.js";
+import { store } from "./store.js";
 import { initWs } from "./ws.js";
 import { ensureHostedSession } from "./admission.js";
 
@@ -111,7 +112,33 @@ export function bootstrapAgentPage({
   moreMenu(root, byId(root, "chatMore"));
 
   let socket = null;
-  const send = (frame) => socket && socket.send(frame);
+  // A hosted worker that finishes its turn is shut down on purpose, so a
+  // socket that closes with every turn answered is an idle session, not a
+  // failure. `idle` is that state; a message sent into it is held in
+  // `resuming` while the session is admitted again, then goes out once the
+  // socket is live, or goes back into the composer if that does not happen.
+  let idle = false;
+  let resuming = null;
+  const turnFinished = () => {
+    const c = store.getState().chat;
+    return c.turns.length > 0 && c.pendingUser.length === 0 && c.turns.every((t) => t.complete);
+  };
+  const send = (frame) => {
+    if (hosted && idle && !live && frame.type === "turn") {
+      if (resuming) return false;
+      resuming = frame;
+      connect();
+      return true;
+    }
+    return socket && socket.send(frame);
+  };
+  function settleResume(reason) {
+    const frame = resuming;
+    resuming = null;
+    if (!frame) return;
+    if (reason) chat.handleRefused(reason, frame.client_id);
+    else socket.send(frame);
+  }
   const chat = initChat({ root, send, ...chatOptions });
   const pause = initPause({ send, button: byId(root, "pauseBtn") });
   const review = reviewOptions === false ? null : initReview({
@@ -147,7 +174,9 @@ export function bootstrapAgentPage({
       onEvent: { ...(review ? review.onEvent : {}), ...(hooks.onEvent || {}) },
       onLive: () => {
         live = true;
+        idle = false;
         clearTimeout(liveTimer);
+        settleResume(null);
         if (review) review.onLive();
         setButton(restartLabel, { hidden: true });
         if (hooks.onLive) hooks.onLive();
@@ -158,7 +187,15 @@ export function bootstrapAgentPage({
         if (review) review.onFallback();
         // A finite worker that ended looks like a lost connection: offer the
         // way back, which admits a new one if there is none.
-        if (hosted) setButton("Resume session");
+        settleResume("The session could not be resumed");
+        if (hosted) {
+          setButton("Resume session");
+          idle = turnFinished();
+          if (idle) {
+            store.setChatAgentStatus("idle");
+            store.setConnection("idle");
+          }
+        }
         if (hooks.onFallback) hooks.onFallback();
       },
       onHello: (frame) => {
@@ -194,17 +231,23 @@ export function bootstrapAgentPage({
       // Starting, disabled, until the socket is live (onLive hides it,
       // onFallback offers Resume when hosted), since a send before then is
       // refused. Same for a standalone page started from its button.
-      if (live) setButton(restartLabel, { hidden: true });
-      else {
+      if (live) {
+        setButton(restartLabel, { hidden: true });
+        idle = false;
+        settleResume(null);
+      } else {
         setButton("Starting…", { disabled: true });
         clearTimeout(liveTimer);
         liveTimer = setTimeout(() => {
-          if (!live) setButton(restartLabel);
+          if (live) return;
+          setButton(restartLabel);
+          settleResume("The session did not come back in time");
         }, liveWaitMs);
       }
     } catch (failure) {
       showError(failure instanceof Error ? failure.message : String(failure));
       setButton("Resume connection");
+      settleResume("The session could not be resumed");
     } finally {
       connecting = false;
     }

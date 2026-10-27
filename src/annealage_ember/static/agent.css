@@ -27,6 +27,7 @@
   border: 1px solid #3a3f47; background: #2a2e35; color: #9aa; white-space: nowrap;
 }
 .agentstatus[data-state="ready"] { background: #1e3a24; border-color: #2f5c39; color: #9fe0a8; }
+.agentstatus[data-state="idle"] { background: #2a2e35; border-color: #3a3f47; color: #9aa; }
 .agentstatus[data-state="connecting"] { background: #3a2f1e; border-color: #5c4a2f; color: #e0c07f; }
 .agentstatus[data-state="unavailable"] { background: #3a1e1e; border-color: #5c2f2f; color: #e8a0a0; }
 /* Who is signed in (chat.js, for a page taken by its tailnet login), beside

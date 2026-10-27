@@ -206,6 +206,7 @@ const CONN_LABEL = {
   connecting: "Connecting…",
   live: "Live",
   polling: "Polling",
+  idle: "Idle",
   refused: TOKEN ? "Reopen URL" : "Sign in",
 };
 // The generic tooltips; a product names what "live" and "polling" mean for
@@ -214,6 +215,7 @@ const CONN_TITLE = {
   connecting: "Connecting to the live update channel.",
   live: "Live: updates arrive without a reload.",
   polling: "Live updates are unavailable right now; falling back to polling.",
+  idle: "The session is idle after a finished turn. Sending a message continues it.",
   refused: REFUSED,
 };
 
