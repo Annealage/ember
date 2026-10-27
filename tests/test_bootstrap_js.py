@@ -128,7 +128,7 @@ globalThis.jobEnded = true;
 const serverFetcher = async () => ({ status: globalThis.jobEnded ? 503 : 200, json: async () => ({ error: { type: "job_ended" } }) });
 const stubs = {
   chat: noTurns,
-  initChat: (o) => { log.chat++; log.chatSend = o.send; return { handleHello() {}, handleEvent() {}, handleRefused: (r, id) => log.refused.push([r, id]) }; },
+  initChat: (o) => { log.chat++; log.chatSend = o.send; return { handleHello() {}, handleEvent() {}, handleRefused: (r, id) => log.refused.push([r, id]), adoptSent() {} }; },
   initPause: () => ({ setPausedFromServer() {} }),
   initReview: () => ({ onEvent: {}, onLive() {}, onFallback() {} }),
   initSettings: () => ({ load() {} }),

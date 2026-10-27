@@ -1484,6 +1484,9 @@ export function initChat({
   const SETTLE_MS = 1500;
   let unconfirmed = new Set();
   let settleTimer = null;
+  // Client ids sent on the connection being opened (a held message released
+  // at live), which its hello and replay cannot account for: not unconfirmed.
+  const adopted = new Set();
   // AgentError predates turn ids. Track the executing turn through the
   // transcript, including replay; queued inputs must not steal its errors.
   let activityTurn = 0;
@@ -1540,7 +1543,8 @@ export function initChat({
     }
     // What this pane sent over an earlier connection is settled by the replay
     // that follows (see `unconfirmed`).
-    unconfirmed = new Set(store.getState().chat.pendingUser.map((p) => p.clientId));
+    unconfirmed = new Set(store.getState().chat.pendingUser.map((p) => p.clientId).filter((id) => !adopted.has(id)));
+    adopted.clear();
     clearTimeout(settleTimer);
     settleTimer = unconfirmed.size ? setTimeout(settleUnconfirmed, SETTLE_MS) : null;
     // A different session from the one this pane was showing (the server
@@ -1863,5 +1867,12 @@ export function initChat({
     revertPendingModel();
   }
 
-  return { handleHello, handleEvent, handleRefused };
+  function adoptSent(clientId) {
+    if (clientId) {
+      adopted.add(clientId);
+      unconfirmed.delete(clientId);
+    }
+  }
+
+  return { handleHello, handleEvent, handleRefused, adoptSent };
 }

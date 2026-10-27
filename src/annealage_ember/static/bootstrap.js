@@ -164,7 +164,10 @@ export function bootstrapAgentPage({
     resuming = null;
     if (!frame) return;
     if (reason) chat.handleRefused(reason, frame.client_id);
-    else socket.send(frame);
+    else {
+      chat.adoptSent(frame.client_id);
+      socket.send(frame);
+    }
   }
   const chat = initChat({ root, send, ...chatOptions });
   const pause = initPause({ send, button: byId(root, "pauseBtn") });

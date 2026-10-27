@@ -146,6 +146,16 @@ out.afterReplayEnds = input.value;
 out.lostToast = el("toast").textContent;
 out.pending = store.getState().chat.pendingUser.length;
 
+// A held message released at live goes out after the connection began: its
+// hello cannot vouch for it either way, so it is not "lost".
+input.value = "";
+sendMessage("held one");
+chat.adoptSent(sent[sent.length - 1].client_id);
+chat.handleHello({ id: "s", agent: "ready" });
+chat.handleEvent({ kind: "viewer_primary" }, { replayed: false });
+out.heldRestored = input.value;
+out.heldPending = store.getState().chat.pendingUser.length;
+
 // Usage, before the agent status: from the hello, then from live events only.
 const usageChip = el("agentStatus").inserted.find((n) => n.className === "chatusage");
 chat.handleHello({ id: "s", agent: "ready", usage: {
@@ -766,3 +776,8 @@ def test_thinking_is_a_closed_block_in_event_order_and_never_raises_activity(obs
     assert thinking["body"] == "weigh it more"
     assert thinking["noteHidden"] is False
     assert thinking["bannerKept"] == "Check credentials"
+
+
+def test_a_held_message_released_at_live_is_not_restored_as_lost(observed):
+    assert observed["heldRestored"] == ""
+    assert observed["heldPending"] == 1
