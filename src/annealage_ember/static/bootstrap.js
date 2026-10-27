@@ -119,10 +119,29 @@ export function bootstrapAgentPage({
   // socket is live, or goes back into the composer if that does not happen.
   let idle = false;
   let resuming = null;
-  const turnFinished = () => {
+  // Idle means the last turn really succeeded (answered, no error on it, not
+  // rejected or lost to an exiting backend) and the server says the worker
+  // ended: GET agent/session answers 503 job_ended. A failed start, a failed
+  // turn or any other lost relay keeps the red state and says why.
+  const FAILED_STOPS = new Set(["rejected", "backend_exited", "not_sent"]);
+  const lastTurnSucceeded = () => {
     const c = store.getState().chat;
-    return c.turns.length > 0 && c.pendingUser.length === 0 && c.turns.every((t) => t.complete);
+    const last = c.turns[c.turns.length - 1];
+    return !!last && c.pendingUser.length === 0 && c.agentStatus !== "unavailable"
+      && last.complete && last.errors.length === 0
+      && !!last.stopReason && !FAILED_STOPS.has(last.stopReason);
   };
+  async function workerEndedNormally() {
+    if (!lastTurnSucceeded()) return false;
+    try {
+      const response = await (fetcher || fetch)(sessionUrl || appUrl("agent/session"), { cache: "no-store" });
+      if (response.status !== 503) return false;
+      const body = await response.json();
+      return !!body && !!body.error && body.error.type === "job_ended";
+    } catch (failure) {
+      return false;
+    }
+  }
   const send = (frame) => {
     if (hosted && idle && !live && frame.type === "turn") {
       if (resuming) return false;
@@ -190,11 +209,18 @@ export function bootstrapAgentPage({
         settleResume("The session could not be resumed");
         if (hosted) {
           setButton("Resume session");
-          idle = turnFinished();
-          if (idle) {
+          idle = false;
+          const c = store.getState().chat;
+          if (c.agentStatus === "unavailable") {
+            const why = c.banner && c.banner.text ? ": " + c.banner.text : "";
+            showError("Could not start the session" + why + ". Use Resume session to retry.");
+          }
+          workerEndedNormally().then((ended) => {
+            if (!ended || live) return;
+            idle = true;
             store.setChatAgentStatus("idle");
             store.setConnection("idle");
-          }
+          });
         }
         if (hooks.onFallback) hooks.onFallback();
       },

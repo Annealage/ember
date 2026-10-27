@@ -199,3 +199,16 @@ class LeanRpcClient(RpcClient):
             "pending_host_calls": len(self._pending_host_tool_calls)
             + len(self._pending_host_uri_requests),
         }
+
+
+def check() -> None:
+    """Build a ``LeanRpcClient`` without starting omp: raises ``RuntimeError`` when the installed omp-rpc
+    is not the shape this was written against. For a worker image's build or test step, so a pin
+    mismatch fails there instead of on the live page: ``python -m annealage_ember.session.rpc_client``."""
+    client = LeanRpcClient()
+    client.stop()
+
+
+if __name__ == "__main__":
+    check()
+    print("omp-rpc matches the shape LeanRpcClient was written against (%s)" % PINNED_OMP_RPC)
