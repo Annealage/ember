@@ -760,20 +760,38 @@ class OmpSession:
     async def interrupt(self) -> None:
         await self._interrupt()
 
-    async def stop_for_revocation(self, deadline: float = 3.0) -> None:
-        """Stop the turn because its authority ended, and fail closed: the
-        abort is waited for at most ``deadline`` seconds, and if it has not gone
-        through by then (a write stalled on a full pipe, omp not answering) the
-        omp process is killed and the session marked unavailable, so nothing
-        the revoked grant started can go on."""
-        try:
-            await asyncio.wait_for(self._interrupt(), deadline)
+    async def stop_for_revocation(self, deadline: float = 3.0, settle: float = 5.0) -> None:
+        """Stop the turn in flight because its authority ended, and fail closed.
+
+        Bound to the turn that is in flight when it starts (the caller admits no
+        successor until this returns). The abort must be acknowledged within
+        ``deadline`` seconds AND the turn must then reach its terminal event
+        (``agent_end``) within ``settle`` seconds: an acknowledged abort is only
+        an RPC reply, not proof that work stopped. Anything else (the abort
+        failing, not answering, or the turn not ending) kills omp's whole process
+        group and marks the session unavailable. A turn that already ended needs
+        nothing. A request omp has already made to a provider is not recalled."""
+        if not self._running and self._active_input_id is None:
             return
+        turn = self._turn
+        acknowledged = False
+        try:
+            acknowledged = bool(await asyncio.wait_for(self._interrupt(), deadline))
         except Exception:
-            pass
+            acknowledged = False
+        if acknowledged:
+            loop = asyncio.get_running_loop()
+            end = loop.time() + settle
+            while loop.time() < end:
+                if self._turn != turn or not self._running:
+                    return
+                await asyncio.sleep(0.05)
         kill = getattr(self._client, "kill", None)
         if kill is not None:
-            kill()
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, kill)
+            except Exception as exc:
+                sys.stderr.write("warning: could not kill the agent process: %r\n" % (exc,))
         self._fail(
             RuntimeError("access ended and the agent did not stop in time; it was shut down"),
             remediation="the agent was shut down because the access it was running under ended; "

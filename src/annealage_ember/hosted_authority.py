@@ -50,6 +50,10 @@ def fenced_out() -> bool:
 
 
 def _in_flight(bus, holder) -> bool:
+    if bus.hosted_stopping:
+        # A revoked turn is still being stopped: no successor until it is
+        # confirmed ended (or torn down), or the late stop could hit it.
+        return True
     if bus.hosted_turn_live:
         return True
     return bool(holder is not None and holder.turn_in_flight())
@@ -88,6 +92,18 @@ def holds(bus, principal: Optional[str], *, now: Optional[float] = None) -> bool
         and bus.hosted_turn_principal == principal
         and now < bus.hosted_turn_exp
     )
+
+
+def _begin_stop(bus, session) -> None:
+    """Start stopping ``session``'s turn and count it until it has settled."""
+    bus.hosted_stopping += 1
+    task = asyncio.get_running_loop().create_task(_stop(session))
+
+    def settled(done):
+        bus.hosted_stopping -= 1
+        done.cancelled() or done.exception()
+
+    task.add_done_callback(settled)
 
 
 def _stop(session):
@@ -144,8 +160,7 @@ def arm_expiry(bus, session) -> None:
             bus.hosted_turn_live = False
             bus.hosted_turn_ops = ()
             bus.hosted_turn_secret = None
-        task = loop.create_task(_stop(session))
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _begin_stop(bus, session)
 
     bus.hosted_expiry_handle = loop.call_later(max(0.0, bus.hosted_turn_exp - time.time()), fire)
 
@@ -170,5 +185,4 @@ def release(bus, owner, session) -> None:
         bus.hosted_turn_owner = None
         bus.hosted_turn_generation += 1
     if session is not None:
-        task = asyncio.get_running_loop().create_task(_stop(session))
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _begin_stop(bus, session)

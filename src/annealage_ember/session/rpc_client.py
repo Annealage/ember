@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import signal
 import threading
 from typing import Any, Callable, Dict, Optional
 
@@ -89,6 +91,7 @@ _REQUIRED_ATTRS = (
     "_pending_host_uri_requests",
     "_process",
     "_write_lock",
+    "_pgid",
     "_write_json",
     *LISTENER_ATTRS,
     _TYPED_LISTENERS,
@@ -189,16 +192,33 @@ class LeanRpcClient(RpcClient):
         finally:
             local.check = previous
 
-    def kill(self) -> None:
-        """End the omp process now, from any thread and without waiting for
-        anything: unlike ``stop`` it takes no lock, so it works while a write is
-        stalled on a full pipe (which then fails) or a request waits for a reply."""
+    def kill(self) -> bool:
+        """End omp and every descendant now, from any thread: SIGKILL to the
+        process group omp leads (it is spawned in its own session, so the group
+        is its own and holds the agent's tool children too, which could
+        otherwise keep the pipes open), falling back to the leader alone. Takes
+        no lock, so it works while a write is stalled on a full pipe. Waits up
+        to a second to confirm the leader is gone; returns whether it is.
+        Never raises."""
         process = self._process
-        if process is not None:
+        if process is None:
+            return True
+        try:
+            pgid = getattr(self, "_pgid", None)
+            killpg = getattr(os, "killpg", None)
+            if pgid is not None and killpg is not None:
+                try:
+                    killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
             try:
                 process.kill()
             except OSError:
                 pass
+            process.wait(timeout=1.0)
+            return True
+        except Exception:
+            return False
 
     def _write_json(self, process, payload):
         check = getattr(self._gate_local, "check", None)

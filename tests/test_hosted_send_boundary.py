@@ -24,6 +24,7 @@ def _bus(exp):
         hosted_turn_principal="alice",
         hosted_turn_owner="conn",
         hosted_turn_generation=1,
+        hosted_stopping=0,
         hosted_lock=threading.Lock(),
         hosted_expiry_handle=None,
     )
@@ -269,30 +270,87 @@ async def test_interrupt_is_not_queued_behind_a_prompt_that_is_waiting_for_omp(m
         await session.close()
 
 
-async def test_a_revocation_stop_that_cannot_get_an_abort_through_kills_omp_and_fails_closed():
-    from annealage_ember.session.base import AGENT_UNAVAILABLE
+# -- stop_for_revocation: abort errors, acknowledged without a terminal, acknowledged with one --
 
-    session, fake, _recorder, _broker = await _started_session()
-    stuck, killed = threading.Event(), []
-    fake.abort = lambda: stuck.wait(5)  # an abort queued behind a stalled write
-    fake.kill = lambda: killed.append(1)
+
+async def _in_flight_turn(monkeypatch=None):
+    session, fake, recorder, _broker = await _started_session()
+    await session.submit_turn([{"type": "text", "text": "go"}])
+    assert session._running and len(fake.prompt_calls) == 1
+    return session, fake
+
+
+async def test_an_abort_that_errors_kills_omp_and_fails_closed():
+    session, fake = await _in_flight_turn()
+    killed = []
+
+    def broken_abort():
+        raise RuntimeError("abort failed")
+
+    fake.abort, fake.kill = broken_abort, lambda: killed.append(1)
     try:
-        started = time.monotonic()
-        await session.stop_for_revocation(deadline=0.3)
-        assert killed == [1] and time.monotonic() - started < 2
-        assert session.agent_status() == AGENT_UNAVAILABLE
+        await session.stop_for_revocation(deadline=1.0, settle=0.3)
+        assert killed == [1] and session.agent_status() == "unavailable"
     finally:
-        stuck.set()
         await session.close()
 
 
-async def test_a_revocation_stop_that_gets_its_abort_through_does_not_kill_omp():
-    session, fake, _recorder, _broker = await _started_session()
+async def test_an_acknowledged_abort_with_no_terminal_event_is_not_a_stopped_turn():
+    session, fake = await _in_flight_turn()
     killed = []
     fake.kill = lambda: killed.append(1)
     try:
-        await session.stop_for_revocation(deadline=1.0)
+        await session.stop_for_revocation(
+            deadline=1.0, settle=0.3
+        )  # acked, but agent_end never comes
+        assert fake.abort_calls == 1 and killed == [1]
+        assert session.agent_status() == "unavailable"
+    finally:
+        await session.close()
+
+
+async def test_an_acknowledged_abort_followed_by_the_terminal_event_is_a_clean_stop():
+    session, fake = await _in_flight_turn()
+    killed = []
+    fake.kill = lambda: killed.append(1)
+    try:
+        task = asyncio.ensure_future(session.stop_for_revocation(deadline=1.0, settle=2.0))
+        await asyncio.sleep(0.2)
+        fake.push_agent_end()
+        await asyncio.wait_for(task, 3)
         assert fake.abort_calls == 1 and killed == []
         assert session.agent_status() == "ready"
     finally:
         await session.close()
+
+
+async def test_a_stop_for_a_turn_that_already_ended_does_nothing():
+    session, fake, _r, _b = await _started_session()
+    killed = []
+    fake.kill = lambda: killed.append(1)
+    try:
+        await session.stop_for_revocation(deadline=0.3, settle=0.3)
+        assert fake.abort_calls == 0 and killed == []
+    finally:
+        await session.close()
+
+
+async def test_no_successor_is_admitted_until_the_revocation_stop_has_settled():
+    """A late stop must never land on a turn that began after it was scheduled."""
+    bus = _bus(time.time() + 60)
+    gate = asyncio.Event()
+    calls = []
+
+    class Session:
+        async def stop_for_revocation(self):
+            calls.append("stop")
+            await gate.wait()  # the old turn's abort is slow
+
+    hosted_authority.release(bus, "conn", Session())
+    await asyncio.sleep(0.05)
+    successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
+    assert hosted_authority.admit(bus, None, successor) is not None  # refused while stopping
+    gate.set()
+    await asyncio.sleep(0.05)
+    assert hosted_authority.admit(bus, None, successor) is None
+    assert calls == ["stop"]  # exactly one stop, the old turn's
