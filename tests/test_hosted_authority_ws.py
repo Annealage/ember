@@ -240,3 +240,23 @@ async def test_a_turn_waiting_for_the_lock_when_its_connection_closes_takes_no_g
         assert session.submitted_turns == []
     finally:
         await app.agent_stop()
+
+
+async def test_an_interrupt_cancels_a_turn_still_waiting_for_the_lock(served_dir, tmp_path_factory):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        async with bus.turn_submission_lock:
+            held = _Held(app, "alice")
+            await held.open([HELLO, {**_turn("never"), "client_id": "c-1"}, {"type": "interrupt"}])
+            assert not bus.hosted_turn_live
+        await asyncio.sleep(0.3)
+        assert not bus.hosted_turn_live and bus.hosted_turn_principal is None
+        assert _logged(app, "user_turn") == []
+        assert session.submitted_turns == []
+        await held.close()
+    finally:
+        await app.agent_stop()

@@ -112,7 +112,17 @@ class _Connection:
     ``identity.Human`` that opened the socket, whose login is what the events
     they cause over it record."""
 
-    __slots__ = ("id", "ws", "tab_id", "human", "queue", "writer_task", "removed", "closed")
+    __slots__ = (
+        "id",
+        "ws",
+        "tab_id",
+        "human",
+        "queue",
+        "writer_task",
+        "removed",
+        "closed",
+        "cancel_generation",
+    )
 
     def __init__(self, conn_id: int, ws, tab_id: Optional[str], human, queue_maxsize: int):
         self.id = conn_id
@@ -125,6 +135,9 @@ class _Connection:
         #: Set the moment the peer is gone, before any cleanup await: a frame still
         #: waiting its turn for this connection must not take authority.
         self.closed = False
+        #: Bumped by an interrupt frame: a turn frame read before it and still
+        #: waiting for the submission lock is cancelled (``hosted_authority.fenced_out``).
+        self.cancel_generation = 0
 
 
 def _is_ping(frame: dict) -> bool:

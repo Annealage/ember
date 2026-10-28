@@ -24,6 +24,7 @@ def _bus(exp):
         hosted_turn_principal="alice",
         hosted_turn_owner="conn",
         hosted_turn_generation=1,
+        hosted_lock=threading.Lock(),
         hosted_expiry_handle=None,
     )
 
@@ -126,3 +127,118 @@ async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_ad
         assert fake.prompt_calls == []
     finally:
         await session.close()
+
+
+async def test_the_send_check_and_a_release_are_ordered_by_one_lock():
+    """A check that is running cannot interleave with a release: the release
+    waits for it, so a send is either checked before it (and then interrupted
+    by it) or refused after it."""
+    bus = _bus(time.time() + 60)
+    hosted_authority.GENERATION.set(bus.hosted_turn_generation)
+    check = hosted_authority.checker(bus)
+    done = threading.Event()
+    with bus.hosted_lock:  # a release (or admit) in progress
+        thread = threading.Thread(target=lambda: (check(), done.set()))
+        thread.start()
+        assert not done.wait(0.2)
+    thread.join(2)
+    assert done.is_set()
+
+
+# -- a hosted prompt accepted while the omp agent is still starting ---------------
+
+
+def _delayed_start_app(served_dir, tmp_path_factory, verifier, gate, built):
+    from conftest import create_toy_app
+    from test_hosted_session import _Sink
+    from test_omp_session import FakeRpcClient, _tool_table
+
+    from annealage_ember import sessions, settings
+    from annealage_ember.session.omp import OmpSession
+    from annealage_ember.session.permissions import PermissionBroker
+
+    def build_session(on_event, *, bus):
+        class SlowToStart(FakeRpcClient):
+            def get_state(self):
+                gate.wait(10)  # the agent coming up, in the executor thread
+                return super().get_state()
+
+        def client_factory(**kwargs):
+            fake = SlowToStart(**kwargs)
+            built.append(fake)
+            return fake
+
+        return OmpSession(
+            on_event,
+            cwd=str(served_dir),
+            session_id="hosted-session",
+            broker=PermissionBroker(on_event, timeout=2.0, no_viewer_grace=0.05),
+            tool_table=_tool_table(),
+            client_factory=client_factory,
+            base_url="http://127.0.0.1:11434/v1",
+        )
+
+    state_dir = tmp_path_factory.mktemp("worker-state")
+    sessions.create_session(state_dir, "hosted-session")
+    return create_toy_app(
+        served_dir,
+        session_id="hosted-session",
+        build_session=build_session,
+        hosted_mode=True,
+        hosted_verifier=verifier,
+        hosted_state_dir=state_dir,
+        hosted_tool_ops={"mcp__toy__list_notes": "project.read"},
+        settings=settings.resolve(tmp_path_factory.mktemp("service"), flags={"backend": "omp"}),
+        state_sink=_Sink(),
+        start_closed=True,
+        idle_timeout=None,
+    )
+
+
+async def test_a_hosted_prompt_accepted_while_omp_starts_is_delivered_with_its_own_grant(
+    served_dir, tmp_path_factory
+):
+    from test_hosted_authority_ws import _send, _Verifier
+
+    gate, built = threading.Event(), []
+    app = _delayed_start_app(served_dir, tmp_path_factory, _Verifier(), gate, built)
+    await app.agent_start()
+    try:
+        held = await _send(app, "alice", "after the start")
+        assert not any(c.prompt_calls for c in built)  # still starting; the prompt is deferred
+        gate.set()
+        for _ in range(100):
+            if built and built[0].prompt_calls:
+                break
+            await asyncio.sleep(0.05)
+        assert [c.message for c in built[0].prompt_calls] == ["after the start"]
+        await held.close()
+    finally:
+        gate.set()
+        await app.agent_stop()
+
+
+async def test_a_hosted_prompt_waiting_for_omp_to_start_is_refused_once_revoked_or_expired(
+    served_dir, tmp_path_factory
+):
+    from test_hosted_authority_ws import _send, _Verifier
+
+    for how in ("revoked", "expired"):
+        gate, built = threading.Event(), []
+        verifier = _Verifier(expiry=time.time() + 1.5 if how == "expired" else None)
+        app = _delayed_start_app(served_dir, tmp_path_factory, verifier, gate, built)
+        await app.agent_start()
+        try:
+            held = await _send(app, "alice", "too late")
+            if how == "revoked":
+                await held.close()
+            else:
+                await asyncio.sleep(1.8)
+            gate.set()
+            await asyncio.sleep(1.0)
+            assert not built or built[0].prompt_calls == [], how
+            if how == "expired":
+                await held.close()
+        finally:
+            gate.set()
+            await app.agent_stop()

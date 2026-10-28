@@ -576,6 +576,8 @@ async def _serve_connection(
             browser_runtime_controls,
             history_session_id=history_session_id,
         )
+        if hosted and kind == "interrupt":
+            conn.cancel_generation += 1  # before anything awaits: see FENCE
         if hosted and kind == "turn":
             # Not awaited here: recording the turn and the backend's own
             # preparation (image expansion) await, and a read loop stuck in
@@ -584,6 +586,7 @@ async def _serve_connection(
             # the connection is seen at once and the grant released
             # (``hosted_authority.release``) while the send is still pending;
             # the backend's send guard then refuses it.
+            hosted_authority.FENCE.set((conn, conn.cancel_generation))
             task = asyncio.ensure_future(dispatching)
             dispatches.add(task)
             task.add_done_callback(dispatches.discard)
@@ -860,6 +863,7 @@ async def _submit_turn_locked(
     client_id = frame.get("client_id")
     holder = getattr(bus, "agent_holder", None)
     hosted_principal = None
+    hosted_generation = None
     defer = (
         holder is not None
         and bus is not None
@@ -872,7 +876,7 @@ async def _submit_turn_locked(
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
     if bus is not None and getattr(bus, "hosted_mode", False):
-        if getattr(conn, "closed", False):
+        if hosted_authority.fenced_out():
             # This frame waited for the lock while its connection went away (the
             # grant it would take was never released: it had none yet).
             return
@@ -883,6 +887,7 @@ async def _submit_turn_locked(
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
         hosted_principal = bus.hosted_turn_principal
+        hosted_generation = bus.hosted_turn_generation
         hosted_authority.arm_expiry(bus, session)
         events = getattr(bus, "session_events", None)
         if events is not None:
@@ -925,7 +930,12 @@ async def _submit_turn_locked(
             # opened, or a resumed conversation coming up): the input is kept
             # and delivered once it is ready, never refused for being early.
             holder.defer_turn(
-                session, blocks_to_send, conn.tab_id, turn, principal=hosted_principal
+                session,
+                blocks_to_send,
+                conn.tab_id,
+                turn,
+                principal=hosted_principal,
+                generation=hosted_generation,
             )
         else:
             await session.submit_turn(blocks_to_send, viewer=conn.tab_id)

@@ -30,6 +30,7 @@ import hashlib
 import inspect
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -714,6 +715,7 @@ def create_app(
     bus.hosted_expiry_handle = None
     bus.hosted_turn_owner = None
     bus.hosted_turn_generation = 0
+    bus.hosted_lock = threading.Lock()
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.

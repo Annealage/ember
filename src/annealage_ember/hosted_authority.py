@@ -30,6 +30,22 @@ from typing import Optional
 #: newer grant, whoever holds that.
 GENERATION = contextvars.ContextVar("hosted_grant_generation", default=None)
 
+#: ``(connection, its cancel generation)`` taken by the read loop the moment a
+#: turn frame arrives, in the context of the task that will submit it. An
+#: interrupt on the connection (or its going away) bumps the generation, so a
+#: turn still waiting for the submission lock when that happens takes no grant.
+FENCE = contextvars.ContextVar("hosted_turn_fence", default=None)
+
+
+def fenced_out() -> bool:
+    """Whether the turn being submitted was cancelled (interrupt) or its
+    connection closed after its frame arrived and before it took the lock."""
+    fence = FENCE.get()
+    if fence is None:
+        return False
+    conn, generation = fence
+    return bool(conn.closed or conn.cancel_generation != generation)
+
 
 def _in_flight(bus, holder) -> bool:
     if bus.hosted_turn_live:
@@ -49,14 +65,15 @@ def admit(bus, holder, claims, *, owner=None, now: Optional[float] = None) -> Op
         if bus.hosted_turn_principal == claims.sub:
             return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
         return "another person's turn is in progress, so this message was not sent; wait for it to finish"
-    bus.hosted_turn_principal = claims.sub
-    bus.hosted_turn_owner = owner
-    bus.hosted_turn_generation += 1
-    GENERATION.set(bus.hosted_turn_generation)
-    bus.hosted_turn_ops = tuple(claims.ops)
-    bus.hosted_turn_exp = claims.exp
-    bus.hosted_turn_secret = secrets.token_urlsafe(32)
-    bus.hosted_turn_live = True
+    with bus.hosted_lock:
+        bus.hosted_turn_principal = claims.sub
+        bus.hosted_turn_owner = owner
+        bus.hosted_turn_generation += 1
+        GENERATION.set(bus.hosted_turn_generation)
+        bus.hosted_turn_ops = tuple(claims.ops)
+        bus.hosted_turn_exp = claims.exp
+        bus.hosted_turn_secret = secrets.token_urlsafe(32)
+        bus.hosted_turn_live = True
     return None
 
 
@@ -82,13 +99,18 @@ def checker(bus):
     generation = GENERATION.get()
 
     def check() -> Optional[str]:
-        if (
-            generation is not None
-            and bus.hosted_turn_generation == generation
-            and bus.hosted_turn_live
-            and time.time() < bus.hosted_turn_exp
-        ):
-            return None
+        # Under the same lock a release takes, so the two are ordered: a send
+        # whose check passed was handed off before the release, which then
+        # interrupts it; one checked after is refused. Held only for the check,
+        # never across the provider call.
+        with bus.hosted_lock:
+            if (
+                generation is not None
+                and bus.hosted_turn_generation == generation
+                and bus.hosted_turn_live
+                and time.time() < bus.hosted_turn_exp
+            ):
+                return None
         return "your access to this project ended before the message was sent to the agent"
 
     return check
@@ -107,9 +129,10 @@ def arm_expiry(bus, session) -> None:
         bus.hosted_expiry_handle = None
         if bus.hosted_turn_secret != secret or not bus.hosted_turn_live:
             return
-        bus.hosted_turn_live = False
-        bus.hosted_turn_ops = ()
-        bus.hosted_turn_secret = None
+        with bus.hosted_lock:
+            bus.hosted_turn_live = False
+            bus.hosted_turn_ops = ()
+            bus.hosted_turn_secret = None
         task = loop.create_task(session.interrupt())
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
@@ -129,11 +152,12 @@ def release(bus, owner, session) -> None:
     if handle is not None:
         handle.cancel()
         bus.hosted_expiry_handle = None
-    bus.hosted_turn_live = False
-    bus.hosted_turn_ops = ()
-    bus.hosted_turn_secret = None
-    bus.hosted_turn_owner = None
-    bus.hosted_turn_generation += 1
+    with bus.hosted_lock:
+        bus.hosted_turn_live = False
+        bus.hosted_turn_ops = ()
+        bus.hosted_turn_secret = None
+        bus.hosted_turn_owner = None
+        bus.hosted_turn_generation += 1
     if session is not None:
         task = asyncio.get_running_loop().create_task(session.interrupt())
         task.add_done_callback(lambda t: t.cancelled() or t.exception())

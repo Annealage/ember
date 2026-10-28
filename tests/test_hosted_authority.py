@@ -1,5 +1,6 @@
 """One agent serves a project's principals; its turn authority has one owner at a time."""
 
+import threading
 from types import SimpleNamespace
 
 from annealage_ember import hosted_authority
@@ -13,6 +14,7 @@ def _bus():
         hosted_turn_secret=None,
         hosted_turn_principal=None,
         hosted_turn_generation=0,
+        hosted_lock=threading.Lock(),
     )
 
 
