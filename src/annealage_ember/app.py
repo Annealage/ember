@@ -1837,6 +1837,8 @@ class AgentHolder:
         if self._stopped:
             return False
         async with self._lock:
+            if self._fenced():
+                return False  # nothing is opened, and a cancel stays in force
             self._cancelled = False
             if self._stopped:
                 return False
