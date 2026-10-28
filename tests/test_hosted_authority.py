@@ -47,7 +47,7 @@ def test_a_queued_or_deferred_turn_still_blocks_another_principal_after_the_gran
     queued[0] = True  # the first turn ended, one is still queued
     bus.hosted_turn_live, bus.hosted_turn_ops = False, ()
     assert hosted_authority.admit(bus, _holder(queued), _claims("bob")) is not None
-    assert hosted_authority.admit(bus, _holder(queued), _claims("alice")) is None
+    assert "previous message" in hosted_authority.admit(bus, _holder(queued), _claims("alice"))
 
 
 def test_a_turn_nobody_owns_waits_rather_than_being_adopted():
@@ -55,20 +55,16 @@ def test_a_turn_nobody_owns_waits_rather_than_being_adopted():
     assert hosted_authority.admit(bus, _holder([True]), _claims("bob")) is not None
 
 
-def test_the_owner_can_only_narrow_the_live_authority_and_keeps_its_secret():
+def test_the_owner_is_refused_behind_their_own_turn_and_the_grant_is_untouched():
     bus, running = _bus(), [False]
-    hosted_authority.admit(
-        bus, _holder(running), _claims("alice", ("project.exec", "project.write"))
+    hosted_authority.admit(bus, _holder(running), _claims("alice", ("project.exec",)))
+    before = (bus.hosted_turn_ops, bus.hosted_turn_secret)
+    running[0] = True
+    reason = hosted_authority.admit(
+        bus, _holder(running), _claims("alice", ("project.exec", "project.admin"))
     )
-    secret, running[0] = bus.hosted_turn_secret, True
-    assert (
-        hosted_authority.admit(
-            bus, _holder(running), _claims("alice", ("project.exec", "project.admin"))
-        )
-        is None
-    )
-    assert bus.hosted_turn_ops == ("project.exec",)
-    assert bus.hosted_turn_secret == secret
+    assert "previous message" in reason
+    assert (bus.hosted_turn_ops, bus.hosted_turn_secret) == before
 
 
 def test_anyone_is_admitted_when_nothing_is_in_flight_and_gets_a_fresh_grant():

@@ -833,19 +833,6 @@ async def _submit_turn_locked(
     client_id = frame.get("client_id")
     holder = getattr(bus, "agent_holder", None)
     hosted_principal = None
-    if bus is not None and getattr(bus, "hosted_mode", False):
-        # Before anything is logged or handed on: whose authority the turn runs
-        # under is decided here, and a refusal changes nothing.
-        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
-        if refusal is not None:
-            await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
-            return
-        hosted_principal = bus.hosted_turn_principal
-        events = getattr(bus, "session_events", None)
-        if events is not None:
-            # The principal this session now runs for: the one a session event
-            # nobody caused (an idle close, a backend failure) is attributed to.
-            events.note(conn.human)
     defer = (
         holder is not None
         and bus is not None
@@ -857,6 +844,20 @@ async def _submit_turn_locked(
     if blocked_reason is not None:
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
+    if bus is not None and getattr(bus, "hosted_mode", False):
+        # Before anything is logged or handed on: whose authority the turn runs
+        # under is decided here, and a refusal changes nothing.
+        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
+        if refusal is not None:
+            await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
+            return
+        hosted_principal = bus.hosted_turn_principal
+        hosted_authority.arm_expiry(bus, session)
+        events = getattr(bus, "session_events", None)
+        if events is not None:
+            # The principal this session now runs for: the one a session event
+            # nobody caused (an idle close, a backend failure) is attributed to.
+            events.note(conn.human)
     if on_admitted is not None:
         on_admitted()
     turn = None

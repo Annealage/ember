@@ -711,6 +711,7 @@ def create_app(
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
     bus.hosted_turn_principal = None
+    bus.hosted_expiry_handle = None
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
