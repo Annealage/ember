@@ -807,7 +807,10 @@ export function initChat({
       else if (tool.result.isError) failed++;
     }
     const count = segment.tools.length;
-    rec.summary.textContent = `${count} tool call${count === 1 ? "" : "s"}`
+    const label = count === 1
+      ? shortToolName(segment.tools[0].name)
+      : `${count} tool calls`;
+    rec.summary.textContent = label
       + (pending ? ` · ${pending} running` : "")
       + (failed ? ` · ${failed} failed` : "");
     // A collapsed run is one summary, however many calls the real turn has.

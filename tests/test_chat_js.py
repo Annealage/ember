@@ -433,6 +433,13 @@ log.anchorNodes = [];
 log.scrollTop = 1800;
 log.listeners.scroll[0]();
 chat.handleEvent({ kind: "text_delta", turn: 2, text: " Following." });
+
+chat.handleEvent(user(11));
+chat.handleEvent({ kind: "tool_use", turn: 11, tool_use_id: "stage-review",
+  name: "supervisor_stage_review", input: {} });
+chat.handleEvent({ kind: "tool_result", tool_use_id: "stage-review", is_error: false, text: "review recorded" });
+const stageReviewRow = [...el("chatLog").children].find((row) => row.dataset.turn === "11");
+out.singleToolSummary = stageReviewRow.children[1].children[0].children[0].children[0].textContent;
 out.followingScrollTop = log.scrollTop;
 
 // Two tool runs must stay BETWEEN their surrounding prose, not collected at
@@ -748,6 +755,10 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
     assert observed["followingScrollTop"] == 2000
 
 
+def test_single_tool_run_shows_tool_name_on_the_collapsed_row(observed):
+    assert observed["singleToolSummary"] == "supervisor_stage_review"
+
+
 def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
     assert observed["inlineOrder"] == [
         "text:Alpha.",
@@ -761,7 +772,7 @@ def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
         "sameCard": True,
         "result": "late earlier result",
         "summaryA": "2 tool calls · 1 failed",
-        "summaryB": "1 tool call · 1 running",
+        "summaryB": "write · 1 running",
         "inspector": [True, True, 42, 17],
         "nextTurn": ["next"],
     }
