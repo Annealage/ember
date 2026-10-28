@@ -950,6 +950,27 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
     monkeypatch.setattr(omp_module, "RpcClient", DurableRpcClient)
     contexts = []
     omp_client.script = lambda client: None
+    # The work deadline includes startup, so a short wall-clock timeout can
+    # expire before the original prompt reaches the fake on a busy CI runner.
+    # Inject the expiry only after submission has completed: this test is about
+    # abort outcomes, not startup timeout behavior.
+    submitted = asyncio.Event()
+    native_submit = omp_module.OmpSession.submit_turn
+    native_wait = asyncio.wait
+    work_timeout = 41.0
+
+    async def submit(session, *args, **kwargs):
+        await native_submit(session, *args, **kwargs)
+        submitted.set()
+
+    async def wait_after_submission(fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        if timeout == work_timeout:
+            await submitted.wait()
+            timeout = 0
+        return await native_wait(fs, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(omp_module.OmpSession, "submit_turn", submit)
+    monkeypatch.setattr(asyncio, "wait", wait_after_submission)
 
     def abort(client):
         client.aborts += 1
@@ -970,14 +991,15 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
         **make_args(
             tmp_path,
             state_dir=tmp_path / "conversation",
-            work_timeout=0.03,
-            interrupt_timeout=0.1,
+            work_timeout=work_timeout,
+            interrupt_timeout=1,
             max_timeout_recoveries=1,
             on_timeout=lambda context: contexts.append(context) or "must not submit",
         ),
     )
     (client,) = omp_client.instances
     assert result.error is not None and client.messages == ["original"]
+    assert client.aborts == 1
     assert Path(result.recovery.conversation_file).is_file()
     if failure in ("provider_error", "unknown_shape"):
         assert contexts == [] and result.timeout_kind is None

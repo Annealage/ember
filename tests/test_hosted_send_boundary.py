@@ -6,11 +6,14 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from test_omp_session import _started_session
 
-from annealage_ember import hosted_authority
-from annealage_ember.session import omp as omp_module
-from annealage_ember.session.base import InputState
+pytest.importorskip("omp_rpc")
+
+from test_omp_session import _started_session  # noqa: E402
+
+from annealage_ember import hosted_authority  # noqa: E402
+from annealage_ember.session import omp as omp_module  # noqa: E402
+from annealage_ember.session.base import InputState  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 

@@ -6,10 +6,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from omp_rpc.client import RpcTimeoutError
 
-from annealage_ember import hosted_authority
-from annealage_ember.session.rpc_client import LeanRpcClient, SendRefused
+pytest.importorskip("omp_rpc")
+
+from omp_rpc.client import RpcTimeoutError  # noqa: E402
+
+from annealage_ember import hosted_authority  # noqa: E402
+from annealage_ember.session.rpc_client import LeanRpcClient, SendRefused  # noqa: E402
 
 
 class _Stdin:
