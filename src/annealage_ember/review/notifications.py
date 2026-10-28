@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 import json
 import os
-import secrets
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -446,16 +445,6 @@ class ReviewNotifications:
                     live, status="dispatching", turn=dispatch_turn, delivery_revision=revision
                 )
                 admitted = True
-                if self.auth.hosted_mode:
-                    claims = human.hosted_claims
-                    bus = app.agent_bus
-                    bus.hosted_turn_ops = tuple(claims.ops)
-                    bus.hosted_turn_exp = claims.exp
-                    bus.hosted_turn_secret = secrets.token_urlsafe(32)
-                    bus.hosted_turn_live = True
-                    events = getattr(bus, "session_events", None)
-                    if events is not None:
-                        events.note(human)
 
             app.agent_event_log.observers.append(observe)
             try:

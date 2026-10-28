@@ -31,9 +31,11 @@ def _in_flight(bus, holder) -> bool:
     return bool(holder is not None and holder.turn_in_flight())
 
 
-def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
+def admit(bus, holder, claims, *, owner=None, now: Optional[float] = None) -> Optional[str]:
     """Give ``claims``' principal the bus's turn authority for a turn about to
-    be handed to the session, or return why it cannot have it (nothing changed)."""
+    be handed to the session, or return why it cannot have it (nothing changed).
+    ``owner`` is the connection the delegation arrived on: the grant ends with
+    it (``release``)."""
     now = time.time() if now is None else now
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
@@ -42,6 +44,7 @@ def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
             return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
         return "another person's turn is in progress, so this message was not sent; wait for it to finish"
     bus.hosted_turn_principal = claims.sub
+    bus.hosted_turn_owner = owner
     bus.hosted_turn_ops = tuple(claims.ops)
     bus.hosted_turn_exp = claims.exp
     bus.hosted_turn_secret = secrets.token_urlsafe(32)
@@ -80,3 +83,25 @@ def arm_expiry(bus, session) -> None:
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     bus.hosted_expiry_handle = loop.call_later(max(0.0, bus.hosted_turn_exp - time.time()), fire)
+
+
+def release(bus, owner, session) -> None:
+    """End the grant ``owner``'s connection holds, because that connection has
+    gone: the hosted front closes it when the principal's access is revoked or
+    expires, and nothing else tells this process. The turn it was running is
+    interrupted and a turn waiting to start is rejected (``holds``), so nothing
+    the revoked principal sent is dispatched to the model after this. A
+    connection that holds no live grant (the usual idle close) changes nothing."""
+    if owner is None or bus.hosted_turn_owner is not owner or not bus.hosted_turn_live:
+        return
+    handle = getattr(bus, "hosted_expiry_handle", None)
+    if handle is not None:
+        handle.cancel()
+        bus.hosted_expiry_handle = None
+    bus.hosted_turn_live = False
+    bus.hosted_turn_ops = ()
+    bus.hosted_turn_secret = None
+    bus.hosted_turn_owner = None
+    if session is not None:
+        task = asyncio.get_running_loop().create_task(session.interrupt())
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())

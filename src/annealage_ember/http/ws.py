@@ -263,6 +263,10 @@ def register_ws(
             connections.dec()
             if conn is not None:
                 await registry.remove(conn)
+                if auth.hosted_mode:
+                    hosted_authority.release(
+                        getattr(holder, "bus", None), conn, getattr(holder, "session", None)
+                    )
         return Response.already_handled
 
 
@@ -847,7 +851,7 @@ async def _submit_turn_locked(
     if bus is not None and getattr(bus, "hosted_mode", False):
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
-        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
+        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims, owner=conn)
         if refusal is not None:
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
