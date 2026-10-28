@@ -472,6 +472,9 @@ class OmpSession:
         # close() cancels: an omp slow to list its models must not queue a
         # prompt, an abort or the stop behind that listing on the pool above
         # (see _emit_available_models).
+        # Abort is asked on a pool of its own: queued on ``_executor`` it would wait
+        # behind a prompt that is itself waiting for omp's response.
+        self._abort_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-abort")
         self._models_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-models")
         self._models_task: Optional[asyncio.Future] = None
 
@@ -651,12 +654,20 @@ class OmpSession:
 
             def send_prompt():
                 # In the thread that calls the provider, behind whatever the
-                # executor was busy with: the last look before the send.
-                if check is not None:
+                # executor was busy with. With the lean client the check runs
+                # under the client's write lock, immediately before the bytes
+                # are written (``LeanRpcClient.send_gate``); any other client
+                # gets the check just before the call.
+                gate = getattr(self._client, "send_gate", None)
+                if check is None:
+                    return self._client.prompt(message, images=images)
+                if gate is None:
                     refusal = check()
                     if refusal:
                         raise RuntimeError(refusal)
-                return self._client.prompt(message, images=images)
+                    return self._client.prompt(message, images=images)
+                with gate(check):
+                    return self._client.prompt(message, images=images)
 
             await self._run_blocking(send_prompt)
             self._emit(InputState(input_id, turn, "provider_ack"))
@@ -785,7 +796,9 @@ class OmpSession:
                     pass
         self._aborted_turn = self._turn
         try:
-            await self._run_blocking(self._client.abort)
+            await asyncio.get_running_loop().run_in_executor(
+                self._abort_executor, self._client.abort
+            )
         except Exception as exc:
             # Best-effort, like the other two backends: the turn is either
             # already finished or the child is gone, and both surface
@@ -1179,6 +1192,7 @@ class OmpSession:
         # Not waited for: a listing omp never answered holds its thread until
         # the stop above fails it, and nothing needs that answer now.
         self._models_executor.shutdown(wait=False)
+        self._abort_executor.shutdown(wait=False)
         self._discard_agent_dir()
         self._set_status(AGENT_UNAVAILABLE)
 

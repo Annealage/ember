@@ -1,0 +1,146 @@
+"""``LeanRpcClient.send_gate``: the revocation check and the wire write are one step under the write lock."""
+
+import json
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+from omp_rpc.client import RpcTimeoutError
+
+from annealage_ember import hosted_authority
+from annealage_ember.session.rpc_client import LeanRpcClient, SendRefused
+
+
+class _Stdin:
+    def __init__(self):
+        self.lines, self.pause = [], None
+        self._buf = ""
+
+    def write(self, text):
+        if self.pause is not None:
+            self.pause.wait(5)  # a full pipe: the write blocks
+        self._buf += text
+
+    def flush(self):
+        for line in self._buf.splitlines():
+            self.lines.append(json.loads(line))
+        self._buf = ""
+
+
+def _client():
+    client = LeanRpcClient(request_timeout=0.3)
+    stdin = _Stdin()
+    client._process = SimpleNamespace(stdin=stdin)
+    return client, stdin
+
+
+def _types(stdin):
+    return [line["type"] for line in stdin.lines]
+
+
+def test_a_refused_check_writes_nothing_and_leaves_no_pending_request():
+    client, stdin = _client()
+    with client.send_gate(lambda: "revoked"):
+        with pytest.raises(SendRefused, match="revoked"):
+            client.prompt("hi")
+    assert stdin.lines == [] and client._pending == {}
+
+
+def test_a_passing_check_writes_the_prompt_and_only_commands_that_start_work_are_gated():
+    client, stdin = _client()
+    checks = []
+    with client.send_gate(lambda: checks.append(1) or None):
+        with pytest.raises(RpcTimeoutError):  # no omp to answer; the write happened
+            client.prompt("hi")
+        with pytest.raises(RpcTimeoutError):
+            client.abort()
+    assert _types(stdin) == ["prompt", "abort"]
+    assert checks == [1]  # abort is never gated: a revoked grant must still be able to stop work
+
+
+def test_the_check_runs_under_the_write_lock_so_an_abort_cannot_overtake_a_checked_prompt():
+    client, stdin = _client()
+    order = []
+
+    def check():
+        # Inside the lock: nothing else can write now.
+        order.append("locked" if not client._write_lock.acquire(blocking=False) else "free")
+        return
+
+    with client.send_gate(check):
+        with pytest.raises(RpcTimeoutError):
+            client.prompt("hi")
+    assert order == ["locked"]
+
+
+def test_release_does_not_wait_for_a_blocked_prompt_write_and_the_abort_follows_it_on_the_wire():
+    client, stdin = _client()
+    stdin.pause = threading.Event()  # the pipe is full: the prompt's write blocks
+    bus = SimpleNamespace(
+        hosted_turn_live=True,
+        hosted_turn_ops=(),
+        hosted_turn_exp=time.time() + 60,
+        hosted_turn_secret="s",
+        hosted_turn_principal="alice",
+        hosted_turn_owner="conn",
+        hosted_turn_generation=1,
+        hosted_lock=threading.Lock(),
+        hosted_expiry_handle=None,
+    )
+    hosted_authority.GENERATION.set(1)
+    check = hosted_authority.checker(bus)
+    errors = []
+
+    def prompt():
+        try:
+            with client.send_gate(check):
+                client.prompt("hi")
+        except Exception as exc:  # the timeout waiting for a reply that never comes
+            errors.append(exc)
+
+    sender = threading.Thread(target=prompt)
+    sender.start()
+    time.sleep(0.2)  # checked, and now stuck writing
+    started = time.monotonic()
+    hosted_authority.release(bus, "conn", None)  # what the event loop does on revocation
+    assert time.monotonic() - started < 0.1  # never waits for the write
+    aborter = threading.Thread(target=lambda: _swallow(client.abort))
+    aborter.start()
+    time.sleep(0.1)
+    assert stdin.lines == []  # the abort waits behind the prompt for the write lock
+    stdin.pause.set()
+    sender.join(3)
+    aborter.join(3)
+    assert _types(stdin) == ["prompt", "abort"]
+
+
+def _swallow(fn):
+    try:
+        fn()
+    except Exception:
+        pass
+
+
+def test_a_prompt_paused_before_the_wire_is_refused_if_the_grant_ends_meanwhile():
+    """The sender is held off the wire (another writer has the lock, or the thread
+    is descheduled before it); the grant ends; when it finally gets to write, the
+    check runs then and refuses it."""
+    client, stdin = _client()
+    live = [True]
+    errors = []
+
+    def prompt():
+        try:
+            with client.send_gate(lambda: None if live[0] else "revoked"):
+                client.prompt("hi")
+        except SendRefused as exc:
+            errors.append(exc)
+
+    with client._write_lock:  # some other write in progress
+        sender = threading.Thread(target=prompt)
+        sender.start()
+        time.sleep(0.2)  # waiting for the lock, nothing checked or written yet
+        live[0] = False
+    sender.join(3)
+    assert errors and stdin.lines == []

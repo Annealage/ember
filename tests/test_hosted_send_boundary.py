@@ -241,3 +241,29 @@ async def test_a_hosted_prompt_waiting_for_omp_to_start_is_refused_once_revoked_
         finally:
             gate.set()
             await app.agent_stop()
+
+
+async def test_interrupt_is_not_queued_behind_a_prompt_that_is_waiting_for_omp(monkeypatch):
+    """Abort has its own worker: the prompt call holds the session's executor
+    while it waits for omp's response, and an abort queued there would wait too."""
+    session, fake, _recorder, _broker = await _started_session()
+    unblock = threading.Event()
+    aborted = threading.Event()
+    original = fake.prompt
+
+    def slow_prompt(*args, **kwargs):
+        unblock.wait(5)
+        return original(*args, **kwargs)
+
+    fake.prompt = slow_prompt
+    fake.abort = lambda: aborted.set()
+    try:
+        task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
+        await asyncio.sleep(0.2)  # the prompt is now holding the executor
+        await asyncio.wait_for(session.interrupt(), 2)
+        assert aborted.is_set()
+        unblock.set()
+        await asyncio.wait_for(task, 5)
+    finally:
+        unblock.set()
+        await session.close()

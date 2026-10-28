@@ -31,7 +31,8 @@ not of the Python objects, and not of the bytes omp sent) are exposed through
 
 **Pinned private surface.** omp-rpc is a third-party package installed from a git
 commit (``PINNED_OMP_RPC``). This subclass reaches these names of it and no others:
-``omp_rpc.client._clone_json_object``; on ``RpcClient``: ``_append_event``,
+``omp_rpc.client._clone_json_object`` and ``RpcProcessExitError``; on ``RpcClient``:
+``_write_lock`` and ``_write_json`` (re-implemented under the lock for the send gate), ``_append_event``,
 ``_events`` (``limit``, ``items``, ``offset``, ``clear``, ``current_index``,
 ``snapshot``, ``snapshot_from``, as ``_BoundedHistory`` has them), ``_event_condition``,
 ``_state_lock``, ``_pending``, ``_pending_host_tool_calls``,
@@ -43,11 +44,13 @@ the same names. Re-read ``omp_rpc/client.py`` against this file when the pin mov
 
 from __future__ import annotations
 
+import contextlib
 import json
-from typing import Any, Dict
+import threading
+from typing import Any, Callable, Dict, Optional
 
 from omp_rpc import RpcClient
-from omp_rpc.client import _clone_json_object
+from omp_rpc.client import RpcProcessExitError, _clone_json_object
 
 from .. import observability
 
@@ -85,6 +88,8 @@ _REQUIRED_ATTRS = (
     "_pending_host_tool_calls",
     "_pending_host_uri_requests",
     "_process",
+    "_write_lock",
+    "_write_json",
     *LISTENER_ATTRS,
     _TYPED_LISTENERS,
 )
@@ -134,11 +139,20 @@ def estimated_size(payload: Dict[str, Any]) -> int:
     return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
+#: Commands that make omp start or feed agent work: the ones a revoked grant must not send.
+_WORK_COMMANDS = frozenset({"prompt", "abort_and_prompt", "steer", "follow_up"})
+
+
+class SendRefused(RuntimeError):
+    """The send gate refused a command at the write; nothing went to omp."""
+
+
 class LeanRpcClient(RpcClient):
     """``RpcClient`` whose event history leaves out ``message_update`` and reports what it holds."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._gate_local = threading.local()
         events = getattr(self, "_events", None)
         missing = [name for name in _REQUIRED_ATTRS if not hasattr(self, name)]
         if (
@@ -156,6 +170,41 @@ class LeanRpcClient(RpcClient):
             )
         self._events = _SizedHistory(events.limit)
         observability.track_client(self)
+
+    @contextlib.contextmanager
+    def send_gate(self, check: Optional[Callable[[], Optional[str]]]):
+        """Within this block, a command that starts agent work (``prompt``,
+        ``abort_and_prompt``, ``steer``, ``follow_up``) made on THIS thread asks
+        ``check()`` immediately before its bytes are written, while holding
+        the write lock, and is refused with ``SendRefused`` (nothing written)
+        when it returns a reason. A command that is written is followed on
+        the wire, never preceded, by any ``abort`` issued after it, because
+        that abort's own write waits for the same lock. The wait for omp's
+        response stays outside the lock, as upstream has it."""
+        local = self._gate_local
+        previous = getattr(local, "check", None)
+        local.check = check
+        try:
+            yield
+        finally:
+            local.check = previous
+
+    def _write_json(self, process, payload):
+        check = getattr(self._gate_local, "check", None)
+        if check is None or payload.get("type") not in _WORK_COMMANDS:
+            return super()._write_json(process, payload)
+        if process.stdin is None:
+            raise RpcProcessExitError("RPC process stdin is unavailable")
+        with self._write_lock:
+            reason = check()
+            if reason:
+                raise SendRefused(reason)
+            try:
+                process.stdin.write(json.dumps(payload))
+                process.stdin.write("\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RpcProcessExitError(f"Failed to write RPC command: {exc}") from exc
 
     def _append_event(self, payload: Dict[str, Any]) -> None:
         observability.rpc_event(payload.get("type"))
