@@ -199,6 +199,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -207,7 +208,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from omp_rpc import host_tool
-from omp_rpc.client import RpcTimeoutError
+from omp_rpc.client import RpcCommandError, RpcTimeoutError
 
 from .. import hosted_state, observability, product
 from ..tools import host_tool_name
@@ -238,6 +239,7 @@ from .base import (
     turn_not_sent,
 )
 from .rpc_client import LeanRpcClient as RpcClient
+from .rpc_client import SendRefused
 
 
 def _provider_id() -> str:
@@ -396,6 +398,11 @@ class OmpSession:
         #: a prompt would be sent to the provider, in the thread that sends it (hosted
         #: apps set it: the turn's own authority must still hold).
         self.send_guard = None
+        #: ``() -> None``, called when omp may still be running work this session can no
+        #: longer track (a hosted app fences its worker with it).
+        self.fence_hook = None
+        #: Turns omp itself reported finished (``agent_end``), read in wire order.
+        self._agent_end_turns: set = set()
         self._timeout_interrupt_turn = None
         self._on_session_file = on_session_file
         self._thinking = thinking
@@ -638,6 +645,7 @@ class OmpSession:
         self._turn_started = time.monotonic()
         self._active_input_id = input_id
         self._running = True
+        stage = "pre"
         try:
             loop = asyncio.get_running_loop()
             expanded = await loop.run_in_executor(
@@ -669,6 +677,7 @@ class OmpSession:
                 with gate(check):
                     return self._client.prompt(message, images=images)
 
+            stage = "send"
             await self._run_blocking(send_prompt)
             self._emit(InputState(input_id, turn, "provider_ack"))
         except Exception as exc:
@@ -679,11 +688,39 @@ class OmpSession:
                 raise
             if _process_gone(exc):
                 self._fail(exc, viewer=viewer)
+            elif (
+                self.send_guard is not None
+                and stage == "send"
+                and not isinstance(exc, (SendRefused, RpcCommandError))
+            ):
+                # Hosted, and the prompt may have been written without omp's answer
+                # arriving (a timeout, a failure after the write): its work could
+                # be running, so this is not a refusal a successor may follow.
+                await self._tear_down_after_uncertain_send(exc, viewer)
             else:
                 self._running = False
                 self._active_input_id = None
                 self._emit(InputState(input_id, turn, "rejected", str(exc)))
                 self._refused(str(exc) or type(exc).__name__, turn, ends_turn=True)
+
+    async def _tear_down_after_uncertain_send(self, exc: BaseException, viewer) -> None:
+        """Kill omp's process group and fail closed; fence the worker through
+        ``fence_hook`` unless the group is verified gone."""
+        verified = False
+        kill = getattr(self._client, "kill", None)
+        if kill is not None:
+            try:
+                verified = (await _run_in_new_thread(kill, 3.0)) is True
+            except Exception as failure:
+                sys.stderr.write("warning: could not kill the agent process: %r\n" % (failure,))
+        if not verified and self.fence_hook is not None:
+            self.fence_hook()
+        self._fail(
+            exc,
+            viewer=viewer,
+            remediation="the message may have reached the agent without being acknowledged, so the "
+            "agent was shut down; start the session again",
+        )
 
     async def _send_next_queued(self) -> None:
         if self._running or not self._input_queue or self._status != AGENT_READY:
@@ -760,7 +797,9 @@ class OmpSession:
     async def interrupt(self) -> None:
         await self._interrupt()
 
-    async def stop_for_revocation(self, deadline: float = 3.0, settle: float = 5.0) -> None:
+    async def stop_for_revocation(
+        self, deadline: float = 3.0, settle: float = 5.0, kill_deadline: float = 3.0
+    ) -> bool:
         """Stop the turn in flight because its authority ended, and fail closed.
 
         Bound to the turn that is in flight when it starts (the caller admits no
@@ -770,9 +809,15 @@ class OmpSession:
         an RPC reply, not proof that work stopped. Anything else (the abort
         failing, not answering, or the turn not ending) kills omp's whole process
         group and marks the session unavailable. A turn that already ended needs
-        nothing. A request omp has already made to a provider is not recalled."""
+        nothing. A request omp has already made to a provider is not recalled.
+
+        Returns whether the turn is known stopped: a clean stop, or a kill that
+        verified the whole group gone. ``False`` means the process may still be
+        alive (the kill failed, was not confirmed, or could not be scheduled
+        within ``kill_deadline``); the session is unavailable either way and
+        the caller must not let anything else run on this worker."""
         if not self._running and self._active_input_id is None:
-            return
+            return True
         turn = self._turn
         acknowledged = False
         try:
@@ -783,13 +828,14 @@ class OmpSession:
             loop = asyncio.get_running_loop()
             end = loop.time() + settle
             while loop.time() < end:
-                if self._turn != turn or not self._running:
-                    return
+                if turn in self._agent_end_turns:
+                    return True
                 await asyncio.sleep(0.05)
+        verified = False
         kill = getattr(self._client, "kill", None)
         if kill is not None:
             try:
-                await asyncio.get_running_loop().run_in_executor(None, kill)
+                verified = (await _run_in_new_thread(kill, kill_deadline)) is True
             except Exception as exc:
                 sys.stderr.write("warning: could not kill the agent process: %r\n" % (exc,))
         self._fail(
@@ -797,6 +843,7 @@ class OmpSession:
             remediation="the agent was shut down because the access it was running under ended; "
             "start the session again",
         )
+        return verified
 
     async def interrupt_for_timeout(self) -> bool:
         """Acknowledge abort or fail closed; the host must still await TurnEnd.
@@ -1563,6 +1610,7 @@ class OmpSession:
         # Read here, on the reader thread, in wire order: the turn this run
         # ended in, whatever the loop has done by the time the settle runs.
         turn = self._turn
+        self._agent_end_turns.add(turn)  # the proof ``stop_for_revocation`` waits for
         self._loop.call_soon_threadsafe(self._turn_settled, turn)
 
     def _turn_settled(self, turn: int) -> None:
@@ -1977,6 +2025,29 @@ def _api_key_env_name(session_id: object) -> str:
     """
     digest = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:32]
     return "%s_OMP_API_KEY_%s" % (product.current().name.upper(), digest)
+
+
+async def _run_in_new_thread(func, timeout: float):
+    """``func()`` on a fresh daemon thread, awaited for at most ``timeout``
+    seconds (``TimeoutError``): not on a shared pool, whose workers can all be
+    busy (or stuck) exactly when a revocation needs this to run."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def deliver(setter, value):
+        if not future.done():
+            setter(value)
+
+    def run():
+        try:
+            result = func()
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting side
+            loop.call_soon_threadsafe(deliver, future.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(deliver, future.set_result, result)
+
+    threading.Thread(target=run, name="omp-kill", daemon=True).start()
+    return await asyncio.wait_for(future, timeout)
 
 
 def _build_custom_provider(base_url: str, api_key_env_name: Optional[str]) -> dict:

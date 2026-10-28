@@ -17,6 +17,7 @@ def _bus():
         hosted_turn_principal=None,
         hosted_turn_generation=0,
         hosted_stopping=0,
+        hosted_fenced=False,
         hosted_lock=threading.Lock(),
     )
 

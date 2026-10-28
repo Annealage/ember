@@ -91,6 +91,7 @@ def test_release_does_not_wait_for_a_blocked_prompt_write_and_the_abort_follows_
         hosted_turn_owner="conn",
         hosted_turn_generation=1,
         hosted_stopping=0,
+        hosted_fenced=False,
         hosted_lock=threading.Lock(),
         hosted_expiry_handle=None,
     )
@@ -198,3 +199,22 @@ def test_kill_takes_down_the_whole_process_group_including_a_child_holding_the_p
     assert leader.poll() is not None
     with pytest.raises(ProcessLookupError):
         os.kill(child, 0)  # the child went with the group (it is reaped by init)
+
+
+def test_a_group_signal_that_fails_makes_the_kill_unverified(monkeypatch):
+    import os
+    import subprocess
+
+    client = LeanRpcClient()
+    leader = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    client._process, client._pgid = leader, leader.pid
+
+    def denied(pgid, sig):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr(os, "killpg", denied)
+    try:
+        assert client.kill() is False  # the leader died, but its group could not be signalled
+    finally:
+        leader.kill()
+        leader.wait()

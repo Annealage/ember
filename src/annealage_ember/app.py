@@ -718,6 +718,7 @@ def create_app(
     bus.hosted_lock = threading.Lock()
     bus.hosted_cancel_generation = 0
     bus.hosted_stopping = 0
+    bus.hosted_fenced = False
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
@@ -829,6 +830,7 @@ def create_app(
             session = ExternalAgentSession(publish, bus.broker)
         if hosted_mode and session is not None:
             session.send_guard = lambda: hosted_authority.checker(bus)
+            session.fence_hook = lambda: setattr(bus, "hosted_fenced", True)
         return session
 
     agent_lock = None

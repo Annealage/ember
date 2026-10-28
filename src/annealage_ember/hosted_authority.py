@@ -67,6 +67,8 @@ def admit(bus, holder, claims, *, owner=None, now: Optional[float] = None) -> Op
     now = time.time() if now is None else now
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
+    if bus.hosted_fenced:
+        return "this agent could not be shut down safely after access ended, so it takes no more messages until the worker is restarted"
     if _in_flight(bus, holder):
         if bus.hosted_turn_principal == claims.sub:
             return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
@@ -101,7 +103,11 @@ def _begin_stop(bus, session) -> None:
 
     def settled(done):
         bus.hosted_stopping -= 1
-        done.cancelled() or done.exception()
+        # Only an explicit "known stopped" lets the worker go on. A stop that
+        # returned False, raised or was cancelled leaves the old process possibly
+        # alive: fence the worker for good (a restart clears it).
+        if done.cancelled() or done.exception() is not None or done.result() is False:
+            bus.hosted_fenced = True
 
     task.add_done_callback(settled)
 

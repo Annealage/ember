@@ -25,6 +25,7 @@ def _bus(exp):
         hosted_turn_owner="conn",
         hosted_turn_generation=1,
         hosted_stopping=0,
+        hosted_fenced=False,
         hosted_lock=threading.Lock(),
         hosted_expiry_handle=None,
     )
@@ -287,7 +288,7 @@ async def test_an_abort_that_errors_kills_omp_and_fails_closed():
     def broken_abort():
         raise RuntimeError("abort failed")
 
-    fake.abort, fake.kill = broken_abort, lambda: killed.append(1)
+    fake.abort, fake.kill = broken_abort, lambda: killed.append(1) or True
     try:
         await session.stop_for_revocation(deadline=1.0, settle=0.3)
         assert killed == [1] and session.agent_status() == "unavailable"
@@ -298,7 +299,7 @@ async def test_an_abort_that_errors_kills_omp_and_fails_closed():
 async def test_an_acknowledged_abort_with_no_terminal_event_is_not_a_stopped_turn():
     session, fake = await _in_flight_turn()
     killed = []
-    fake.kill = lambda: killed.append(1)
+    fake.kill = lambda: killed.append(1) or True
     try:
         await session.stop_for_revocation(
             deadline=1.0, settle=0.3
@@ -312,7 +313,7 @@ async def test_an_acknowledged_abort_with_no_terminal_event_is_not_a_stopped_tur
 async def test_an_acknowledged_abort_followed_by_the_terminal_event_is_a_clean_stop():
     session, fake = await _in_flight_turn()
     killed = []
-    fake.kill = lambda: killed.append(1)
+    fake.kill = lambda: killed.append(1) or True
     try:
         task = asyncio.ensure_future(session.stop_for_revocation(deadline=1.0, settle=2.0))
         await asyncio.sleep(0.2)
@@ -327,7 +328,7 @@ async def test_an_acknowledged_abort_followed_by_the_terminal_event_is_a_clean_s
 async def test_a_stop_for_a_turn_that_already_ended_does_nothing():
     session, fake, _r, _b = await _started_session()
     killed = []
-    fake.kill = lambda: killed.append(1)
+    fake.kill = lambda: killed.append(1) or True
     try:
         await session.stop_for_revocation(deadline=0.3, settle=0.3)
         assert fake.abort_calls == 0 and killed == []
@@ -354,3 +355,102 @@ async def test_no_successor_is_admitted_until_the_revocation_stop_has_settled():
     await asyncio.sleep(0.05)
     assert hosted_authority.admit(bus, None, successor) is None
     assert calls == ["stop"]  # exactly one stop, the old turn's
+
+
+# -- an unverified kill, a stalled kill, a written-but-unacknowledged prompt --------------------
+
+
+class _Stopping:
+    """The hosted side: what release does with the backend's answer."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    async def stop_for_revocation(self):
+        return self.answer
+
+
+async def test_a_kill_that_is_not_verified_fences_the_worker_so_no_successor_runs():
+    from annealage_ember.session.base import AgentError  # noqa: F401
+
+    for how in ("false", "raises", "stalls", "missing"):
+        bus = _bus(time.time() + 60)
+        session, fake = await _in_flight_turn()
+        stall = threading.Event()
+        try:
+            if how == "false":
+                fake.kill = lambda: False
+            elif how == "raises":
+                fake.kill = lambda: (_ for _ in ()).throw(OSError("EPERM"))
+            elif how == "stalls":
+                fake.kill = lambda stall=stall: stall.wait(10)
+            # "missing": the client has no kill at all
+            stopped = await session.stop_for_revocation(deadline=1.0, settle=0.2, kill_deadline=0.3)
+            assert stopped is False, how
+            assert session.agent_status() == "unavailable", how
+
+            hosted_authority.release(bus, "conn", _Stopping(stopped))
+            await asyncio.sleep(0.1)
+            assert bus.hosted_fenced is True, how
+            successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
+            assert "restarted" in hosted_authority.admit(bus, None, successor), how
+        finally:
+            stall.set()
+            await session.close()
+
+
+async def test_a_verified_kill_lets_the_worker_go_on_after_the_stop():
+    bus = _bus(time.time() + 60)
+    bus.hosted_fenced = False
+    session, fake = await _in_flight_turn()
+    fake.kill = lambda: True
+    try:
+        stopped = await session.stop_for_revocation(deadline=1.0, settle=0.2)
+        assert stopped is True
+
+        hosted_authority.release(bus, "conn", _Stopping(stopped))
+        await asyncio.sleep(0.1)
+        assert bus.hosted_fenced is False
+    finally:
+        await session.close()
+
+
+async def _hosted_send_failing_with(exc, monkeypatch=None):
+    session, fake, recorder, _broker = await _started_session()
+    bus = _bus(time.time() + 60)
+    bus.hosted_fenced = False
+    session.send_guard = lambda: hosted_authority.checker(bus)
+    session.fence_hook = lambda: setattr(bus, "hosted_fenced", True)
+    hosted_authority.GENERATION.set(bus.hosted_turn_generation)
+    killed = []
+    fake.kill = lambda: killed.append(1) or False  # and it cannot be verified
+    fake.prompt = lambda *a, **k: (_ for _ in ()).throw(exc)
+    await session.submit_turn([{"type": "text", "text": "go"}])
+    return session, bus, killed, recorder
+
+
+async def test_a_prompt_that_timed_out_after_the_write_tears_the_agent_down_and_fences():
+    from omp_rpc.client import RpcTimeoutError
+
+    session, bus, killed, recorder = await _hosted_send_failing_with(RpcTimeoutError("no reply"))
+    try:
+        assert killed == [1] and session.agent_status() == "unavailable"
+        assert bus.hosted_fenced is True  # the kill could not be verified
+        states = [e.state for e in recorder.all if isinstance(e, InputState)]
+        assert "rejected" not in states and "uncertain" in states
+    finally:
+        await session.close()
+
+
+async def test_a_prompt_omp_answered_with_an_error_is_a_plain_refusal():
+    from omp_rpc.client import RpcCommandError
+
+    session, bus, killed, recorder = await _hosted_send_failing_with(
+        RpcCommandError(command="prompt", error="nope", code=None)
+    )
+    try:
+        assert killed == [] and bus.hosted_fenced is False
+        assert session.agent_status() == "ready"
+        assert any(isinstance(e, InputState) and e.state == "rejected" for e in recorder.all)
+    finally:
+        await session.close()

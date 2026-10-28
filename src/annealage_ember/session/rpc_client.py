@@ -49,6 +49,7 @@ import json
 import os
 import signal
 import threading
+import time
 from typing import Any, Callable, Dict, Optional
 
 from omp_rpc import RpcClient
@@ -193,30 +194,50 @@ class LeanRpcClient(RpcClient):
             local.check = previous
 
     def kill(self) -> bool:
-        """End omp and every descendant now, from any thread: SIGKILL to the
-        process group omp leads (it is spawned in its own session, so the group
-        is its own and holds the agent's tool children too, which could
-        otherwise keep the pipes open), falling back to the leader alone. Takes
-        no lock, so it works while a write is stalled on a full pipe. Waits up
-        to a second to confirm the leader is gone; returns whether it is.
-        Never raises."""
+        """End omp and every descendant now, from any thread, and say whether
+        that is VERIFIED: SIGKILL to the process group omp leads (it is spawned
+        in its own session, so the group is its own and holds the agent's tool
+        children, which could otherwise keep running), then up to a second of
+        waiting for the leader to be reaped and the group to be empty
+        (``killpg(pgid, 0)`` says no such process). A group signal that
+        failed for any reason but the group being already empty, a leader that
+        will not die, or a group that still has members is ``False``: the caller
+        must treat the process as possibly alive. Takes no lock, so it works
+        while a write is stalled on a full pipe. Never raises."""
         process = self._process
         if process is None:
             return True
         try:
             pgid = getattr(self, "_pgid", None)
             killpg = getattr(os, "killpg", None)
-            if pgid is not None and killpg is not None:
+            grouped = pgid is not None and killpg is not None
+            if grouped:
                 try:
                     killpg(pgid, signal.SIGKILL)
-                except OSError:
+                except ProcessLookupError:
                     pass
+                except OSError:
+                    grouped = False  # could not signal the group: only the leader can be dealt with
             try:
                 process.kill()
             except OSError:
                 pass
             process.wait(timeout=1.0)
-            return True
+            if not grouped:
+                return (
+                    pgid is None or killpg is None
+                )  # leader-only platforms have no group to check
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    killpg(pgid, 0)
+                except ProcessLookupError:
+                    return True
+                except OSError:
+                    return False
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
         except Exception:
             return False
 
