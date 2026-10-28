@@ -1558,6 +1558,11 @@ class AgentHolder:
             await asyncio.wait({start}, timeout=wait_ready)
         return self.session
 
+    def _fenced(self):
+        """Whether this hosted worker was fenced because an old agent process may
+        still be alive (``hosted_authority``): no successor may be started."""
+        return getattr(self.bus, "hosted_fenced", False)
+
     async def _replace_down(self):
         """Close the session that went down, as an idle close would, end the
         turns it left running (as interrupted, as ``create_app`` ends a killed
@@ -1565,6 +1570,8 @@ class AgentHolder:
         keep the app from ever closing for being idle), and open its
         replacement from ``_retry_with``; a factory that raises leaves the app
         closed, for the next ``ensure`` to try again."""
+        if self._fenced():
+            return
         session, start = self.session, self._start_task
         self._start_task = None
         self.closed = True
@@ -1581,6 +1588,11 @@ class AgentHolder:
         # The model the human last switched to, which the new session does not
         # start on: every factory builds from the run's settings.
         wanted = self._session_info.get("model")
+        if self._fenced():
+            # Every path that opens a successor (ensure, launch, a replaced
+            # down session) ends here: none may while the old process could live.
+            sys.stderr.write("error: the agent worker is fenced; not opening a new session\n")
+            return
         if not self._claim():
             return
         try:

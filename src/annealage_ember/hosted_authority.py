@@ -119,6 +119,27 @@ def _stop(session):
     return stop() if stop is not None else session.interrupt()
 
 
+def interrupt(bus, session) -> None:
+    """A manual interrupt on a hosted turn: the grant ends and the turn is
+    stopped through the same bounded lifecycle as a revocation (abort, terminal
+    proof, verified group kill or a permanent fence), not a bare abort whose
+    failure nothing would follow up. Every turn still waiting for the
+    submission lock is cancelled with it."""
+    bus.hosted_cancel_generation += 1
+    handle = getattr(bus, "hosted_expiry_handle", None)
+    if handle is not None:
+        handle.cancel()
+        bus.hosted_expiry_handle = None
+    with bus.hosted_lock:
+        bus.hosted_turn_live = False
+        bus.hosted_turn_ops = ()
+        bus.hosted_turn_secret = None
+        bus.hosted_turn_owner = None
+        bus.hosted_turn_generation += 1
+    if session is not None:
+        _begin_stop(bus, session)
+
+
 def checker(bus):
     """A thread-safe ``() -> reason | None`` for the send of ONE turn: bound to
     the grant generation of the task asking (``GENERATION``), and so false for

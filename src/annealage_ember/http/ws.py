@@ -560,10 +560,10 @@ async def _serve_connection(
         bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
         if hosted and bus is not None:
             if kind == "interrupt":
-                bus.hosted_cancel_generation += 1  # before anything awaits: see FENCE
-                bus.hosted_turn_live = False
-                bus.hosted_turn_ops = ()
-                bus.hosted_turn_secret = None
+                # Before anything awaits (see FENCE), and through the bounded stop
+                # lifecycle rather than a bare abort: see hosted_authority.interrupt.
+                hosted_authority.interrupt(bus, session)
+                continue
         dispatching = _dispatch(
             ws,
             conn,

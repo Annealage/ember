@@ -284,3 +284,72 @@ async def test_another_principals_interrupt_also_cancels_a_turn_waiting_for_the_
         await bob.close()
     finally:
         await app.agent_stop()
+
+
+async def _closed_worker(hosted):
+    """The old agent is gone (closed by a cancel, then the 'cancelled' mark
+    lifted as an idle close would leave it): the next interaction would open
+    a successor."""
+    await hosted.call("post", "/agent/session/cancel", _admin())
+    hosted.app.agent_holder._cancelled = False
+
+
+def _admin():
+    return {**_as("alice"), "Content-Type": "application/json"}
+
+
+async def test_a_fenced_worker_opens_no_successor_by_a_turn_or_a_launch(
+    served_dir, tmp_path_factory
+):
+    """After a kill that could not be verified, neither a hosted turn (ensure) nor
+    an HTTP launch may call the session factory."""
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        await _closed_worker(hosted)
+        app.agent_bus.hosted_fenced = True
+        held = await _send(app, "alice", "again")  # ensure(retry=True) before admission
+        res = await hosted.call("post", "/agent/session", _admin())
+        assert len(hosted.sessions) == 1  # the factory was never called again
+        assert res.status_code == 503  # not opened: the route reports no session
+        assert _logged(app, "user_turn") == []
+        await held.close()
+    finally:
+        await app.agent_stop()
+
+
+async def test_without_the_fence_the_same_turn_does_open_the_successor(
+    served_dir, tmp_path_factory
+):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        await _closed_worker(hosted)
+        held = await _send(app, "alice", "again")
+        assert len(hosted.sessions) == 2  # control: the fence is what stopped it above
+        await held.close()
+    finally:
+        await app.agent_stop()
+
+
+async def test_a_manual_interrupt_goes_through_the_bounded_stop_and_the_grant_ends(
+    served_dir, tmp_path_factory
+):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        held = await _send(app, "alice", "first")
+        assert bus.hosted_turn_live
+        interrupter = await _Held(app, "alice").open([HELLO, {"type": "interrupt"}])
+        await asyncio.sleep(0.2)
+        assert session.interrupted == 1  # once, by the stop lifecycle
+        assert not bus.hosted_turn_live and bus.hosted_stopping == 0
+        await interrupter.close()
+        await held.close()
+    finally:
+        await app.agent_stop()

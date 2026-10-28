@@ -25,6 +25,7 @@ def _bus(exp):
         hosted_turn_owner="conn",
         hosted_turn_generation=1,
         hosted_stopping=0,
+        hosted_cancel_generation=0,
         hosted_fenced=False,
         hosted_lock=threading.Lock(),
         hosted_expiry_handle=None,
@@ -453,4 +454,55 @@ async def test_a_prompt_omp_answered_with_an_error_is_a_plain_refusal():
         assert session.agent_status() == "ready"
         assert any(isinstance(e, InputState) and e.state == "rejected" for e in recorder.all)
     finally:
+        await session.close()
+
+
+async def test_a_manual_interrupt_with_a_failed_abort_ends_in_a_verified_kill_or_a_fence():
+    for verified in (True, False):
+        bus = _bus(time.time() + 60)
+        session, fake = await _in_flight_turn()
+
+        def broken_abort():
+            raise RuntimeError("abort failed")
+
+        fake.abort = broken_abort
+        fake.kill = lambda verified=verified: verified
+        try:
+            hosted_authority.interrupt(bus, session)
+            assert not bus.hosted_turn_live and bus.hosted_stopping == 1
+            for _ in range(100):
+                if bus.hosted_stopping == 0:
+                    break
+                await asyncio.sleep(0.05)
+            assert bus.hosted_stopping == 0
+            assert session.agent_status() == "unavailable"
+            assert bus.hosted_fenced is (not verified), verified
+            # the disconnect that follows has nothing left to disarm or retry
+            hosted_authority.release(bus, "conn", session)
+            assert bus.hosted_stopping == 0
+        finally:
+            await session.close()
+
+
+async def test_a_manual_interrupt_that_stalls_past_the_deadline_is_still_torn_down():
+    bus = _bus(time.time() + 60)
+    session, fake = await _in_flight_turn()
+    stuck = threading.Event()
+    fake.abort = lambda: stuck.wait(10)  # the abort never answers
+    fake.kill = lambda: True
+    session_stop = session.stop_for_revocation
+
+    async def quick(**_):
+        return await session_stop(deadline=0.3, settle=0.3)
+
+    session.stop_for_revocation = quick
+    try:
+        hosted_authority.interrupt(bus, session)
+        for _ in range(100):
+            if bus.hosted_stopping == 0:
+                break
+            await asyncio.sleep(0.05)
+        assert session.agent_status() == "unavailable" and bus.hosted_fenced is False
+    finally:
+        stuck.set()
         await session.close()
