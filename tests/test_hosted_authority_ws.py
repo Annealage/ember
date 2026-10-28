@@ -260,3 +260,27 @@ async def test_an_interrupt_cancels_a_turn_still_waiting_for_the_lock(served_dir
         await held.close()
     finally:
         await app.agent_stop()
+
+
+async def test_another_principals_interrupt_also_cancels_a_turn_waiting_for_the_lock(
+    served_dir, tmp_path_factory
+):
+    """The submission lock is project-wide, so an interrupt on Bob's connection
+    reaches Alice's detached turn waiting on it."""
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        async with bus.turn_submission_lock:
+            alice = await _Held(app, "alice").open([HELLO, {**_turn("never"), "client_id": "c-1"}])
+            bob = await _Held(app, "bob").open([HELLO, {"type": "interrupt"}])
+        await asyncio.sleep(0.3)
+        assert not bus.hosted_turn_live and bus.hosted_turn_principal is None
+        assert _logged(app, "user_turn") == []
+        assert session.submitted_turns == []
+        await alice.close()
+        await bob.close()
+    finally:
+        await app.agent_stop()

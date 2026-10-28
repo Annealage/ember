@@ -30,10 +30,12 @@ from typing import Optional
 #: newer grant, whoever holds that.
 GENERATION = contextvars.ContextVar("hosted_grant_generation", default=None)
 
-#: ``(connection, its cancel generation)`` taken by the read loop the moment a
-#: turn frame arrives, in the context of the task that will submit it. An
-#: interrupt on the connection (or its going away) bumps the generation, so a
-#: turn still waiting for the submission lock when that happens takes no grant.
+#: ``(connection, bus, bus.hosted_cancel_generation)`` taken by the read loop the
+#: moment a turn frame arrives, in the context of the task that will submit it.
+#: An interrupt on ANY connection bumps the bus's generation (the submission
+#: lock is project-wide, so one principal's interrupt reaches every waiting
+#: turn), and a connection going away closes its own, so a turn still waiting
+#: for the lock when either happens takes no grant.
 FENCE = contextvars.ContextVar("hosted_turn_fence", default=None)
 
 
@@ -43,8 +45,8 @@ def fenced_out() -> bool:
     fence = FENCE.get()
     if fence is None:
         return False
-    conn, generation = fence
-    return bool(conn.closed or conn.cancel_generation != generation)
+    conn, bus, generation = fence
+    return bool(conn.closed or bus.hosted_cancel_generation != generation)
 
 
 def _in_flight(bus, holder) -> bool:
@@ -99,10 +101,12 @@ def checker(bus):
     generation = GENERATION.get()
 
     def check() -> Optional[str]:
-        # Under the same lock a release takes, so the two are ordered: a send
-        # whose check passed was handed off before the release, which then
-        # interrupts it; one checked after is refused. Held only for the check,
-        # never across the provider call.
+        # Under the lock admit/release/expiry take, so the check never sees a
+        # half-written grant. It orders the CHECK only, not the provider
+        # call that follows it: that is made after the lock is dropped (never
+        # held across a blocking call), so a release can still land between the
+        # check and the prompt reaching omp, and its interrupt then queues
+        # behind the prompt on the backend's single worker.
         with bus.hosted_lock:
             if (
                 generation is not None

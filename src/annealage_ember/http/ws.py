@@ -560,6 +560,7 @@ async def _serve_connection(
         bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
         if hosted and bus is not None:
             if kind == "interrupt":
+                bus.hosted_cancel_generation += 1  # before anything awaits: see FENCE
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
@@ -576,8 +577,6 @@ async def _serve_connection(
             browser_runtime_controls,
             history_session_id=history_session_id,
         )
-        if hosted and kind == "interrupt":
-            conn.cancel_generation += 1  # before anything awaits: see FENCE
         if hosted and kind == "turn":
             # Not awaited here: recording the turn and the backend's own
             # preparation (image expansion) await, and a read loop stuck in
@@ -586,7 +585,7 @@ async def _serve_connection(
             # the connection is seen at once and the grant released
             # (``hosted_authority.release``) while the send is still pending;
             # the backend's send guard then refuses it.
-            hosted_authority.FENCE.set((conn, conn.cancel_generation))
+            hosted_authority.FENCE.set((conn, bus, bus.hosted_cancel_generation))
             task = asyncio.ensure_future(dispatching)
             dispatches.add(task)
             task.add_done_callback(dispatches.discard)

@@ -129,10 +129,9 @@ async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_ad
         await session.close()
 
 
-async def test_the_send_check_and_a_release_are_ordered_by_one_lock():
-    """A check that is running cannot interleave with a release: the release
-    waits for it, so a send is either checked before it (and then interrupted
-    by it) or refused after it."""
+async def test_the_send_check_never_sees_a_half_written_grant():
+    """The check takes the lock admit/release take, so it cannot interleave
+    with them (it does not, and cannot, order the provider call after it)."""
     bus = _bus(time.time() + 60)
     hosted_authority.GENERATION.set(bus.hosted_turn_generation)
     check = hosted_authority.checker(bus)
