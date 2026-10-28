@@ -392,8 +392,9 @@ class OmpSession:
         self._resume = resume or None
         self._strict_resume = strict_resume
         self.last_request_timeout = None
-        #: ``() -> reason | None``, asked at the moment a prompt would be sent to
-        #: the provider (hosted apps set it: the turn's authority must still hold).
+        #: ``() -> check``, where ``check() -> reason | None`` is asked at the moment
+        #: a prompt would be sent to the provider, in the thread that sends it (hosted
+        #: apps set it: the turn's own authority must still hold).
         self.send_guard = None
         self._timeout_interrupt_turn = None
         self._on_session_file = on_session_file
@@ -644,13 +645,20 @@ class OmpSession:
                 self._automation_interrupted or self._closing
             ):
                 raise RuntimeError("OMP automated prompt was stopped before submission; not sent")
-            if self.send_guard is not None:
-                # The last look before the provider: the awaits above are where
-                # a hosted grant can end.
-                refusal = self.send_guard()
-                if refusal:
-                    raise RuntimeError(refusal)
-            await self._run_blocking(self._client.prompt, message, images=images)
+            check = self.send_guard() if self.send_guard is not None else None
+            if check is not None and check():
+                raise RuntimeError(check())
+
+            def send_prompt():
+                # In the thread that calls the provider, behind whatever the
+                # executor was busy with: the last look before the send.
+                if check is not None:
+                    refusal = check()
+                    if refusal:
+                        raise RuntimeError(refusal)
+                return self._client.prompt(message, images=images)
+
+            await self._run_blocking(send_prompt)
             self._emit(InputState(input_id, turn, "provider_ack"))
         except Exception as exc:
             if isinstance(exc, (TimeoutError, RpcTimeoutError)):

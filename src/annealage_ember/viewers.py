@@ -112,7 +112,7 @@ class _Connection:
     ``identity.Human`` that opened the socket, whose login is what the events
     they cause over it record."""
 
-    __slots__ = ("id", "ws", "tab_id", "human", "queue", "writer_task", "removed")
+    __slots__ = ("id", "ws", "tab_id", "human", "queue", "writer_task", "removed", "closed")
 
     def __init__(self, conn_id: int, ws, tab_id: Optional[str], human, queue_maxsize: int):
         self.id = conn_id
@@ -122,6 +122,9 @@ class _Connection:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         self.writer_task: Optional[asyncio.Task] = None
         self.removed = False
+        #: Set the moment the peer is gone, before any cleanup await: a frame still
+        #: waiting its turn for this connection must not take authority.
+        self.closed = False
 
 
 def _is_ping(frame: dict) -> bool:

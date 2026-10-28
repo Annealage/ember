@@ -23,6 +23,7 @@ def _bus(exp):
         hosted_turn_secret="s",
         hosted_turn_principal="alice",
         hosted_turn_owner="conn",
+        hosted_turn_generation=1,
         hosted_expiry_handle=None,
     )
 
@@ -40,7 +41,8 @@ async def _submit_during_slow_expansion(monkeypatch, bus, *, while_expanding):
 
     monkeypatch.setattr(omp_module.turn_images, "expand_turn_blocks", slow_expand)
     session, fake, recorder, _broker = await _started_session()
-    session.send_guard = lambda: hosted_authority.guard(bus)
+    session.send_guard = lambda: hosted_authority.checker(bus)
+    hosted_authority.GENERATION.set(bus.hosted_turn_generation)
     try:
         task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
         await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
@@ -79,3 +81,48 @@ async def test_a_grant_that_expires_during_image_expansion_is_not_sent(monkeypat
         monkeypatch, bus, while_expanding=lambda s: time.sleep(0.4)
     )
     assert fake.prompt_calls == []
+
+
+async def test_a_prompt_queued_behind_a_busy_executor_is_not_sent_after_revocation(monkeypatch):
+    bus = _bus(time.time() + 60)
+    session, fake, recorder, _broker = await _started_session()
+    session.send_guard = lambda: hosted_authority.checker(bus)
+    hosted_authority.GENERATION.set(bus.hosted_turn_generation)
+    unblock = threading.Event()
+    try:
+        session._executor.submit(unblock.wait, 5)  # the executor is saturated
+        task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
+        await asyncio.sleep(0.2)  # past the early check, queued behind the busy call
+        assert fake.prompt_calls == []
+        hosted_authority.release(bus, "conn", None)
+        unblock.set()
+        await asyncio.wait_for(task, 5)
+        await asyncio.sleep(0.05)
+        assert fake.prompt_calls == []
+    finally:
+        unblock.set()
+        await session.close()
+
+
+async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_admitted_under(
+    monkeypatch,
+):
+    bus = _bus(time.time() + 60)
+    session, fake, _recorder, _broker = await _started_session()
+    session.send_guard = lambda: hosted_authority.checker(bus)
+    hosted_authority.GENERATION.set(bus.hosted_turn_generation)
+    try:
+        hosted_authority.release(bus, "conn", None)
+        # Someone else is admitted meanwhile: a live grant, but not this turn's.
+        assert (
+            hosted_authority.admit(
+                bus, None, SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
+            )
+            is None
+        )
+        hosted_authority.GENERATION.set(1)
+        task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
+        await asyncio.wait_for(task, 5)
+        assert fake.prompt_calls == []
+    finally:
+        await session.close()

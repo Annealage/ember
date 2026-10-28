@@ -218,3 +218,25 @@ async def test_a_disconnect_is_seen_while_the_turn_is_still_being_prepared(
         slow.set()
     finally:
         await app.agent_stop()
+
+
+async def test_a_turn_waiting_for_the_lock_when_its_connection_closes_takes_no_grant(
+    served_dir, tmp_path_factory
+):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        async with bus.turn_submission_lock:
+            held = await _send(app, "bob", "never")  # its dispatch now waits on the lock
+            assert not bus.hosted_turn_live
+            await held.close()  # revoked before it ever held a grant: release has nothing to end
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.3)
+        assert not bus.hosted_turn_live and bus.hosted_turn_principal is None
+        assert _logged(app, "user_turn") == []
+        assert session.submitted_turns == []
+    finally:
+        await app.agent_stop()

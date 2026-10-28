@@ -20,9 +20,15 @@ All of it fails closed.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import secrets
 import time
 from typing import Optional
+
+#: The generation of the grant the running task was admitted under. A grant's
+#: number is its own: a send stamped with an older one is never made under a
+#: newer grant, whoever holds that.
+GENERATION = contextvars.ContextVar("hosted_grant_generation", default=None)
 
 
 def _in_flight(bus, holder) -> bool:
@@ -45,6 +51,8 @@ def admit(bus, holder, claims, *, owner=None, now: Optional[float] = None) -> Op
         return "another person's turn is in progress, so this message was not sent; wait for it to finish"
     bus.hosted_turn_principal = claims.sub
     bus.hosted_turn_owner = owner
+    bus.hosted_turn_generation += 1
+    GENERATION.set(bus.hosted_turn_generation)
     bus.hosted_turn_ops = tuple(claims.ops)
     bus.hosted_turn_exp = claims.exp
     bus.hosted_turn_secret = secrets.token_urlsafe(32)
@@ -63,16 +71,27 @@ def holds(bus, principal: Optional[str], *, now: Optional[float] = None) -> bool
     )
 
 
-def guard(bus, *, now: Optional[float] = None) -> Optional[str]:
-    """Why a prompt may not be sent to the provider now, or ``None``. Called
-    by the backend at the send itself, after every await that could have let
-    the grant end (recording, image expansion): one turn is in flight at a
-    time, so the live grant is that turn's, and none means revoked, expired or
-    never taken."""
-    now = time.time() if now is None else now
-    if bus.hosted_turn_live and now < bus.hosted_turn_exp:
-        return None
-    return "your access to this project ended before the message was sent to the agent"
+def checker(bus):
+    """A thread-safe ``() -> reason | None`` for the send of ONE turn: bound to
+    the grant generation of the task asking (``GENERATION``), and so false for
+    this turn's prompt once that grant is released, expired or replaced, even
+    if another principal holds a newer one. The backend asks it at the send
+    itself, in the thread that makes the provider call, after every await that
+    could have let the grant end (recording, image expansion, a busy executor).
+    Not set (no grant for this task) refuses."""
+    generation = GENERATION.get()
+
+    def check() -> Optional[str]:
+        if (
+            generation is not None
+            and bus.hosted_turn_generation == generation
+            and bus.hosted_turn_live
+            and time.time() < bus.hosted_turn_exp
+        ):
+            return None
+        return "your access to this project ended before the message was sent to the agent"
+
+    return check
 
 
 def arm_expiry(bus, session) -> None:
@@ -114,6 +133,7 @@ def release(bus, owner, session) -> None:
     bus.hosted_turn_ops = ()
     bus.hosted_turn_secret = None
     bus.hosted_turn_owner = None
+    bus.hosted_turn_generation += 1
     if session is not None:
         task = asyncio.get_running_loop().create_task(session.interrupt())
         task.add_done_callback(lambda t: t.cancelled() or t.exception())

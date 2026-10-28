@@ -12,6 +12,7 @@ def _bus():
         hosted_turn_exp=0,
         hosted_turn_secret=None,
         hosted_turn_principal=None,
+        hosted_turn_generation=0,
     )
 
 

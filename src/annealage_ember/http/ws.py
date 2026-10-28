@@ -262,6 +262,7 @@ def register_ws(
         finally:
             connections.dec()
             if conn is not None:
+                conn.closed = True
                 if auth.hosted_mode:
                     # Before any await: the grant must not stay live across the
                     # cleanup below, nor across a dispatch still in progress.
@@ -871,6 +872,10 @@ async def _submit_turn_locked(
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
     if bus is not None and getattr(bus, "hosted_mode", False):
+        if getattr(conn, "closed", False):
+            # This frame waited for the lock while its connection went away (the
+            # grant it would take was never released: it had none yet).
+            return
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
         refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims, owner=conn)

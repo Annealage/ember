@@ -713,6 +713,7 @@ def create_app(
     bus.hosted_turn_principal = None
     bus.hosted_expiry_handle = None
     bus.hosted_turn_owner = None
+    bus.hosted_turn_generation = 0
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
@@ -823,7 +824,7 @@ def create_app(
             )
             session = ExternalAgentSession(publish, bus.broker)
         if hosted_mode and session is not None:
-            session.send_guard = lambda: hosted_authority.guard(bus)
+            session.send_guard = lambda: hosted_authority.checker(bus)
         return session
 
     agent_lock = None
@@ -1686,12 +1687,12 @@ class AgentHolder:
         """Whether any turn is running, queued, or waiting for the agent to start."""
         return bool(self._turns or self._deferred)
 
-    def defer_turn(self, session, blocks, viewer, turn, principal=None):
+    def defer_turn(self, session, blocks, viewer, turn, principal=None, generation=None):
         """Keep an input accepted while ``session`` is still starting, and
         deliver it once it is ready. It is never refused for being early: a
         resumed conversation can take a long time to come up. A start that
         fails ends it as rejected, with the reason."""
-        self._deferred.append((session, blocks, viewer, turn, principal))
+        self._deferred.append((session, blocks, viewer, turn, principal, generation))
         self._publish(
             InputState(
                 input_id="starting-%d" % turn,
@@ -1705,7 +1706,7 @@ class AgentHolder:
 
     async def _drain_deferred(self):
         while self._deferred:
-            session, blocks, viewer, turn, principal = self._deferred[0]
+            session, blocks, viewer, turn, principal, generation = self._deferred[0]
             start = self._start_task if session is self.session else None
             if start is not None and not start.done():
                 await asyncio.wait({start})
@@ -1738,6 +1739,7 @@ class AgentHolder:
                 )
                 self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
                 continue
+            hosted_authority.GENERATION.set(generation)
             try:
                 await session.submit_turn(blocks, viewer=viewer)
             except Exception as exc:
