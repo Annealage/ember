@@ -760,6 +760,26 @@ class OmpSession:
     async def interrupt(self) -> None:
         await self._interrupt()
 
+    async def stop_for_revocation(self, deadline: float = 3.0) -> None:
+        """Stop the turn because its authority ended, and fail closed: the
+        abort is waited for at most ``deadline`` seconds, and if it has not gone
+        through by then (a write stalled on a full pipe, omp not answering) the
+        omp process is killed and the session marked unavailable, so nothing
+        the revoked grant started can go on."""
+        try:
+            await asyncio.wait_for(self._interrupt(), deadline)
+            return
+        except Exception:
+            pass
+        kill = getattr(self._client, "kill", None)
+        if kill is not None:
+            kill()
+        self._fail(
+            RuntimeError("access ended and the agent did not stop in time; it was shut down"),
+            remediation="the agent was shut down because the access it was running under ended; "
+            "start the session again",
+        )
+
     async def interrupt_for_timeout(self) -> bool:
         """Acknowledge abort or fail closed; the host must still await TurnEnd.
 

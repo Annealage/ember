@@ -3,6 +3,8 @@
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from annealage_ember import hosted_authority
 
 
@@ -96,3 +98,23 @@ def test_a_waiting_turn_is_delivered_only_under_its_own_live_unexpired_authority
     assert not hosted_authority.holds(bus, None, now=1_000)
     bus.hosted_turn_live = False
     assert not hosted_authority.holds(bus, "alice", now=1_000)
+
+
+@pytest.mark.asyncio
+async def test_release_stops_a_backend_with_the_bounded_fail_closed_stop():
+    import asyncio
+
+    calls = []
+
+    class Session:
+        async def interrupt(self):
+            calls.append("interrupt")
+
+        async def stop_for_revocation(self):
+            calls.append("stop_for_revocation")
+
+    bus = _bus()
+    hosted_authority.admit(bus, None, _claims("alice"), owner="conn")
+    hosted_authority.release(bus, "conn", Session())
+    await asyncio.sleep(0.05)
+    assert calls == ["stop_for_revocation"]

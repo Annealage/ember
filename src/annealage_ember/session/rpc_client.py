@@ -189,6 +189,17 @@ class LeanRpcClient(RpcClient):
         finally:
             local.check = previous
 
+    def kill(self) -> None:
+        """End the omp process now, from any thread and without waiting for
+        anything: unlike ``stop`` it takes no lock, so it works while a write is
+        stalled on a full pipe (which then fails) or a request waits for a reply."""
+        process = self._process
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
     def _write_json(self, process, payload):
         check = getattr(self._gate_local, "check", None)
         if check is None or payload.get("type") not in _WORK_COMMANDS:

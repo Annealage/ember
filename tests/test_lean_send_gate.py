@@ -14,12 +14,14 @@ from annealage_ember.session.rpc_client import LeanRpcClient, SendRefused
 
 class _Stdin:
     def __init__(self):
-        self.lines, self.pause = [], None
+        self.lines, self.pause, self.broken = [], None, False
         self._buf = ""
 
     def write(self, text):
         if self.pause is not None:
             self.pause.wait(5)  # a full pipe: the write blocks
+        if self.broken:
+            raise BrokenPipeError("omp was killed")
         self._buf += text
 
     def flush(self):
@@ -31,7 +33,10 @@ class _Stdin:
 def _client():
     client = LeanRpcClient(request_timeout=0.3)
     stdin = _Stdin()
-    client._process = SimpleNamespace(stdin=stdin)
+    client._process = SimpleNamespace(
+        stdin=stdin,
+        kill=lambda: (setattr(stdin, "broken", True), stdin.pause and stdin.pause.set()),
+    )
     return client, stdin
 
 
@@ -144,3 +149,29 @@ def test_a_prompt_paused_before_the_wire_is_refused_if_the_grant_ends_meanwhile(
         live[0] = False
     sender.join(3)
     assert errors and stdin.lines == []
+
+
+def test_revoked_between_the_check_and_the_write_the_stalled_write_is_killed_not_delivered():
+    """The window the gate cannot close: the check passed, the write is stuck on
+    a full pipe, the grant ends. Teardown kills omp, the write fails, and the
+    prompt never reaches it."""
+    client, stdin = _client()
+    stdin.pause = threading.Event()
+    errors = []
+
+    def prompt():
+        try:
+            with client.send_gate(lambda: None):  # the grant still held at the check
+                client.prompt("hi")
+        except Exception as exc:
+            errors.append(exc)
+
+    sender = threading.Thread(target=prompt)
+    sender.start()
+    time.sleep(0.2)  # past the check, stuck in write
+    assert sender.is_alive()
+    client.kill()  # what OmpSession.stop_for_revocation does when abort cannot go through
+    sender.join(3)
+    assert not sender.is_alive()
+    assert errors and type(errors[0]).__name__ == "RpcProcessExitError"
+    assert stdin.lines == []

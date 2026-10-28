@@ -90,6 +90,13 @@ def holds(bus, principal: Optional[str], *, now: Optional[float] = None) -> bool
     )
 
 
+def _stop(session):
+    """Stop the turn the grant belonged to: bounded and fail-closed where the
+    backend can (``stop_for_revocation``), a plain interrupt otherwise."""
+    stop = getattr(session, "stop_for_revocation", None)
+    return stop() if stop is not None else session.interrupt()
+
+
 def checker(bus):
     """A thread-safe ``() -> reason | None`` for the send of ONE turn: bound to
     the grant generation of the task asking (``GENERATION``), and so false for
@@ -137,7 +144,7 @@ def arm_expiry(bus, session) -> None:
             bus.hosted_turn_live = False
             bus.hosted_turn_ops = ()
             bus.hosted_turn_secret = None
-        task = loop.create_task(session.interrupt())
+        task = loop.create_task(_stop(session))
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     bus.hosted_expiry_handle = loop.call_later(max(0.0, bus.hosted_turn_exp - time.time()), fire)
@@ -163,5 +170,5 @@ def release(bus, owner, session) -> None:
         bus.hosted_turn_owner = None
         bus.hosted_turn_generation += 1
     if session is not None:
-        task = asyncio.get_running_loop().create_task(session.interrupt())
+        task = asyncio.get_running_loop().create_task(_stop(session))
         task.add_done_callback(lambda t: t.cancelled() or t.exception())
