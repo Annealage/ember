@@ -252,6 +252,32 @@ async def test_an_input_waiting_for_an_agent_that_never_starts_is_rejected_with_
         await app.agent_stop()
 
 
+async def test_a_hosted_input_waiting_to_start_is_not_delivered_without_live_authority(
+    served_dir,
+):
+    built = []
+    _Session.gate = asyncio.Event()
+    app = _app(served_dir, built, start_closed=True, idle_timeout=None)
+    await app.agent_start()
+    try:
+        await _send_turn(app, "carry on")
+        (session,) = built
+        # Hosted mode, and the authority it was accepted under is gone by the
+        # time the agent is up (expired, revoked, or another principal's now).
+        app.agent_bus.hosted_mode = True
+        app.agent_bus.hosted_turn_live = False
+        _Session.gate.set()
+        await _until(lambda: _logged(app, "turn_end"))
+        assert session.submitted == []
+        assert [(e["turn"], e["stop_reason"]) for e in _logged(app, "turn_end")] == [
+            (1, "rejected")
+        ]
+        rejected = [e for e in _logged(app, "input_state") if e["state"] == "rejected"]
+        assert rejected and "access ended" in rejected[0]["detail"]
+    finally:
+        await app.agent_stop()
+
+
 # -- one agent per project ---------------------------------------------------
 
 

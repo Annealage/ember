@@ -27,14 +27,13 @@ would answer questions an unauthenticated caller should not be able to ask.
 
 import asyncio
 import json
-import secrets
 import sys
 import time
 
 from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
-from .. import observability, protocol
+from .. import hosted_authority, observability, protocol
 from ..hosted_state import attribution
 from ..session.base import (
     AGENT_CONNECTING,
@@ -552,19 +551,7 @@ async def _serve_connection(
         session = holder.session
         bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
         if hosted and bus is not None:
-            if kind == "turn":
-                claims = human.hosted_claims
-                bus.hosted_turn_ops = tuple(claims.ops)
-                bus.hosted_turn_exp = claims.exp
-                bus.hosted_turn_secret = secrets.token_urlsafe(32)
-                bus.hosted_turn_live = True
-                events = getattr(bus, "session_events", None)
-                if events is not None:
-                    # The principal this session now runs for: the one a
-                    # session event nobody caused (an idle close, a backend
-                    # failure) is attributed to.
-                    events.note(human)
-            elif kind == "interrupt":
+            if kind == "interrupt":
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
@@ -845,6 +832,20 @@ async def _submit_turn_locked(
     blocks = frame["blocks"]
     client_id = frame.get("client_id")
     holder = getattr(bus, "agent_holder", None)
+    hosted_principal = None
+    if bus is not None and getattr(bus, "hosted_mode", False):
+        # Before anything is logged or handed on: whose authority the turn runs
+        # under is decided here, and a refusal changes nothing.
+        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
+        if refusal is not None:
+            await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
+            return
+        hosted_principal = bus.hosted_turn_principal
+        events = getattr(bus, "session_events", None)
+        if events is not None:
+            # The principal this session now runs for: the one a session event
+            # nobody caused (an idle close, a backend failure) is attributed to.
+            events.note(conn.human)
     defer = (
         holder is not None
         and bus is not None
@@ -891,7 +892,9 @@ async def _submit_turn_locked(
             # The agent is still starting (a closed one an interaction just
             # opened, or a resumed conversation coming up): the input is kept
             # and delivered once it is ready, never refused for being early.
-            holder.defer_turn(session, blocks_to_send, conn.tab_id, turn)
+            holder.defer_turn(
+                session, blocks_to_send, conn.tab_id, turn, principal=hosted_principal
+            )
         else:
             await session.submit_turn(blocks_to_send, viewer=conn.tab_id)
     except Exception as exc:

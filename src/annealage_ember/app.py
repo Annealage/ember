@@ -36,7 +36,17 @@ from typing import Optional
 
 from microdot import Microdot, Request
 
-from . import files, net, observability, product, protocol, remote_actions, sessions, uploads
+from . import (
+    files,
+    hosted_authority,
+    net,
+    observability,
+    product,
+    protocol,
+    remote_actions,
+    sessions,
+    uploads,
+)
 from . import settings as settings_module
 from .agent_lock import AgentAlreadyOpen, AgentLock
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
@@ -700,6 +710,7 @@ def create_app(
     bus.hosted_turn_exp = 0
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
+    bus.hosted_turn_principal = None
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
@@ -1667,12 +1678,16 @@ class AgentHolder:
         behind them, so they are delivered in the order they were sent."""
         return bool(self._deferred)
 
-    def defer_turn(self, session, blocks, viewer, turn):
+    def turn_in_flight(self):
+        """Whether any turn is running, queued, or waiting for the agent to start."""
+        return bool(self._turns or self._deferred)
+
+    def defer_turn(self, session, blocks, viewer, turn, principal=None):
         """Keep an input accepted while ``session`` is still starting, and
         deliver it once it is ready. It is never refused for being early: a
         resumed conversation can take a long time to come up. A start that
         fails ends it as rejected, with the reason."""
-        self._deferred.append((session, blocks, viewer, turn))
+        self._deferred.append((session, blocks, viewer, turn, principal))
         self._publish(
             InputState(
                 input_id="starting-%d" % turn,
@@ -1686,7 +1701,7 @@ class AgentHolder:
 
     async def _drain_deferred(self):
         while self._deferred:
-            session, blocks, viewer, turn = self._deferred[0]
+            session, blocks, viewer, turn, principal = self._deferred[0]
             start = self._start_task if session is self.session else None
             if start is not None and not start.done():
                 await asyncio.wait({start})
@@ -1700,6 +1715,21 @@ class AgentHolder:
                         turn=turn,
                         state="rejected",
                         detail="the agent did not start, so this message was not sent",
+                    )
+                )
+                self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
+                continue
+            if getattr(self.bus, "hosted_mode", False) and not hosted_authority.holds(
+                self.bus, principal
+            ):
+                # Accepted under authority that has since ended or been taken
+                # over: delivering it now would run it under no verified grant.
+                self._publish(
+                    InputState(
+                        input_id="starting-%d" % turn,
+                        turn=turn,
+                        state="rejected",
+                        detail="your access ended before the agent started, so this message was not sent",
                     )
                 )
                 self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
