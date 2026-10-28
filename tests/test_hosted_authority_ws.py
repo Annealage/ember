@@ -189,3 +189,32 @@ async def test_a_prompt_waiting_for_the_agent_to_start_is_not_dispatched_after_r
         assert [w["stop_reason"] for w in _logged(app, "turn_end")] == ["rejected"]
     finally:
         await app.agent_stop()
+
+
+async def test_a_disconnect_is_seen_while_the_turn_is_still_being_prepared(
+    served_dir, tmp_path_factory
+):
+    """Recording and image expansion await inside the turn's dispatch; the
+    grant must end when the peer goes, not when that dispatch finishes."""
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        slow = asyncio.Event()
+        reached = []
+
+        async def delayed_submit(blocks, viewer=None):
+            reached.append(blocks)
+            await slow.wait()  # the backend preparing the prompt
+
+        session.submit_turn = delayed_submit
+        held = await _send(app, "alice", "first")
+        assert reached and app.agent_bus.hosted_turn_live
+        await held.close()
+        await asyncio.sleep(0.1)
+        assert not app.agent_bus.hosted_turn_live  # ended with the dispatch still pending
+        assert not slow.is_set()
+        slow.set()
+    finally:
+        await app.agent_stop()

@@ -63,6 +63,18 @@ def holds(bus, principal: Optional[str], *, now: Optional[float] = None) -> bool
     )
 
 
+def guard(bus, *, now: Optional[float] = None) -> Optional[str]:
+    """Why a prompt may not be sent to the provider now, or ``None``. Called
+    by the backend at the send itself, after every await that could have let
+    the grant end (recording, image expansion): one turn is in flight at a
+    time, so the live grant is that turn's, and none means revoked, expired or
+    never taken."""
+    now = time.time() if now is None else now
+    if bus.hosted_turn_live and now < bus.hosted_turn_exp:
+        return None
+    return "your access to this project ended before the message was sent to the agent"
+
+
 def arm_expiry(bus, session) -> None:
     """Interrupt ``session`` when the authority just admitted expires, unless
     that grant has ended by then (a new turn has a new secret)."""

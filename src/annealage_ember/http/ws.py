@@ -262,11 +262,13 @@ def register_ws(
         finally:
             connections.dec()
             if conn is not None:
-                await registry.remove(conn)
                 if auth.hosted_mode:
+                    # Before any await: the grant must not stay live across the
+                    # cleanup below, nor across a dispatch still in progress.
                     hosted_authority.release(
                         getattr(holder, "bus", None), conn, getattr(holder, "session", None)
                     )
+                await registry.remove(conn)
         return Response.already_handled
 
 
@@ -510,6 +512,7 @@ async def _serve_connection(
     The session each frame goes to is the holder's at that moment, so a
     session resumed while this connection was open is the one it reaches.
     """
+    dispatches = set()
     while True:
         try:
             timeout = None
@@ -559,7 +562,7 @@ async def _serve_connection(
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
                 bus.hosted_turn_secret = None
-        await _dispatch(
+        dispatching = _dispatch(
             ws,
             conn,
             registry,
@@ -572,6 +575,25 @@ async def _serve_connection(
             browser_runtime_controls,
             history_session_id=history_session_id,
         )
+        if hosted and kind == "turn":
+            # Not awaited here: recording the turn and the backend's own
+            # preparation (image expansion) await, and a read loop stuck in
+            # them would not see the peer go away until they finished, leaving
+            # the grant live meanwhile. The loop keeps reading, so the end of
+            # the connection is seen at once and the grant released
+            # (``hosted_authority.release``) while the send is still pending;
+            # the backend's send guard then refuses it.
+            task = asyncio.ensure_future(dispatching)
+            dispatches.add(task)
+            task.add_done_callback(dispatches.discard)
+            task.add_done_callback(_report_dispatch_failure)
+        else:
+            await dispatching
+
+
+def _report_dispatch_failure(task):
+    if not task.cancelled() and task.exception() is not None:
+        sys.stderr.write("warning: a turn frame failed: %r\n" % (task.exception(),))
 
 
 async def _dispatch(

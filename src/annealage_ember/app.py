@@ -822,6 +822,8 @@ def create_app(
                 ),
             )
             session = ExternalAgentSession(publish, bus.broker)
+        if hosted_mode and session is not None:
+            session.send_guard = lambda: hosted_authority.guard(bus)
         return session
 
     agent_lock = None
