@@ -436,8 +436,9 @@ class _LifecycleCollector:
             "Apps' agents: open (a live session) or closed",
             labels=("state",),
         )
-        open_apps = sum(1 for h in _tracked(_holders) if h.session is not None and not h.closed)
-        total = len(_tracked(_holders))
+        holders = _tracked(_holders)
+        open_apps = sum(1 for h in holders if h.session is not None and not h.closed)
+        total = len(holders)
         apps.add_metric(("open",), open_apps)
         apps.add_metric(("closed",), total - open_apps)
         yield apps

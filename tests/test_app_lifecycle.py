@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import socket
+import weakref
 
 import pytest
 from conftest import TEST_HOST, create_toy_app, make_test_client
@@ -211,9 +212,16 @@ def _sample(name, **labels):
 
 async def test_the_lifecycle_metrics_follow_an_open_an_idle_close_a_resume_and_a_permission(
     served_dir,
+    monkeypatch,
 ):
     """The same transitions as above, seen from /metrics' owners: opens and closes by
     reason, the apps' open/closed gauge, and the broker's own pending count."""
+
+    # The process-wide gauge uses weak references. Unrelated apps from earlier
+    # tests can be collected between scrapes, so give this test its own set.
+    from annealage_ember import observability
+
+    monkeypatch.setattr(observability, "_holders", weakref.WeakSet())
 
     def snapshot():
         return {
@@ -256,6 +264,37 @@ async def test_the_lifecycle_metrics_follow_an_open_an_idle_close_a_resume_and_a
         await app.agent_registry.remove(conn)
     finally:
         await app.agent_stop()
+
+
+async def test_lifecycle_gauge_uses_one_snapshot_when_a_holder_is_collected(monkeypatch):
+    from annealage_ember import observability
+
+    class Holder:
+        session = object()
+        closed = False
+
+    held = [Holder()]
+    holders = weakref.WeakSet(held)
+    monkeypatch.setattr(observability, "_holders", holders)
+    original_tracked = observability._tracked
+
+    def tracked(group):
+        snapshot = original_tracked(group)
+        if group is holders:
+            # Drop the last external reference as the first snapshot is taken.
+            held.clear()
+        return snapshot
+
+    monkeypatch.setattr(observability, "_tracked", tracked)
+    family = next(
+        family
+        for family in observability._LifecycleCollector().collect()
+        if family.name == "annealage_agent_apps"
+    )
+    assert {sample.labels["state"]: sample.value for sample in family.samples} == {
+        "open": 1,
+        "closed": 0,
+    }
 
 
 async def test_an_app_with_nothing_to_resume_from_never_closes_for_idle(served_dir):
