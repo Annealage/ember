@@ -1186,7 +1186,12 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
 
     def publish(event):
         if bus is not None and getattr(bus, "hosted_mode", False):
-            ended = isinstance(event, (AgentError, SessionReset)) or (
+            # Only a real end of the turn ends its grant. An AgentError does not: a
+            # stream error leaves the session ready and the turn possibly still
+            # running, and clearing the grant then would leave nothing for a
+            # disconnect or the expiry to stop (the turn's own TurnEnd, or a
+            # SessionReset, clears it).
+            ended = isinstance(event, SessionReset) or (
                 isinstance(event, TurnEnd) and event.stop_reason != "steered"
             )
             if ended:
@@ -1559,9 +1564,13 @@ class AgentHolder:
         return self.session
 
     def _fenced(self):
-        """Whether this hosted worker was fenced because an old agent process may
-        still be alive (``hosted_authority``): no successor may be started."""
-        return getattr(self.bus, "hosted_fenced", False)
+        """Whether this hosted worker may not open a successor: it was fenced
+        because an old agent process may still be alive, or a stop of the old
+        one is still running (it can mark the old session unavailable before it
+        knows whether the process is gone; ``hosted_authority``)."""
+        return getattr(self.bus, "hosted_fenced", False) or bool(
+            getattr(self.bus, "hosted_stopping", 0)
+        )
 
     async def _replace_down(self):
         """Close the session that went down, as an idle close would, end the

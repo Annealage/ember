@@ -353,3 +353,76 @@ async def test_a_manual_interrupt_goes_through_the_bounded_stop_and_the_grant_en
         await held.close()
     finally:
         await app.agent_stop()
+
+
+async def test_an_agent_error_without_a_turn_end_leaves_the_grant_for_disconnect_and_expiry(
+    served_dir, tmp_path_factory
+):
+    """A stream error can leave the session ready and the turn still running:
+    the grant must survive it so a revocation or the expiry still stops the turn."""
+    from annealage_ember.session.base import AgentError
+
+    for how in ("disconnect", "expiry"):
+        verifier = _Verifier(expiry=time.time() + 1.0 if how == "expiry" else None)
+        hosted = _build(served_dir, tmp_path_factory, verifier=verifier)
+        app = hosted.app
+        await app.agent_start()
+        try:
+            (session,) = hosted.sessions
+            bus = app.agent_bus
+            held = await _send(app, "alice", "first")
+            session.emit(AgentError(stderr="stream failed", remediation="retry"))
+            assert bus.hosted_turn_live, how  # not cleared by the error
+            if how == "disconnect":
+                await held.close()
+            else:
+                await asyncio.sleep(1.4)
+            await asyncio.sleep(0.2)
+            assert session.interrupted == 1, how  # the stop lifecycle still owns the turn
+            assert not bus.hosted_turn_live
+            if how == "expiry":
+                await held.close()
+        finally:
+            await app.agent_stop()
+
+
+async def test_no_successor_while_a_stop_is_pending_even_if_the_old_session_already_looks_down(
+    served_dir, tmp_path_factory
+):
+    """The stop marks the old session unavailable before it knows whether the
+    process is gone; a concurrent ensure/launch must not replace it then."""
+    from annealage_ember.session.base import AgentStatus
+
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    gate = asyncio.Event()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+
+        async def slow_failing_stop():
+            session.set_status("unavailable")
+            session.emit(AgentStatus(status="unavailable"))  # looks down to the holder
+            await gate.wait()
+            return False  # and the kill could not be verified
+
+        session.stop_for_revocation = slow_failing_stop
+        held = await _send(app, "alice", "first")
+        await held.close()  # revocation: the stop starts and is pending
+        await asyncio.sleep(0.1)
+        assert bus.hosted_stopping == 1 and app.agent_holder._down
+        # Concurrent human interactions while the stop is pending.
+        again = await _send(app, "bob", "again")
+        res = await hosted.call("post", "/agent/session", _admin())
+        assert len(hosted.sessions) == 1 and res.status_code in (200, 503)
+        assert json.loads(res.body).get("launched") is not True  # nothing was launched
+        gate.set()
+        await asyncio.sleep(0.2)
+        assert bus.hosted_fenced is True
+        await _send(app, "bob", "and again")
+        assert len(hosted.sessions) == 1  # fenced for good
+        await again.close()
+    finally:
+        gate.set()
+        await app.agent_stop()
