@@ -503,7 +503,11 @@ def model_controls(swap_product):
         dataclasses.replace(
             TOY,
             browser_runtime_controls=False,
-            settings_keys=(*TOY.settings_keys, *shared),
+            settings_keys=(*TOY.settings_keys, *shared, settings.Key(
+                name="admin_profile", type_name="str", default="oauth",
+                layers=(settings.USER,), effect="restart", description="Profile",
+                py_type=str, section="Models", choices=("oauth", "api"),
+            )),
         )
     )
     return {
@@ -519,6 +523,13 @@ def model_controls(swap_product):
         "agents": [
             {"title": "Coordinator", "model": "model", "effort": "effort", "inherits": "high"},
         ],
+        "profile": {"key": "admin_profile", "profiles": [
+            {"id": "oauth", "title": "OAuth", "billing": "Subscription",
+             "tiers": {"high": {"model": "anthropic/opus", "effort": "high"}}},
+            {"id": "api", "title": "API", "billing": "Billed separately",
+             "tiers": {"high": {"model": "anthropic-api/opus", "effort": "low"}}},
+        ]},
+        "efforts": ["low", "high"],
     }
 
 
@@ -563,6 +574,8 @@ async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runti
     assert payload["model_controls"]["runtime"] == before_runtime
     assert payload["model_controls"]["session_id"] == "same-conversation"
     assert payload["model_controls"]["models"] == ["anthropic/opus", "openai-codex/gpt"]
+    assert payload["model_controls"]["profile"] == model_controls["profile"]
+    assert payload["model_controls"]["efforts"] == ["low", "high"]
     assert app.agent_runtime_info["resolved_runtime"] == before_runtime
     assert "backend" not in payload["settings"]
     assert settings.resolve(served_dir)["admin_high_model"] == "openai-codex/gpt"
@@ -576,6 +589,25 @@ async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runti
     assert (await _put(client, {"model": None}, token="agent-only-secret")).status_code == 403
     cleared = body_of(await _put(client, {"model": None}))
     assert "model" not in cleared["pending"]
+    profile = body_of(await _put(client, {"admin_profile": "api"}))
+    assert profile["settings"]["admin_profile"]["value"] == "oauth"
+    assert profile["pending"]["admin_profile"] == {"value": "api", "from": settings.USER}
+    assert profile["model_controls"]["runtime"] == before_runtime
+    assert settings.resolve(None)["admin_profile"] == "api"
+    assert (await _put(client, {"admin_profile": "oauth"}, token="agent-only-secret")).status_code == 403
+
+
+async def test_model_override_equal_to_startup_reports_saved_provenance(served_dir, model_controls):
+    client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    payload = body_of(await _put(client, {"admin_high_model": "anthropic/opus"}))
+    assert payload["settings"]["admin_high_model"]["from"] == settings.DEFAULT
+    assert payload["pending"]["admin_high_model"] == {
+        "value": "anthropic/opus", "from": settings.USER,
+    }
+    later = body_of(await client.get("/settings?t=%s" % TOKEN))
+    assert later["pending"]["admin_high_model"] == payload["pending"]["admin_high_model"]
 
 
 async def test_hosted_cannot_opt_into_operator_model_settings(served_dir, model_controls):

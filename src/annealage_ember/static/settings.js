@@ -128,7 +128,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
   // pending one rather than the one this run is using. Showing the running
   // value instead would mean that opening the window and pressing Save with no
   // edits silently reverted the last change.
-  const editing = pending ? pending.value : entry.value;
+  const editing = options.displayDefault ? "" : pending ? pending.value : entry.value;
 
   let input;
   const choices = choicesOf(entry);
@@ -137,7 +137,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
     for (const choice of choices) {
       const option = document.createElement("option");
       option.value = choice;
-      option.textContent = choice === "" ? (options.inherits ? "(inherit)" : "(not set)") : choice;
+      option.textContent = choice === "" ? (options.configured ? "Default (inherit)" : "(not set)") : choice;
       input.appendChild(option);
     }
     input.value = editing === null ? "" : String(editing);
@@ -151,12 +151,34 @@ function fieldRow(name, entry, pending, product, options = {}) {
     input.value = editing === null ? "" : String(editing);
   }
   if (options.models && input.tagName === "INPUT") {
-    input.setAttribute("list", "settings-model-suggestions");
-    input.placeholder = options.inherits ? "Inherit shared default" : "provider/model";
+    const select = document.createElement("select");
+    select.className = "setinput-model-choice";
+    select.id = "set-choice-" + name;
+    select.disabled = !entry.editable;
+    for (const [value, text] of [
+      ["", options.inherits ? "Default (inherit)" : "Default"],
+      ...options.models.map(value => [value, value]),
+      ["__manual__", "Enter a model ID…"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      select.appendChild(option);
+    }
+    select.value = !editing ? "" : options.models.includes(editing) ? editing : "__manual__";
+    input.hidden = select.value !== "__manual__";
+    input.placeholder = "provider/model";
     input.setAttribute("autocomplete", "off");
+    select.addEventListener("change", () => {
+      input.hidden = select.value !== "__manual__";
+      input.value = select.value === "__manual__" ? "" : select.value;
+    });
+    row.appendChild(select);
+    label.htmlFor = select.id;
   }
   input.id = "set-" + name;
   input.className = "setinput";
+  if (options.displayDefault) input.dataset.defaultBaseline = "true";
   if (options.configured) input.dataset.configured = "true";
   input.dataset.key = name;
   input.dataset.valueType = entry.type;
@@ -227,14 +249,52 @@ function modelSettingsBlock(payload) {
     + ". Child runtime is reported by each work run, not by these saved defaults.";
   block.appendChild(session);
 
-  const models = document.createElement("datalist");
-  models.id = "settings-model-suggestions";
-  for (const model of controls.models || []) {
-    const option = document.createElement("option");
-    option.value = model;
-    models.appendChild(option);
+  const profile = controls.profile;
+  const profileEntry = profile && payload.settings[profile.key];
+  const profileDetail = document.createElement("p");
+  profileDetail.className = "sethelp";
+  if (profileEntry) {
+    const row = fieldRow(profile.key, {
+      ...profileEntry, choices: profile.profiles.map(item => item.id),
+    }, payload.pending && payload.pending[profile.key], payload.product || {}, {
+      label: "Default profile", configured: true,
+      description: "Shared tier overrides must be cleared for a new profile to take effect; per-agent overrides are preserved.",
+    });
+    const select = row.querySelector("#set-" + profile.key);
+    for (const option of select.children) {
+      const item = profile.profiles.find(candidate => candidate.id === option.value);
+      if (item) option.textContent = item.title;
+    }
+    let previous = select.value;
+    select.addEventListener("change", () => {
+      if (select.value === previous) return;
+      const overrides = [];
+      for (const spec of Object.values(controls.groups)) {
+        for (const kind of ["model", "effort"]) {
+          const input = block.querySelector("#set-" + spec[kind]);
+          if (input && input.value.trim()) overrides.push({ input, title: spec.title + " " + kind });
+        }
+      }
+      if (overrides.length && !window.confirm(
+        "Switching profiles will clear these shared overrides on Save:\n\n"
+        + overrides.map(item => item.title + ": " + item.input.value).join("\n")
+        + "\n\nPer-agent overrides will not be changed. Continue?"
+      )) {
+        select.value = previous;
+        return;
+      }
+      for (const { input } of overrides) {
+        input.value = "";
+        const chooser = block.querySelector("#set-choice-" + input.dataset.key);
+        if (chooser) {
+          chooser.value = "";
+          input.hidden = true;
+        }
+      }
+      previous = select.value;
+    });
+    block.append(row, profileDetail);
   }
-  block.appendChild(models);
   const catalogNote = document.createElement("p");
   catalogNote.className = "sethelp";
   catalogNote.textContent = (controls.models || []).length
@@ -251,15 +311,19 @@ function modelSettingsBlock(payload) {
       const name = spec[kind];
       const entry = payload.settings[name];
       if (!entry) continue;
-      block.appendChild(fieldRow(name, entry, payload.pending && payload.pending[name],
-        payload.product || {}, {
+      const saved = payload.pending && payload.pending[name];
+      const choices = kind === "effort" && controls.efforts
+        ? [...new Set([...controls.efforts, saved ? saved.value : entry.value].filter(Boolean))]
+        : null;
+      block.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
+        saved, payload.product || {}, {
           label: kind === "model" ? "Provider / model" : "Reasoning effort",
-          models: kind === "model", inherits, configured: true,
+          models: kind === "model" ? (controls.models || []) : null, inherits, configured: true,
+          displayDefault: !!profileEntry && !inherits && (saved ? saved.from : entry.from) === "default",
           description: inherits
-            ? "Optional user override. Empty inherits " + kind + " from "
+            ? "Optional user override. Default inherits " + kind + " from "
               + controls.groups[inherits].title + ". Saves to your user settings, not this project."
-            : "Shared " + kind + ". Empty uses built-in "
-              + spec["default_" + kind] + ". Saves to your user settings, not this project.",
+            : "Shared override. Default uses the selected profile; built-in values without a user override also inherit the profile.",
         }));
     }
     const preview = document.createElement("p");
@@ -267,8 +331,8 @@ function modelSettingsBlock(payload) {
     block.appendChild(preview);
     previews.push({ spec, inherits, preview });
   }
-  for (const spec of Object.values(controls.groups)) {
-    pair(spec, spec.title + " shared default", null);
+  for (const [id, spec] of Object.entries(controls.groups)) {
+    pair({ ...spec, group_id: id }, spec.title + " shared default", null);
   }
   const overrides = document.createElement("h3");
   overrides.textContent = "Optional per-agent overrides";
@@ -281,15 +345,27 @@ function modelSettingsBlock(payload) {
     return input ? input.value.trim() : "";
   }
   function updatePreviews(edited = false) {
+    const selectedProfile = profileEntry && profile.profiles.find(item => item.id === value(profile.key));
+    if (profileEntry) {
+      profileDetail.textContent = selectedProfile
+        ? selectedProfile.billing + " " + Object.entries(selectedProfile.tiers)
+          .map(([tier, config]) => tier + ": " + config.model + " · effort " + config.effort).join(" · ")
+        : "No profile details available for this selection.";
+    }
+    function tierValue(id, kind) {
+      const group = controls.groups[id];
+      const name = group[kind];
+      const current = value(name);
+      return current || (selectedProfile && selectedProfile.tiers[id]
+        && selectedProfile.tiers[id][kind]) || group["default_" + kind] || "";
+    }
     for (const { spec, inherits, preview } of previews) {
       const configured = ["model", "effort"].map((kind) => {
-        const own = value(spec[kind]);
-        const group = inherits && controls.groups[inherits];
-        const effective = own || (group
-          ? value(group[kind]) || group["default_" + kind]
-          : spec["default_" + kind]) || "";
+        const own = inherits ? value(spec[kind]) : "";
+        const id = inherits || spec.group_id;
+        const effective = own || tierValue(id, kind);
         return kind + ": " + (effective || "backend default")
-          + (group && !own ? " (inherited " + group.title + ")" : "");
+          + (inherits && !own ? " (inherited " + controls.groups[inherits].title + ")" : "");
       });
       preview.textContent = (edited ? "Selected configuration (save to persist): " : "Saved configuration: ")
         + configured.join(" · ");
@@ -512,9 +588,9 @@ function collectChanges(root, payload) {
     } else {
       value = input.value;
     }
-    const saved = payload.pending && payload.pending[name]
-      ? payload.pending[name].value
-      : entry.value;
+    const saved = input.dataset.defaultBaseline === "true"
+      ? (!entry.nullable && entry.type === "str" ? "" : null)
+      : payload.pending && payload.pending[name] ? payload.pending[name].value : entry.value;
     if (value !== saved) changes[name] = value;
   }
   return changes;
@@ -625,6 +701,7 @@ export function initSettings({
         modelKeys.add(spec.model);
         modelKeys.add(spec.effort);
       }
+      if (controls.profile) modelKeys.add(controls.profile.key);
       body.appendChild(modelSettingsBlock(payload));
     }
     for (const section of payload.sections || []) {

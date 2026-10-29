@@ -106,6 +106,8 @@ def register_settings_routes(
     if controls:
         for row in (*controls["groups"].values(), *controls["agents"]):
             control_keys.update((row["model"], row["effort"]))
+        if controls.get("profile"):
+            control_keys.add(controls["profile"]["key"])
         for name in control_keys:
             key = settings_module.KEYS_BY_NAME.get(name)
             if key is None or key.effect != "restart" or name == "backend":
@@ -193,6 +195,10 @@ def register_settings_routes(
                 "runtime": runtime_info.get("resolved_runtime"),
                 "session_id": runtime_info.get("id"),
             }
+            if controls.get("profile"):
+                body["model_controls"]["profile"] = controls["profile"]
+            if controls.get("efforts") is not None:
+                body["model_controls"]["efforts"] = controls["efforts"]
 
         # What is on disk now, which after a write is not what this run started
         # with. A hand-edited file that no longer parses must not take the whole
@@ -228,7 +234,9 @@ def register_settings_routes(
             if entry["effect"] == "load":
                 entry["value"] = source[name]
                 entry["from"] = source.provenance(name)
-            elif source[name] != entry["value"]:
+            elif source[name] != entry["value"] or (
+                name in control_keys and source.provenance(name) != entry["from"]
+            ):
                 pending[name] = {"value": source[name], "from": source.provenance(name)}
         body["pending"] = pending
         return body

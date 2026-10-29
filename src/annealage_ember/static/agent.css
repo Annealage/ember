@@ -291,19 +291,19 @@ pre.toolresult.error { color: #e8a0a0; }
   gap: 4px 10px; padding: 7px 0;
 }
 .setlabel { font-size: 12px; color: #d6d8dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.setinput {
+.setinput, .setinput-model-choice {
   min-height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid #3a3f47;
   background: #23272e; color: #d6d8dc; font: inherit; font-size: 12px; min-width: 150px;
 }
 .setinput[type="checkbox"] { min-width: 0; width: 18px; height: 18px; }
-.setinput:disabled { opacity: .5; }
+.setinput:disabled, .setinput-model-choice:disabled { opacity: .5; }
 .setnote { grid-column: 1 / -1; font-size: 11px; color: #8b93a0; }
 .sethelp { grid-column: 1 / -1; font-size: 11px; color: #6f7784; }
 
 /* Provider/model references need the panel's width, not a short scalar box.
    Keep these rows stacked even on desktop and contain long IDs on phones. */
 .setmodels .setrow { grid-template-columns: minmax(0, 1fr); }
-.setmodels .setinput { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
+.setmodels .setinput, .setmodels .setinput-model-choice { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; }
 .setmodels .setnote, .setmodels .sethelp { overflow-wrap: anywhere; }
 .setmodels h4 { margin: 16px 0 4px; font-size: 12px; color: inherit; }
 

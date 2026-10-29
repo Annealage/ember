@@ -40,6 +40,9 @@ function el(tag) {
   };
 }
 globalThis.document = { createElement: el };
+let confirmed = false;
+let prompt = "";
+globalThis.window = { confirm(message) { prompt = message; return confirmed; } };
 const { modelSettingsBlock, collectChanges } = await import(
   "data:text/javascript;base64," + Buffer.from(source).toString("base64")
 );
@@ -80,7 +83,7 @@ panel.appendChild(unrelated);
 const output = {
   initial: block.textContent,
   unchanged: collectChanges(panel, payload),
-  suggestions: block.querySelector("#settings-model-suggestions").children.map(c => c.value),
+  suggestions: block.querySelector("#set-choice-author_model").children.map(c => c.value),
 };
 block.querySelector("#set-high_model").value = "anthropic/sonnet";
 block.listeners.input();
@@ -94,6 +97,84 @@ block.querySelector("#set-high_model").value = "";
 block.listeners.input();
 output.cleared = block.textContent;
 output.blankChanges = collectChanges(panel, payload);
+const profilePayload = {
+  product: {}, settings: {
+    profile: entry("oauth"),
+    high_model: { ...entry("anthropic/opus"), from: "default" },
+    high_effort: { ...entry("high"), from: "default" },
+    model: entry(null, true), effort: entry(null, true),
+    author_model: entry("custom/legacy"), author_effort: entry("max"),
+  },
+  pending: { profile: { value: "api", from: "user" } },
+  model_controls: {
+    ...payload.model_controls,
+    efforts: ["low", "medium", "high"],
+    profile: { key: "profile", profiles: [
+      { id: "oauth", title: "OAuth", billing: "Subscription", tiers: {
+        high: { model: "anthropic/opus", effort: "high" },
+      } },
+      { id: "api", title: "API", billing: "API usage billed separately", tiers: {
+        high: { model: "anthropic-api/opus", effort: "low" },
+      } },
+    ] },
+  },
+};
+const profiles = modelSettingsBlock(profilePayload);
+output.profileInitial = profiles.textContent;
+output.profileUnchanged = collectChanges(profiles, profilePayload);
+output.legacyChoice = profiles.querySelector("#set-choice-author_model").value;
+output.legacyEfforts = profiles.querySelector("#set-author_effort").children.map(c => c.value);
+profiles.querySelector("#set-profile").value = "oauth";
+profiles.listeners.change();
+output.profileChanged = collectChanges(profiles, profilePayload);
+output.profileUpdated = profiles.textContent;
+const chooser = profiles.querySelector("#set-choice-model");
+chooser.value = "openai-codex/gpt";
+chooser.listeners.change();
+profiles.listeners.change();
+output.catalogueChange = collectChanges(profiles, profilePayload);
+chooser.value = "__manual__";
+chooser.listeners.change();
+profiles.querySelector("#set-model").value = "custom/model";
+profiles.listeners.input();
+output.manualChange = collectChanges(profiles, profilePayload);
+chooser.value = "";
+chooser.listeners.change();
+profiles.listeners.change();
+output.defaultChange = collectChanges(profiles, profilePayload);
+const explicitPayload = {
+  ...profilePayload,
+  settings: { ...profilePayload.settings, high_model: entry("custom/shared"), high_effort: entry("medium") },
+};
+const explicit = modelSettingsBlock(explicitPayload);
+const profileSelect = explicit.querySelector("#set-profile");
+profileSelect.value = "oauth";
+profileSelect.listeners.change();
+output.cancelled = { value: profileSelect.value, changes: collectChanges(explicit, explicitPayload), prompt };
+confirmed = true;
+profileSelect.value = "oauth";
+profileSelect.listeners.change();
+output.confirmed = collectChanges(explicit, explicitPayload);
+output.confirmedAgent = explicit.querySelector("#set-author_model").value;
+const historical = modelSettingsBlock(profilePayload);
+const highChooser = historical.querySelector("#set-choice-high_model");
+highChooser.value = "anthropic/opus";
+highChooser.listeners.change();
+historical.listeners.change();
+output.historicalPreview = historical.textContent;
+output.historicalChange = collectChanges(historical, profilePayload);
+const sameValuePayload = {
+  ...profilePayload,
+  pending: { ...profilePayload.pending, high_model: { value: "anthropic/opus", from: "user" } },
+};
+const sameValue = modelSettingsBlock(sameValuePayload);
+output.sameValueVisible = sameValue.querySelector("#set-high_model").value;
+output.sameValueUnchanged = collectChanges(sameValue, sameValuePayload);
+const sameProfile = sameValue.querySelector("#set-profile");
+sameProfile.value = "oauth";
+sameProfile.listeners.change();
+output.sameValueCleared = collectChanges(sameValue, sameValuePayload);
+output.sameValuePrompt = prompt;
 console.log(JSON.stringify(output));
 """
 
@@ -110,7 +191,7 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert run.returncode == 0, run.stderr
     output = json.loads(run.stdout)
     assert output["unchanged"] == {}
-    assert output["suggestions"] == ["anthropic/opus", "openai-codex/gpt"]
+    assert output["suggestions"] == ["", "anthropic/opus", "openai-codex/gpt", "__manual__"]
     assert "pending restart; startup setting was" in output["initial"]
     assert "model: openai-codex/gpt (inherited High)" in output["initial"]
     assert (
@@ -124,3 +205,30 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert "model: anthropic/opus (inherited High)" in output["cleared"]
     assert output["blankChanges"] == {"high_model": ""}
     assert "actual-opus" in output["updated"]
+    assert "API usage billed separately" in output["profileInitial"]
+    assert "model: anthropic-api/opus (inherited High)" in output["profileInitial"]
+    assert "pending restart; startup setting was" in output["profileInitial"]
+    assert "actual-opus" in output["profileInitial"]
+    assert output["profileUnchanged"] == {}
+    assert output["legacyChoice"] == "__manual__"
+    assert "max" in output["legacyEfforts"]
+    assert output["profileChanged"] == {"profile": "oauth"}
+    assert "Subscription" in output["profileUpdated"]
+    assert "model: anthropic/opus (inherited High)" in output["profileUpdated"]
+    assert output["catalogueChange"] == {"profile": "oauth", "model": "openai-codex/gpt"}
+    assert output["manualChange"] == {"profile": "oauth", "model": "custom/model"}
+    assert output["defaultChange"] == {"profile": "oauth"}
+    assert output["cancelled"]["value"] == "api"
+    assert output["cancelled"]["changes"] == {}
+    assert "High model: custom/shared" in output["cancelled"]["prompt"]
+    assert "High effort: medium" in output["cancelled"]["prompt"]
+    assert output["confirmed"] == {
+        "profile": "oauth", "high_model": "", "high_effort": "",
+    }
+    assert output["confirmedAgent"] == "custom/legacy"
+    assert "model: anthropic/opus (inherited High)" in output["historicalPreview"]
+    assert output["historicalChange"] == {"high_model": "anthropic/opus"}
+    assert output["sameValueVisible"] == "anthropic/opus"
+    assert output["sameValueUnchanged"] == {}
+    assert output["sameValueCleared"] == {"profile": "oauth", "high_model": ""}
+    assert "High model: anthropic/opus" in output["sameValuePrompt"]
