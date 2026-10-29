@@ -131,7 +131,9 @@ function fieldRow(name, entry, pending, product, options = {}) {
   const editing = options.displayDefault ? "" : pending ? pending.value : entry.value;
 
   let input;
-  const choices = choicesOf(entry);
+  const choices = options.models
+    ? ["", ...new Set([...options.models, ...(editing ? [String(editing)] : [])])]
+    : choicesOf(entry);
   if (choices) {
     input = document.createElement("select");
     for (const choice of choices) {
@@ -139,6 +141,12 @@ function fieldRow(name, entry, pending, product, options = {}) {
       option.value = choice;
       option.textContent = choice === "" ? (options.configured ? "Default (inherit)" : "(not set)") : choice;
       input.appendChild(option);
+    }
+    if (options.models) {
+      const other = document.createElement("option");
+      other.value = "__other__";
+      other.textContent = "Other model…";
+      input.appendChild(other);
     }
     input.value = editing === null ? "" : String(editing);
   } else if (entry.type === "bool") {
@@ -150,32 +158,6 @@ function fieldRow(name, entry, pending, product, options = {}) {
     input.type = entry.type === "int" ? "number" : "text";
     input.value = editing === null ? "" : String(editing);
   }
-  if (options.models && input.tagName === "INPUT") {
-    const select = document.createElement("select");
-    select.className = "setinput-model-choice";
-    select.id = "set-choice-" + name;
-    select.disabled = !entry.editable;
-    for (const [value, text] of [
-      ["", options.inherits ? "Default (inherit)" : "Default"],
-      ...options.models.map(value => [value, value]),
-      ["__manual__", "Enter a model ID…"],
-    ]) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = text;
-      select.appendChild(option);
-    }
-    select.value = !editing ? "" : options.models.includes(editing) ? editing : "__manual__";
-    input.hidden = select.value !== "__manual__";
-    input.placeholder = "provider/model";
-    input.setAttribute("autocomplete", "off");
-    select.addEventListener("change", () => {
-      input.hidden = select.value !== "__manual__";
-      input.value = select.value === "__manual__" ? "" : select.value;
-    });
-    row.appendChild(select);
-    label.htmlFor = select.id;
-  }
   input.id = "set-" + name;
   input.className = "setinput";
   if (options.displayDefault) input.dataset.defaultBaseline = "true";
@@ -184,16 +166,28 @@ function fieldRow(name, entry, pending, product, options = {}) {
   input.dataset.valueType = entry.type;
   if (!entry.editable) input.disabled = true;
   row.appendChild(input);
+  if (options.models) {
+    const custom = document.createElement("input");
+    custom.id = "set-custom-" + name;
+    custom.type = "text";
+    custom.placeholder = "provider/model";
+    custom.hidden = true;
+    custom.disabled = !entry.editable;
+    input.addEventListener("change", () => {
+      custom.hidden = input.value !== "__other__";
+    });
+    row.appendChild(custom);
+  }
 
   const note = document.createElement("div");
   note.className = "setnote";
   const origin = originText(options.configured && pending ? pending.from : entry.from, product);
-  const parts = [origin];
+  const parts = options.compact ? [] : [origin];
   if (entry.in_effect === false) {
     // A value this app does not use at all (the bind of an app a front door
     // serves): saying when it would take effect would be wrong.
     parts.push("not in effect: " + entry.reason);
-  } else if (entry.effect === "restart") {
+  } else if (entry.effect === "restart" && !options.compact) {
     parts.push("takes effect next run");
   }
   if (pending) {
@@ -208,7 +202,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
 
   const help = document.createElement("div");
   help.className = "sethelp";
-  help.textContent = options.description || entry.description || "";
+  help.textContent = options.description ?? entry.description ?? "";
   row.appendChild(help);
 
   return row;
@@ -225,12 +219,8 @@ function modelSettingsBlock(payload) {
   heading.textContent = "Models and providers";
   const intro = document.createElement("p");
   intro.className = "sethelp";
-  intro.textContent = "Shared defaults apply unless an agent has an override. "
-    + "Leave either override empty to inherit its corresponding shared value. "
-    + "Use provider/model IDs; changing provider does not change the backend. "
-    + "Save changes your user settings for the next server run. Restart the server "
-    + "and resume this conversation to apply them; saving never interrupts, restarts "
-    + "or forks the conversation. Model availability depends on the operator's provider login.";
+  intro.textContent = "Saved selections apply after a server restart and conversation resume; "
+    + "they do not change the running conversation. Defaults inherit from the profile or shared tier.";
   block.append(heading, intro);
 
   const runtime = document.createElement("p");
@@ -246,19 +236,25 @@ function modelSettingsBlock(payload) {
   const session = document.createElement("p");
   session.className = "setnote";
   session.textContent = "Conversation: " + (controls.session_id || "not started")
-    + ". Child runtime is reported by each work run, not by these saved defaults.";
+    + ". Child runtime is reported by each work run.";
   block.appendChild(session);
 
   const profile = controls.profile;
   const profileEntry = profile && payload.settings[profile.key];
   const profileDetail = document.createElement("p");
   profileDetail.className = "sethelp";
+  const tierPoints = {};
+  for (const id of Object.keys(controls.groups)) {
+    const point = document.createElement("p");
+    point.className = "setnote";
+    tierPoints[id] = point;
+  }
   if (profileEntry) {
     const row = fieldRow(profile.key, {
       ...profileEntry, choices: profile.profiles.map(item => item.id),
     }, payload.pending && payload.pending[profile.key], payload.product || {}, {
-      label: "Default profile", configured: true,
-      description: "Shared tier overrides must be cleared for a new profile to take effect; per-agent overrides are preserved.",
+      label: "Default profile", configured: true, compact: true,
+      description: "Switching profiles clears shared overrides; per-agent overrides remain.",
     });
     const select = row.querySelector("#set-" + profile.key);
     for (const option of select.children) {
@@ -272,12 +268,12 @@ function modelSettingsBlock(payload) {
       for (const spec of Object.values(controls.groups)) {
         for (const kind of ["model", "effort"]) {
           const input = block.querySelector("#set-" + spec[kind]);
-          if (input && input.value.trim()) overrides.push({ input, title: spec.title + " " + kind });
+          if (input && value(spec[kind])) overrides.push({ input, title: spec.title + " " + kind, value: value(spec[kind]) });
         }
       }
       if (overrides.length && !window.confirm(
         "Switching profiles will clear these shared overrides on Save:\n\n"
-        + overrides.map(item => item.title + ": " + item.input.value).join("\n")
+        + overrides.map(item => item.title + ": " + item.value).join("\n")
         + "\n\nPer-agent overrides will not be changed. Continue?"
       )) {
         select.value = previous;
@@ -285,22 +281,21 @@ function modelSettingsBlock(payload) {
       }
       for (const { input } of overrides) {
         input.value = "";
-        const chooser = block.querySelector("#set-choice-" + input.dataset.key);
-        if (chooser) {
-          chooser.value = "";
-          input.hidden = true;
-        }
+        const custom = block.querySelector("#set-custom-" + input.dataset.key);
+        if (custom) custom.hidden = true;
       }
       previous = select.value;
     });
-    block.append(row, profileDetail);
+    block.append(row, profileDetail, ...Object.values(tierPoints));
   }
-  const catalogNote = document.createElement("p");
-  catalogNote.className = "sethelp";
-  catalogNote.textContent = (controls.models || []).length
-    ? "Model suggestions come from the running backend. You can also enter a provider/model ID."
-    : "No backend model catalog is available yet. Enter a provider/model ID directly.";
-  block.appendChild(catalogNote);
+  if (controls.models_error || !(controls.models || []).length) {
+    const unavailable = document.createElement("p");
+    unavailable.className = "setnote";
+    unavailable.textContent = controls.models_error
+      ? "Model catalogue unavailable; existing selections are preserved."
+      : "No catalogue models available; use Other model to enter an ID.";
+    block.appendChild(unavailable);
+  }
 
   const previews = [];
   function pair(spec, title, inherits) {
@@ -318,18 +313,17 @@ function modelSettingsBlock(payload) {
       block.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
         saved, payload.product || {}, {
           label: kind === "model" ? "Provider / model" : "Reasoning effort",
-          models: kind === "model" ? (controls.models || []) : null, inherits, configured: true,
+          models: kind === "model" ? (controls.models || []) : null, inherits, configured: true, compact: true,
           displayDefault: !!profileEntry && !inherits && (saved ? saved.from : entry.from) === "default",
-          description: inherits
-            ? "Optional user override. Default inherits " + kind + " from "
-              + controls.groups[inherits].title + ". Saves to your user settings, not this project."
-            : "Shared override. Default uses the selected profile; built-in values without a user override also inherit the profile.",
+          description: "",
         }));
     }
-    const preview = document.createElement("p");
-    preview.className = "setnote";
-    block.appendChild(preview);
-    previews.push({ spec, inherits, preview });
+    if (!profileEntry) {
+      const preview = document.createElement("p");
+      preview.className = "setnote";
+      block.appendChild(preview);
+      previews.push({ spec, inherits, preview });
+    }
   }
   for (const [id, spec] of Object.entries(controls.groups)) {
     pair({ ...spec, group_id: id }, spec.title + " shared default", null);
@@ -342,15 +336,21 @@ function modelSettingsBlock(payload) {
   }
   function value(name) {
     const input = block.querySelector("#set-" + name);
-    return input ? input.value.trim() : "";
+    if (!input) return "";
+    const custom = block.querySelector("#set-custom-" + name);
+    return (input.value === "__other__" && custom ? custom.value : input.value).trim();
   }
   function updatePreviews(edited = false) {
     const selectedProfile = profileEntry && profile.profiles.find(item => item.id === value(profile.key));
     if (profileEntry) {
       profileDetail.textContent = selectedProfile
-        ? selectedProfile.billing + " " + Object.entries(selectedProfile.tiers)
-          .map(([tier, config]) => tier + ": " + config.model + " · effort " + config.effort).join(" · ")
-        : "No profile details available for this selection.";
+        ? selectedProfile.billing + " · Profile tiers" : "No profile details available for this selection.";
+      for (const [id, point] of Object.entries(tierPoints)) {
+        const config = selectedProfile && selectedProfile.tiers[id];
+        point.textContent = config
+          ? (controls.groups[id].title || id) + ": " + config.model + " · " + config.effort
+          : "";
+      }
     }
     function tierValue(id, kind) {
       const group = controls.groups[id];
@@ -574,19 +574,21 @@ function collectChanges(root, payload) {
     const name = input.dataset.key;
     const entry = payload.settings[name];
     if (!entry || input.disabled) continue;
+    const custom = root.querySelector("#set-custom-" + name);
+    const selected = input.value === "__other__" && custom ? custom.value : input.value;
     let value;
     if (input.type === "checkbox") {
       value = input.checked;
-    } else if (input.value === "") {
+    } else if (selected === "") {
       value = !entry.nullable && entry.type === "str" ? "" : null;
     } else if (entry.type === "int") {
-      const parsed = Number(input.value);
+      const parsed = Number(selected);
       if (!Number.isInteger(parsed)) {
         throw new Error(name + " must be a whole number");
       }
       value = parsed;
     } else {
-      value = input.value;
+      value = selected;
     }
     const saved = input.dataset.defaultBaseline === "true"
       ? (!entry.nullable && entry.type === "str" ? "" : null)

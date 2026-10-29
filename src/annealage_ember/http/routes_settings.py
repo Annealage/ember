@@ -188,10 +188,14 @@ def register_settings_routes(
         }
         if controls:
             runtime_info = getattr(app, "agent_runtime_info", {})
+            catalogue = controls.get("model_catalog")
+            models = await loop.run_in_executor(None, catalogue) if catalogue else None
             body["model_controls"] = {
                 "groups": controls["groups"],
                 "agents": controls["agents"],
-                "models": list(runtime_info.get("models") or []),
+                "models": list(models if models is not None else runtime_info.get("models") or [])
+                if not catalogue or models is not None else [],
+                "models_error": bool(catalogue and models is None),
                 "runtime": runtime_info.get("resolved_runtime"),
                 "session_id": runtime_info.get("id"),
             }

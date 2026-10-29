@@ -597,6 +597,24 @@ async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runti
     assert (await _put(client, {"admin_profile": "oauth"}, token="agent-only-secret")).status_code == 403
 
 
+@pytest.mark.parametrize(("catalogue", "expected", "error"), [
+    (lambda: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"],
+     ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"], False),
+    (list, [], False),
+    (lambda: None, [], True),
+])
+async def test_model_catalogue_is_available_without_a_session(
+    served_dir, model_controls, catalogue, expected, error
+):
+    model_controls["model_catalog"] = catalogue
+    app = create_toy_app(served_dir, token=TOKEN, settings_model_controls=model_controls)
+    app.agent_runtime_info["models"] = ["stale/model"]
+    client = make_test_client(app)
+    payload = body_of(await client.get("/settings?t=%s" % TOKEN))
+    assert payload["model_controls"]["models"] == expected
+    assert payload["model_controls"]["models_error"] is error
+
+
 async def test_model_override_equal_to_startup_reports_saved_provenance(served_dir, model_controls):
     client = make_test_client(create_toy_app(
         served_dir, token=TOKEN, settings_model_controls=model_controls,

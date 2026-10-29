@@ -83,7 +83,7 @@ panel.appendChild(unrelated);
 const output = {
   initial: block.textContent,
   unchanged: collectChanges(panel, payload),
-  suggestions: block.querySelector("#set-choice-author_model").children.map(c => c.value),
+  suggestions: block.querySelector("#set-author_model").children.map(c => c.value),
 };
 block.querySelector("#set-high_model").value = "anthropic/sonnet";
 block.listeners.input();
@@ -102,44 +102,65 @@ const profilePayload = {
     profile: entry("oauth"),
     high_model: { ...entry("anthropic/opus"), from: "default" },
     high_effort: { ...entry("high"), from: "default" },
+    low_model: { ...entry("anthropic/sonnet"), from: "default" },
+    low_effort: { ...entry("medium"), from: "default" },
     model: entry(null, true), effort: entry(null, true),
     author_model: entry("custom/legacy"), author_effort: entry("max"),
   },
   pending: { profile: { value: "api", from: "user" } },
   model_controls: {
     ...payload.model_controls,
+    groups: {
+      ...payload.model_controls.groups,
+      low: { title: "Low", model: "low_model", effort: "low_effort",
+        default_model: "anthropic/sonnet", default_effort: "medium" },
+    },
     efforts: ["low", "medium", "high"],
     profile: { key: "profile", profiles: [
       { id: "oauth", title: "OAuth", billing: "Subscription", tiers: {
         high: { model: "anthropic/opus", effort: "high" },
+        low: { model: "anthropic/sonnet", effort: "medium" },
       } },
       { id: "api", title: "API", billing: "API usage billed separately", tiers: {
         high: { model: "anthropic-api/opus", effort: "low" },
+        low: { model: "anthropic-api/sonnet", effort: "medium" },
       } },
     ] },
   },
 };
 const profiles = modelSettingsBlock(profilePayload);
 output.profileInitial = profiles.textContent;
+output.tierRows = profiles.querySelectorAll(".setnote").map(c => c.textContent);
 output.profileUnchanged = collectChanges(profiles, profilePayload);
-output.legacyChoice = profiles.querySelector("#set-choice-author_model").value;
+output.legacyChoice = profiles.querySelector("#set-author_model").value;
+output.legacyOptions = profiles.querySelector("#set-author_model").children.map(c => c.value);
 output.legacyEfforts = profiles.querySelector("#set-author_effort").children.map(c => c.value);
+const unavailable = modelSettingsBlock({
+  ...profilePayload,
+  model_controls: { ...profilePayload.model_controls, models: [], models_error: true },
+});
+output.unavailable = unavailable.textContent;
+output.unavailableChoice = unavailable.querySelector("#set-author_model").value;
+output.unavailableUnchanged = collectChanges(unavailable, profilePayload);
+const emptyCatalog = modelSettingsBlock({
+  ...profilePayload,
+  model_controls: { ...profilePayload.model_controls, models: [] },
+});
+output.emptyCatalog = emptyCatalog.textContent;
 profiles.querySelector("#set-profile").value = "oauth";
 profiles.listeners.change();
 output.profileChanged = collectChanges(profiles, profilePayload);
 output.profileUpdated = profiles.textContent;
-const chooser = profiles.querySelector("#set-choice-model");
+const chooser = profiles.querySelector("#set-model");
 chooser.value = "openai-codex/gpt";
-chooser.listeners.change();
 profiles.listeners.change();
 output.catalogueChange = collectChanges(profiles, profilePayload);
-chooser.value = "__manual__";
+chooser.value = "__other__";
 chooser.listeners.change();
-profiles.querySelector("#set-model").value = "custom/model";
+profiles.querySelector("#set-custom-model").value = "custom/new";
 profiles.listeners.input();
 output.manualChange = collectChanges(profiles, profilePayload);
 chooser.value = "";
-chooser.listeners.change();
 profiles.listeners.change();
 output.defaultChange = collectChanges(profiles, profilePayload);
 const explicitPayload = {
@@ -157,9 +178,8 @@ profileSelect.listeners.change();
 output.confirmed = collectChanges(explicit, explicitPayload);
 output.confirmedAgent = explicit.querySelector("#set-author_model").value;
 const historical = modelSettingsBlock(profilePayload);
-const highChooser = historical.querySelector("#set-choice-high_model");
+const highChooser = historical.querySelector("#set-high_model");
 highChooser.value = "anthropic/opus";
-highChooser.listeners.change();
 historical.listeners.change();
 output.historicalPreview = historical.textContent;
 output.historicalChange = collectChanges(historical, profilePayload);
@@ -191,7 +211,7 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert run.returncode == 0, run.stderr
     output = json.loads(run.stdout)
     assert output["unchanged"] == {}
-    assert output["suggestions"] == ["", "anthropic/opus", "openai-codex/gpt", "__manual__"]
+    assert output["suggestions"] == ["", "anthropic/opus", "openai-codex/gpt", "__other__"]
     assert "pending restart; startup setting was" in output["initial"]
     assert "model: openai-codex/gpt (inherited High)" in output["initial"]
     assert (
@@ -206,17 +226,26 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["blankChanges"] == {"high_model": ""}
     assert "actual-opus" in output["updated"]
     assert "API usage billed separately" in output["profileInitial"]
-    assert "model: anthropic-api/opus (inherited High)" in output["profileInitial"]
+    assert "High: anthropic-api/opus · low" in output["profileInitial"]
+    assert "Low: anthropic-api/sonnet · medium" in output["profileInitial"]
+    assert "High: anthropic-api/opus · low" in output["tierRows"]
+    assert "Low: anthropic-api/sonnet · medium" in output["tierRows"]
     assert "pending restart; startup setting was" in output["profileInitial"]
     assert "actual-opus" in output["profileInitial"]
     assert output["profileUnchanged"] == {}
-    assert output["legacyChoice"] == "__manual__"
+    assert output["legacyChoice"] == "custom/legacy"
+    assert "custom/legacy" in output["legacyOptions"]
+    assert "Model catalogue unavailable" in output["unavailable"]
+    assert output["unavailableChoice"] == "custom/legacy"
+    assert output["unavailableUnchanged"] == {}
     assert "max" in output["legacyEfforts"]
     assert output["profileChanged"] == {"profile": "oauth"}
+    assert "No catalogue models available" in output["emptyCatalog"]
     assert "Subscription" in output["profileUpdated"]
-    assert "model: anthropic/opus (inherited High)" in output["profileUpdated"]
+    assert "High: anthropic/opus · high" in output["profileUpdated"]
+    assert "Low: anthropic/sonnet · medium" in output["profileUpdated"]
     assert output["catalogueChange"] == {"profile": "oauth", "model": "openai-codex/gpt"}
-    assert output["manualChange"] == {"profile": "oauth", "model": "custom/model"}
+    assert output["manualChange"] == {"profile": "oauth", "model": "custom/new"}
     assert output["defaultChange"] == {"profile": "oauth"}
     assert output["cancelled"]["value"] == "api"
     assert output["cancelled"]["changes"] == {}
@@ -226,7 +255,7 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
         "profile": "oauth", "high_model": "", "high_effort": "",
     }
     assert output["confirmedAgent"] == "custom/legacy"
-    assert "model: anthropic/opus (inherited High)" in output["historicalPreview"]
+    assert "High: anthropic-api/opus · low" in output["historicalPreview"]
     assert output["historicalChange"] == {"high_model": "anthropic/opus"}
     assert output["sameValueVisible"] == "anthropic/opus"
     assert output["sameValueUnchanged"] == {}
