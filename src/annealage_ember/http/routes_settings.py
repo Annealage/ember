@@ -41,6 +41,7 @@ they cannot drift.
 import asyncio
 import functools
 import sys
+import weakref
 
 from .. import diagnostics, product
 from .. import settings as settings_module
@@ -54,6 +55,28 @@ BIND_KEYS = ("host", "port")
 # Hosted projects can tune project preferences; binding, model/provider selection
 # and credentials stay in trusted service configuration.
 HOSTED_FROZEN_KEYS = frozenset(("backend", "model", "omp_base_url", "omp_api_key", "datum_url"))
+
+# Mounted projects share the user file. Serialize read/merge/replace and its
+# notification across all apps on the serving loop.
+_SAVE_LOCKS = weakref.WeakKeyDictionary()
+_SAVE_TASKS = set()
+
+
+def _save_finished(task):
+    _SAVE_TASKS.discard(task)
+    if not task.cancelled():
+        # Retrieve exceptions even if the disconnected request no longer waits.
+        exc = task.exception()
+        if exc is not None:
+            sys.stderr.write("error: settings save failed: %r\n" % exc)
+
+
+def _save_lock():
+    loop = asyncio.get_running_loop()
+    lock = _SAVE_LOCKS.get(loop)
+    if lock is None:
+        lock = _SAVE_LOCKS[loop] = asyncio.Lock()
+    return lock
 
 
 def _hosted_frozen(name):
@@ -95,8 +118,11 @@ def register_settings_routes(
 
     Hosted mode filters service-controlled settings and writes only to the
     supplied per-project cache directory. ``model_controls`` is an explicit
-    product opt-in to restart-only administrator model settings, independent
-    of the WebSocket's live runtime controls. It cannot opt into hosted mode.
+    product opt-in to administrator model settings, independent of the
+    WebSocket's live runtime controls. It cannot opt into hosted mode.
+    Its optional async ``on_save(changes)`` runs after a successful save of
+    control keys; ``status()`` reports current application state. Their JSON
+    results are returned as ``model_apply``, distinct from persistence.
     """
     state_dir = state_dir or serve_dir
     if settings is None:
@@ -203,6 +229,12 @@ def register_settings_routes(
                 body["model_controls"]["profile"] = controls["profile"]
             if controls.get("efforts") is not None:
                 body["model_controls"]["efforts"] = controls["efforts"]
+            status = controls.get("status")
+            if status:
+                try:
+                    body["model_apply"] = await status()
+                except Exception as exc:
+                    body["model_apply"] = {"status": "error", "error": str(exc)}
 
         # What is on disk now, which after a write is not what this run started
         # with. A hand-edited file that no longer parses must not take the whole
@@ -305,27 +337,49 @@ def register_settings_routes(
                 "error": "%s cannot be set here: %s" % (" and ".join(refused), MOUNTED_BIND_REASON),
             }, 400
 
-        loop = asyncio.get_running_loop()
-        try:
-            _resolved, written = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    settings_module.apply,
-                    state_dir,
-                    changes,
-                    flags=settings.flags,
-                    layer="project" if hosted_mode else None,
-                    layer_overrides=dict.fromkeys(control_keys, settings_module.USER),
-                ),
-            )
-        except settings_module.SettingsError as exc:
-            # Every refusal this route makes past the body's shape comes from
-            # here, in one message written for whoever is reading the window.
-            return {"ok": False, "error": str(exc)}, 400
-        except OSError as exc:
-            sys.stderr.write("error: could not write settings: %s\n" % exc)
-            return {"ok": False, "error": "could not write the settings file: %s" % exc}, 500
+        async def persist_and_notify():
+            loop = asyncio.get_running_loop()
+            apply_result = None
+            # This task owns the lock through the executor write and callback,
+            # even if the requesting client disconnects while either runs.
+            async with _save_lock():
+                try:
+                    _resolved, written = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            settings_module.apply,
+                            state_dir,
+                            changes,
+                            flags=settings.flags,
+                            layer="project" if hosted_mode else None,
+                            layer_overrides=dict.fromkeys(control_keys, settings_module.USER),
+                        ),
+                    )
+                except settings_module.SettingsError as exc:
+                    return None, None, ({"ok": False, "error": str(exc)}, 400)
+                except OSError as exc:
+                    sys.stderr.write("error: could not write settings: %s\n" % exc)
+                    return None, None, (
+                        {"ok": False, "error": "could not write the settings file: %s" % exc},
+                        500,
+                    )
+                callback = controls.get("on_save") if controls else None
+                if callback and control_keys.intersection(changes):
+                    try:
+                        apply_result = await callback(dict(changes))
+                    except Exception as exc:
+                        apply_result = {"status": "error", "error": str(exc)}
+            return written, apply_result, None
+
+        task = asyncio.create_task(persist_and_notify())
+        _SAVE_TASKS.add(task)
+        task.add_done_callback(_save_finished)
+        written, apply_result, error = await asyncio.shield(task)
+        if error is not None:
+            return error
 
         body = await _payload()
         body["written"] = written
+        if apply_result is not None:
+            body["model_apply"] = apply_result
         return body, 200

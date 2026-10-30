@@ -195,6 +195,10 @@ sameProfile.value = "oauth";
 sameProfile.listeners.change();
 output.sameValueCleared = collectChanges(sameValue, sameValuePayload);
 output.sameValuePrompt = prompt;
+output.livePending = modelSettingsBlock({ ...payload, model_apply: {status: "pending"} }).textContent;
+output.liveError = modelSettingsBlock({ ...payload, model_apply: {status: "error", error: "refused"} }).textContent;
+output.liveApplied = modelSettingsBlock({ ...payload, model_apply: {status: "applied"} }).textContent;
+output.restartRequired = modelSettingsBlock({ ...payload, model_apply: {status: "restart_required"} }).textContent;
 console.log(JSON.stringify(output));
 """
 
@@ -213,6 +217,11 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["unchanged"] == {}
     assert output["suggestions"] == ["", "anthropic/opus", "openai-codex/gpt", "__other__"]
     assert "pending restart; startup setting was" in output["initial"]
+    assert "waiting for current turns" in output["livePending"]
+    assert "pending restart" not in output["livePending"]
+    assert "Saved, but applying failed: refused" in output["liveError"]
+    assert "Saved model settings applied." in output["liveApplied"]
+    assert "require a restart" in output["restartRequired"]
     assert "model: openai-codex/gpt (inherited High)" in output["initial"]
     assert (
         "Actual coordinator runtime (backend-reported): omp · anthropic · actual-opus · effort low"

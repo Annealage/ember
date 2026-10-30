@@ -190,9 +190,8 @@ function fieldRow(name, entry, pending, product, options = {}) {
   } else if (entry.effect === "restart" && !options.compact) {
     parts.push("takes effect next run");
   }
-  if (pending) {
-    // The field above holds the saved value, so what the note has to supply is
-    // the other half: what the running server is still using.
+  if (pending && !options.live) {
+    // The field holds the saved value; explain the startup value beside it.
     parts.push(options.configured
       ? "pending restart; startup setting was " + JSON.stringify(entry.value)
       : "saved; this run is still using " + JSON.stringify(entry.value));
@@ -209,8 +208,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
 }
 
 // A product declares its tier/role keys; the UI does not know product names.
-// These controls save configuration only. Backend-reported runtime is kept
-// separate, since a resumed conversation can have a different actual model.
+// Saved configuration and backend-reported runtime are distinct.
 function modelSettingsBlock(payload) {
   const controls = payload.model_controls;
   const block = document.createElement("section");
@@ -219,9 +217,27 @@ function modelSettingsBlock(payload) {
   heading.textContent = "Models and providers";
   const intro = document.createElement("p");
   intro.className = "sethelp";
-  intro.textContent = "Saved selections apply after a server restart and conversation resume; "
-    + "they do not change the running conversation. Defaults inherit from the profile or shared tier.";
+  const live = !!payload.model_apply && payload.model_apply.status !== "restart_required";
+  intro.textContent = live
+    ? "Saved selections apply between turns. Defaults inherit from the profile or shared tier."
+    : "Saved selections apply after a server restart and conversation resume; "
+      + "they do not change the running conversation. Defaults inherit from the profile or shared tier.";
   block.append(heading, intro);
+  if (payload.model_apply) {
+    const application = document.createElement("p");
+    application.className = "setnote";
+    const result = payload.model_apply;
+    application.textContent = result.status === "pending"
+      ? "Saved; waiting for current turns to finish before applying."
+      : result.status === "error"
+        ? "Saved, but applying failed: " + (result.error || "see application status")
+        : result.status === "applied"
+          ? "Saved model settings applied."
+          : result.status === "restart_required"
+            ? "Saved model settings require a restart."
+            : "Model application status: " + result.status;
+    block.appendChild(application);
+  }
 
   const runtime = document.createElement("p");
   runtime.className = "setnote";
@@ -253,7 +269,7 @@ function modelSettingsBlock(payload) {
     const row = fieldRow(profile.key, {
       ...profileEntry, choices: profile.profiles.map(item => item.id),
     }, payload.pending && payload.pending[profile.key], payload.product || {}, {
-      label: "Default profile", configured: true, compact: true,
+      label: "Default profile", configured: true, compact: true, live,
       description: "Switching profiles clears shared overrides; per-agent overrides remain.",
     });
     const select = row.querySelector("#set-" + profile.key);
@@ -313,7 +329,7 @@ function modelSettingsBlock(payload) {
       block.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
         saved, payload.product || {}, {
           label: kind === "model" ? "Provider / model" : "Reasoning effort",
-          models: kind === "model" ? (controls.models || []) : null, inherits, configured: true, compact: true,
+          models: kind === "model" ? (controls.models || []) : null, inherits, configured: true, compact: true, live,
           displayDefault: !!profileEntry && !inherits && (saved ? saved.from : entry.from) === "default",
           description: "",
         }));
@@ -761,11 +777,19 @@ export function initSettings({
         applyToPage(saved, onLoad);
         close();
         const names = Object.keys(changes);
-        const restart = names.filter(
-          (name) => saved.settings[name] && saved.settings[name].effect === "restart");
-        toast(restart.length
-          ? "Saved. " + restart.join(", ") + " takes effect next run."
-          : "Saved.");
+        const result = saved.model_apply;
+        const restart = names.filter((name) =>
+          saved.settings[name] && saved.settings[name].effect === "restart"
+          && !(result && result.status !== "restart_required" && modelKeys.has(name)));
+        if (result && result.status === "error") {
+          toast("Saved, but applying model settings failed: " + (result.error || "see settings"));
+        } else if (result && result.status === "pending") {
+          toast("Saved. Model settings will apply after current turns finish.");
+        } else {
+          toast(restart.length
+            ? "Saved. " + restart.join(", ") + " takes effect next run."
+            : "Saved.");
+        }
       } catch (err) {
         status.textContent = err.message;
         save.disabled = false;

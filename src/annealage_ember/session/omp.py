@@ -438,6 +438,10 @@ class OmpSession:
         # Retain ownership through the terminal event's asynchronous usage read:
         # a later input must not start until that turn's counters are settled.
         self._running = False
+        # A live profile is a barrier between turns, including queued inputs.
+        self._profile_pending = None
+        self._profile_task = None
+        self._profile_status = None
         self._settling_turn: Optional[int] = None
         self._input_queue = deque()
         self._automation_completion = None
@@ -549,6 +553,8 @@ class OmpSession:
 
     def turn_refusal(self) -> Optional[str]:
         """Report local admission limits before the caller consumes turn notes."""
+        if self._profile_status and self._profile_status["status"] == "error":
+            return "model profile could not be applied; restart the session"
         if (self._running or self._input_queue) and len(self._input_queue) >= 8:
             return "input queue is full; wait for a queued turn to finish"
         return None
@@ -580,6 +586,8 @@ class OmpSession:
             or self._closing
             or self._running
             or self._input_queue
+            or self._profile_pending is not None
+            or self._profile_task is not None
             or self._automation_attempt_id is not None
         ):
             raise RuntimeError("OMP session is not idle for automated work")
@@ -629,7 +637,7 @@ class OmpSession:
         turn = self._next_input_turn
         self._emit(InputState(input_id, turn, "received"))
         job = (input_id, turn, blocks, viewer)
-        if self._running or self._input_queue:
+        if self._running or self._input_queue or self._profile_pending is not None or self._profile_task is not None:
             if len(self._input_queue) >= 8:
                 self._emit(InputState(input_id, turn, "rejected", "input queue is full"))
                 self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
@@ -723,7 +731,12 @@ class OmpSession:
         )
 
     async def _send_next_queued(self) -> None:
-        if self._running or not self._input_queue or self._status != AGENT_READY:
+        if self._running or self._status != AGENT_READY:
+            return
+        if self._profile_pending is not None or self._profile_task is not None:
+            self._start_profile_apply()
+            return
+        if not self._input_queue:
             return
         await self._send_input(self._input_queue.popleft())
 
@@ -897,6 +910,91 @@ class OmpSession:
             sys.stderr.write("warning: interrupt failed: %r\n" % (exc,))
             return False
         return True
+
+    @property
+    def model_profile_status(self):
+        """Latest live-profile outcome, or None if this interface was not used."""
+        return dict(self._profile_status) if self._profile_status is not None else None
+
+    def queue_model_profile(self, model: str, effort: str) -> dict:
+        """Install a turn-admission barrier immediately, without yielding.
+
+        The latest request supersedes pending requests. Pass unresolved values
+        to fence the session at the boundary if host resolution failed.
+        """
+        # Validate at the boundary too: even an invalid saved selection must
+        # fence subsequent turns, without disrupting an active one.
+        if self._closing or self._status == AGENT_UNAVAILABLE:
+            if not self._profile_status or self._profile_status["status"] != "error":
+                self._profile_status = {"status": "error", "error": "session is unavailable"}
+            return self.model_profile_status
+        self._profile_pending = (model, effort)
+        self._profile_status = {"status": "pending"}
+        self._start_profile_apply()
+        return self.model_profile_status
+
+    async def apply_model_profile(self, model: str, effort: str) -> dict:
+        """Queue a profile and, if idle, wait for its verified application."""
+        result = self.queue_model_profile(model, effort)
+        if result["status"] == "error":
+            return result
+        task = self._profile_task
+        if task is not None and not self._running:
+            await asyncio.shield(task)
+        return self.model_profile_status
+
+    def _start_profile_apply(self) -> None:
+        if (self._profile_pending is None or self._profile_task is not None
+                or self._running or self._closing or self._status != AGENT_READY):
+            return
+        self._profile_task = asyncio.create_task(self._apply_pending_profile())
+
+    async def _apply_pending_profile(self) -> None:
+        try:
+            while self._profile_pending is not None and not self._closing:
+                model, effort = self._profile_pending
+                self._profile_pending = None
+                try:
+                    if (not isinstance(model, str) or not model.strip()
+                            or not isinstance(effort, str) or not effort.strip()):
+                        raise ValueError("model and effort must be concrete non-empty strings")
+                    if not self._base_url and ("/" not in model or not all(model.split("/", 1))):
+                        raise ValueError("model must be a provider/model reference")
+                    provider, model_id = ((_provider_id(), model) if self._base_url
+                                          else model.split("/", 1))
+                    await self._run_blocking(self._client.set_model, provider, model_id)
+                    await self._run_blocking(self._client.set_thinking_level, effort)
+                    state = await self._run_blocking(self._client.get_state)
+                    actual = getattr(state, "model", None)
+                    if (getattr(actual, "provider", None), getattr(actual, "id", None),
+                            getattr(state, "thinking_level", None)) != (provider, model_id, effort):
+                        raise RuntimeError("OMP did not confirm the requested model and effort")
+                    if self._closing or self._status != AGENT_READY:
+                        raise RuntimeError("session closed while applying the model profile")
+                    self._model, self._model_role, self._thinking = model, None, effort
+                    if self.resolved_runtime:
+                        self.resolved_runtime = {
+                            key: value for key, value in self.resolved_runtime.items()
+                            if key not in ("requested_role", "resolved_role", "role_provenance")
+                        }
+                    self._record_resolved_runtime(AgentRuntimeResolved(
+                        backend="omp", provider=provider, model=model_id,
+                        effort=effort, provenance="get_state",
+                    ))
+                    self._emit(AgentModelChanged(model=model))
+                except Exception as exc:
+                    self._profile_pending = None
+                    self._profile_status = {"status": "error", "error": str(exc) or type(exc).__name__}
+                    self._fail(exc, remediation="model settings could not be confirmed; reopen the session")
+                    return
+                if self._profile_pending is None:
+                    self._profile_status = {"status": "applied"}
+        finally:
+            self._profile_task = None
+            if self._closing and self._profile_status and self._profile_status["status"] == "pending":
+                self._profile_status = {"status": "error", "error": "session closed before profile applied"}
+            if not self._closing:
+                await self._send_next_queued()
 
     async def set_model(self, model: str) -> None:
         """Switch `omp`'s live session model via the RPC `set_model` command.
@@ -1148,6 +1246,7 @@ class OmpSession:
         if self._usage is not None and any(self._usage.values()):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
+        self._start_profile_apply()
         # After READY, and not waited for: the list only feeds suggestions,
         # so a slow listing holds up neither the start nor what is sent once
         # the session is ready.
@@ -1256,6 +1355,9 @@ class OmpSession:
 
     async def close(self) -> None:
         self._closing = True
+        if self._profile_status and self._profile_status["status"] == "pending":
+            self._profile_status = {"status": "error", "error": "session closed before profile applied"}
+            self._profile_pending = None
         if self._models_task is not None:
             self._models_task.cancel()
         if self._watch_task is not None:
@@ -1850,6 +1952,9 @@ class OmpSession:
         Never raises. Identical in intent to ``SdkSession._fail``/
         ``CodexSession._fail``; ``remediation``, when given, replaces the
         one ``_remediation_for`` guesses from the exception's class."""
+        if self._profile_status and self._profile_status["status"] == "pending":
+            self._profile_pending = None
+            self._profile_status = {"status": "error", "error": str(exc) or type(exc).__name__}
         self._set_status(AGENT_UNAVAILABLE)
         if self._active_input_id is not None:
             self._emit(InputState(self._active_input_id, self._turn, "uncertain", str(exc)))

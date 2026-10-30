@@ -327,6 +327,35 @@ async def test_a_resumed_session_comes_back_on_the_model_the_human_switched_to(s
         await app.agent_stop()
 
 
+async def test_policy_managed_reopen_does_not_restore_old_browser_model(served_dir):
+    built = []
+    policy = {"model": "provider/A", "effort": "low"}
+
+    def resume(on_event, *, bus):
+        session = _factory(built, resumed=True)(on_event, bus=bus)
+        session.policy = dict(policy)
+        return session
+
+    app = _app(
+        served_dir, built, resume_session=resume,
+        settings_model_controls={
+            "groups": {}, "agents": [], "restore_model_on_resume": False,
+        },
+    )
+    await app.agent_start()
+    try:
+        await built[0].set_model("provider/B")
+        await _until(lambda: app.agent_status()["agent"] == agent_app.AGENT_CLOSED)
+        policy.update(model="provider/C", effort="high")
+        await app.agent_holder.ensure(retry=True)
+        await _until(lambda: len(built) == 2 and built[1].started == 1)
+        assert built[1].policy == {"model": "provider/C", "effort": "high"}
+        assert built[1].models == []
+        assert app.agent_runtime_info["model"] is None
+    finally:
+        await app.agent_stop()
+
+
 @pytest.mark.parametrize("resume", [True, False])
 async def test_an_interaction_after_the_agent_went_down_starts_it_again(served_dir, resume):
     """A start that failed (a model login gone, say) is tried again by the

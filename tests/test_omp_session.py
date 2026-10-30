@@ -1292,6 +1292,89 @@ def _text(text):
 
 
 @pytest.mark.asyncio
+async def test_live_profile_waits_for_terminal_and_supersedes_before_queued_turn():
+    session, fake, recorder, _ = await _started_session(base_url=None)
+    try:
+        await session.submit_turn(_text("first"))
+        assert session.queue_model_profile("old/model", "low") == {"status": "pending"}
+        assert session.queue_model_profile("new/model/variant", "high") == {"status": "pending"}
+        await session.submit_turn(_text("second"))
+        with pytest.raises(RuntimeError, match="not idle"):
+            await session.submit_automated_turn(_text("auto"), attempt_id="a", on_admitted=lambda: None)
+        assert fake.set_model_calls == []
+        assert [call.message for call in fake.prompt_calls] == ["first"]
+        fake.push_agent_end(is_terminal=False)
+        await asyncio.sleep(0)
+        assert fake.set_model_calls == []
+        fake.push_agent_end()
+        await _next_input_state(recorder, 2, "provider_ack")
+        assert fake.set_model_calls == [("new", "model/variant")]
+        assert fake.set_thinking_level_calls == ["high"]
+        assert session.model_profile_status == {"status": "applied"}
+        assert session.resolved_runtime["provider"] == "new"
+        assert session.resolved_runtime["model"] == "model/variant"
+        assert session.resolved_runtime["effort"] == "high"
+        assert any(isinstance(e, AgentRuntimeResolved) and e.effort == "high" for e in recorder.all)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_live_profile_partial_failure_fences_queued_and_future_turns():
+    class BadEffort(FakeRpcClient):
+        def set_thinking_level(self, level):
+            raise RuntimeError("effort refused")
+
+    session, fake, recorder, _ = await _started_session(base_url=None, client_class=BadEffort)
+    try:
+        await session.submit_turn(_text("first"))
+        assert (await session.apply_model_profile("provider/new", "high"))["status"] == "pending"
+        await session.submit_turn(_text("second"))
+        fake.push_agent_end()
+        await _next_input_state(recorder, 2, "rejected")
+        assert fake.set_model_calls == [("provider", "new")]
+        assert session.model_profile_status == {"status": "error", "error": "effort refused"}
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        await session.submit_turn(_text("third"))
+        assert [call.message for call in fake.prompt_calls] == ["first"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_live_profile_requires_backend_confirmation_and_fences_invalid_profile():
+    class WrongState(FakeRpcClient):
+        def set_thinking_level(self, level):
+            self.set_thinking_level_calls.append(level)
+
+    session, _, _, _ = await _started_session(base_url=None, client_class=WrongState)
+    try:
+        result = await session.apply_model_profile("provider/model", "high")
+        assert result["status"] == "error"
+        assert "confirm" in result["error"]
+        assert session.agent_status() == AGENT_UNAVAILABLE
+    finally:
+        await session.close()
+
+    session, fake, _, _ = await _started_session(base_url=None)
+    try:
+        await session.submit_turn(_text("first"))
+        assert session.queue_model_profile(None, None)["status"] == "pending"
+        assert session.agent_status() == AGENT_READY
+        await session.submit_turn(_text("second"))
+        fake.push_agent_end()
+        for _ in range(100):
+            if session.agent_status() == AGENT_UNAVAILABLE:
+                break
+            await asyncio.sleep(0.01)
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        assert fake.set_model_calls == []
+        assert [call.message for call in fake.prompt_calls] == ["first"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_inflight_messages_queue_until_terminal_and_keep_their_turn_identity():
     session, fake, recorder, broker = await _started_session()
     try:
@@ -2770,6 +2853,31 @@ async def test_resume_operator_selection_wins_on_the_same_native_conversation(tm
         assert (fake.session_id, fake.session_file) == ("omp-resumed", str(conversation))
         assert fake.switch_calls == [str(conversation)]
         assert conversation.read_text() == "existing history\n"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_profile_queued_while_connecting_applies_after_resume_before_prompt(tmp_path):
+    conversation = tmp_path / "saved.jsonl"
+    conversation.touch()
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder, cwd="/proj/root", session_id="resume-profile",
+        client_factory=ResumingModelClient, resume=str(conversation),
+        strict_resume=True, model="openai-codex/gpt-6.1-sol", thinking="low",
+    )
+    try:
+        assert session.queue_model_profile("anthropic/new", "high") == {"status": "pending"}
+        await session.start()
+        fake = session._client
+        await session.submit_turn(_text("resume"))
+        await _next_input_state(recorder, 1, "provider_ack")
+        assert fake.switch_calls == [str(conversation)]
+        assert fake.prompt_runtimes == [
+            ("omp-resumed", str(conversation), "anthropic", "new", "high")
+        ]
+        assert session.model_profile_status == {"status": "applied"}
     finally:
         await session.close()
 

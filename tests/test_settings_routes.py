@@ -14,8 +14,10 @@ appears under ``pending``, because a settings window that could not confirm
 its own write would be useless. Both are asserted below against a real write.
 """
 
+import asyncio
 import dataclasses
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -595,6 +597,124 @@ async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runti
     assert profile["model_controls"]["runtime"] == before_runtime
     assert settings.resolve(None)["admin_profile"] == "api"
     assert (await _put(client, {"admin_profile": "oauth"}, token="agent-only-secret")).status_code == 403
+
+
+async def test_live_model_callback_runs_only_after_authorized_persistence(served_dir, model_controls):
+    calls = []
+    state = {"status": "pending"}
+
+    async def on_save(changes):
+        calls.append((changes, settings.resolve(None)["admin_high_model"]))
+        return dict(state)
+
+    async def status():
+        return dict(state)
+
+    model_controls.update(on_save=on_save, status=status)
+    client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    assert (await _put(client, {"admin_high_model": "bad/model"}, token="wrong")).status_code == 403
+    assert (await _put(client, {"admin_high_effort": 42})).status_code == 400
+    assert calls == []
+    response = body_of(await _put(client, {"admin_high_model": "new/model"}))
+    assert response["model_apply"] == {"status": "pending"}
+    assert calls == [({"admin_high_model": "new/model"}, "new/model")]
+    state["status"] = "applied"
+    assert body_of(await client.get("/settings?t=%s" % TOKEN))["model_apply"] == state
+    await _put(client, {"tool_cards_collapsed": True})
+    assert len(calls) == 1
+
+
+async def test_live_model_callback_failure_reports_saved_not_applied(served_dir, model_controls):
+    async def on_save(changes):
+        raise RuntimeError("coordinator unavailable")
+
+    model_controls["on_save"] = on_save
+    client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    response = await _put(client, {"admin_high_model": "new/model"})
+    assert response.status_code == 200
+    assert body_of(response)["model_apply"] == {
+        "status": "error", "error": "coordinator unavailable",
+    }
+    assert settings.resolve(None)["admin_high_model"] == "new/model"
+
+
+async def test_model_writes_are_serialized_through_notification(served_dir, model_controls):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen = []
+
+    async def on_save(changes):
+        seen.append(settings.resolve(None)["admin_high_model"])
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()
+        return {"status": "applied"}
+
+    model_controls["on_save"] = on_save
+    client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    other_client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    first = asyncio.create_task(_put(client, {"admin_high_model": "first/model"}))
+    await asyncio.wait_for(entered.wait(), 2)
+    second = asyncio.create_task(_put(other_client, {"admin_high_model": "second/model"}))
+    await asyncio.sleep(0)
+    assert settings.resolve(None)["admin_high_model"] == "first/model"
+    release.set()
+    await asyncio.gather(first, second)
+    assert seen == ["first/model", "second/model"]
+    assert settings.resolve(None)["admin_high_model"] == "second/model"
+
+
+async def test_cancelled_request_keeps_write_and_notification_serialized(
+    served_dir, model_controls, monkeypatch,
+):
+    loop = asyncio.get_running_loop()
+    writing = asyncio.Event()
+    release = threading.Event()
+    observed = []
+    original_apply = settings.apply
+
+    def blocked_apply(*args, **kwargs):
+        if args[1].get("admin_high_model") == "first/model":
+            loop.call_soon_threadsafe(writing.set)
+            if not release.wait(5):
+                raise RuntimeError("test did not release the writer")
+        return original_apply(*args, **kwargs)
+
+    async def on_save(changes):
+        observed.append(settings.resolve(None)["admin_high_model"])
+        return {"status": "applied"}
+
+    monkeypatch.setattr(settings, "apply", blocked_apply)
+    model_controls["on_save"] = on_save
+    first_client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    second_client = make_test_client(create_toy_app(
+        served_dir, token=TOKEN, settings_model_controls=model_controls,
+    ))
+    first = asyncio.create_task(_put(first_client, {"admin_high_model": "first/model"}))
+    try:
+        await asyncio.wait_for(writing.wait(), 2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = asyncio.create_task(_put(second_client, {"admin_high_model": "second/model"}))
+        await asyncio.sleep(0)
+        assert observed == []
+        release.set()
+        await asyncio.wait_for(second, 2)
+        assert observed == ["first/model", "second/model"]
+        assert settings.resolve(None)["admin_high_model"] == "second/model"
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize(("catalogue", "expected", "error"), [

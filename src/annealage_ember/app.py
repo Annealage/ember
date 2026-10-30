@@ -339,11 +339,27 @@ def create_app(
     available in standalone mode.
 
     ``settings_model_controls`` declares grouped model/effort defaults and
-    optional per-agent overrides for the settings window. Unlike the chat
-    picker these are saved restart-only configuration, authenticated as the
-    human, and never enabled in hosted mode. It may explicitly expose model
-    and effort even when the product disables live browser runtime controls;
-    it never exposes backend switching.
+    optional per-agent overrides for the settings window. These authenticated
+    administrator settings are never enabled in hosted mode and cannot expose
+    backend switching. By default they take effect on restart. A product may
+    opt into live application with async ``on_save(changes)`` and ``status()``
+    callbacks. The first is called only after a control-key save succeeds;
+    its JSON result is returned in ``model_apply`` on PUT. The second supplies
+    that field on GET, including later pending, applied, error, or
+    restart_required outcomes. Persistence remains successful if application
+    fails. The host must resolve precedence, synchronize across all projects,
+    preserve queued child snapshots, and fence sessions if resolution fails.
+    For OMP, ``queue_model_profile(model, effort)`` installs an immediate
+    admission barrier without awaiting, coalesces pending requests, applies
+    at the terminal turn boundary, and verifies both fields against OMP.
+    ``model_profile_status`` reports the outcome; passing unresolved values
+    fences the session at that boundary. ``apply_model_profile`` is the async
+    convenience that additionally waits for an idle session's application.
+    The host must supply concrete provider/model and effort strings and arrange
+    fresh selections on session creation and resume.
+    Products whose session factory resolves live policy on every reopen must
+    set ``restore_model_on_resume`` to False in these controls; otherwise the
+    holder restores the browser's previous model over the factory selection.
 
     ``session_id`` is the id the CLI resolved for this run (fresh or resumed,
     per plan section 3.4), or None for viewer-only; it is reported in the
@@ -849,6 +865,10 @@ def create_app(
         resume_session=resume_session,
         idle_timeout=idle_timeout,
         agent_lock=agent_lock,
+        restore_model_on_resume=(
+            settings_model_controls.get("restore_model_on_resume", True)
+            if settings_model_controls and not hosted_mode else True
+        ),
     )
     holder.redeliveries = redeliveries
     app.agent_holder = holder
@@ -1423,6 +1443,7 @@ class AgentHolder:
         resume_session=None,
         idle_timeout=None,
         agent_lock=None,
+        restore_model_on_resume=True,
     ):
         self._app = app
         self.bus = bus
@@ -1469,6 +1490,7 @@ class AgentHolder:
         # The model every session this app builds starts on (the run's
         # settings); session_info["model"] follows live switches.
         self._startup_model = session_info.get("model")
+        self._restore_model_on_resume = restore_model_on_resume
         # Held across every change of session (idle close, resume, stop), so
         # a page arriving while one closes waits for it and then resumes.
         self._lock = asyncio.Lock()
@@ -1594,9 +1616,9 @@ class AgentHolder:
         self._resume()
 
     def _resume(self):
-        # The model the human last switched to, which the new session does not
-        # start on: every factory builds from the run's settings.
-        wanted = self._session_info.get("model")
+        # Only browser-controlled sessions replay a human's old model.
+        # Policy-managed factories select the current model themselves.
+        wanted = self._session_info.get("model") if self._restore_model_on_resume else None
         if self._fenced():
             # Every path that opens a successor (ensure, launch, a replaced
             # down session) ends here: none may while the old process could live.
@@ -1616,7 +1638,9 @@ class AgentHolder:
         if session is not None:
             # What the new session runs until the switch is made again: the
             # hello says so, and the switch's own event puts it back.
-            self._session_info["model"] = self._startup_model
+            self._session_info["model"] = (
+                self._startup_model if self._restore_model_on_resume else None
+            )
             if self._viewers:
                 # A turn frame resuming on a connection already open: the new
                 # session's broker has to know a page is there to answer it.
