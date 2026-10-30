@@ -394,6 +394,14 @@ await front.serve(on_ready=on_ready)
 - **`app.agent_status()`** is `{"agent": "connecting" | "ready" | "unavailable" | "closed", "turn_running", "waiting", "attention", "last_activity", "viewers", "pid"}`: `waiting` is a permission request open or an `attention` raised since the human's last turn (`attention` is its `title: body`), `last_activity` epoch seconds, `pid` the live agent child's process id (`None` while closed or when the backend has none). It is read from the live session and process, not from the last status that was logged. Each of `app.agent_status_listeners` is called with no arguments whenever it changes.
 - **The product's page** under a prefix loads the agent modules through the relative import map entry `"agent/": "./agent/static/"` and its own files relative to itself too (a `<base>` is refused by the policy's `base-uri 'none'`), and names its own routes through `appUrl` (below).
 
+## Idle compaction (omp)
+
+An omp session compacts itself when its context holds 100,000 tokens or more and it has been idle for 20 minutes since a turn ended (`IDLE_COMPACT_TOKENS` and `IDLE_COMPACT_AFTER` in `session/omp.py`). The aim is a smaller prompt for the next turn, instead of a cold read of a large one after the provider's prompt cache has lapsed.
+
+omp has this feature itself (`compaction.idle*`), but its timer belongs to the interactive UI and is never armed under RPC. `OmpSession` therefore keeps the clock and sends omp's `compact` command, so nothing in omp's `config.yml` is needed or read. It is always on; `OmpSession(idle_compact_tokens=, idle_compact_after=)` only move the thresholds. Only a turn that ended in the running process arms it, as a resumed conversation's cache has already lapsed.
+
+A message sent during the compaction is queued like any other (`InputState` `queued`) and goes out when it ends. `Usage.context` then reports the new fill. A hosted session's `send_guard` is asked before the compaction and again at the write, as for a prompt. omp refuses conversations under about 20k tokens as too small; that is logged and the session stays ready. The design is in the module docstring of `session/omp.py`.
+
 ## The backend's own logs
 
 Every product gets all of this from `create_app`, with nothing to wire:

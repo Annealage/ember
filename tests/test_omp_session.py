@@ -103,6 +103,11 @@ class FakeRpcClient:
         self.context_usage = None
         self.model = None
         self.thinking_level = None
+        # compact(): what it does while omp "summarises" (called on the compaction pool's
+        # thread), the error it raises, and how often it was asked.
+        self.compact_calls = 0
+        self.compact_hook = None
+        self.compact_error = None
 
     def start(self):
         self.started = True
@@ -119,6 +124,15 @@ class FakeRpcClient:
             model=self.model,
             thinking_level=self.thinking_level,
         )
+
+    def compact(self, custom_instructions=None):
+        self.compact_calls += 1
+        if self.compact_hook is not None:
+            self.compact_hook()
+        if self.compact_error is not None:
+            raise self.compact_error
+        self.context_usage = SimpleNamespace(tokens=3000, context_window=200000, percent=1.5)
+        return SimpleNamespace(tokens_before=150000)
 
     def get_session_stats(self):
         return SimpleNamespace(cost=self.cost, tokens=SimpleNamespace(**self.tokens))
@@ -3089,3 +3103,138 @@ async def test_a_session_is_counted_ready_until_it_closes_and_a_close_counts_a_s
     await session.close()
     assert sample("annealage_omp_session_state", state="ready") == ready
     assert sample("annealage_omp_session_stops_total") == stops + 1
+
+
+# -- idle compaction ------------------------------------------------------------------
+
+
+def _big_context(fake, tokens=150000):
+    fake.context_usage = SimpleNamespace(tokens=tokens, context_window=200000, percent=75.0)
+
+
+async def _finish_turn(session, fake, recorder, text="work"):
+    await session.submit_turn(_text(text))
+    fake.push_agent_end()
+    await _next_of(recorder, TurnEnd)
+
+
+async def _until(predicate, timeout=2.0):
+    end = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < end, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_large_context_left_idle_is_compacted_and_the_new_fill_is_reported():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.05
+    )
+    try:
+        _big_context(fake)
+        await _finish_turn(session, fake, recorder)
+        await _until(lambda: fake.compact_calls == 1)
+        while True:
+            usage = await _next_of(recorder, Usage)
+            if usage.context == {"used_tokens": 3000, "window_tokens": 200000}:
+                break
+        await asyncio.sleep(0.15)
+        assert fake.compact_calls == 1  # once per idle period, not on a loop
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_small_context_is_never_compacted():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.05
+    )
+    try:
+        _big_context(fake, tokens=99999)
+        await _finish_turn(session, fake, recorder)
+        await asyncio.sleep(0.25)
+        assert fake.compact_calls == 0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_before_the_idle_time_is_up_postpones_the_compaction_to_its_own_end():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.2
+    )
+    try:
+        _big_context(fake)
+        await _finish_turn(session, fake, recorder, "one")
+        await asyncio.sleep(0.1)
+        await session.submit_turn(_text("two"))  # running past the first deadline
+        await asyncio.sleep(0.3)
+        assert fake.compact_calls == 0
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+        await _until(lambda: fake.compact_calls == 1)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_message_during_the_compaction_waits_for_it_and_is_then_sent():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.05
+    )
+    release = threading.Event()
+    fake.compact_hook = lambda: release.wait(5)
+    try:
+        _big_context(fake)
+        await _finish_turn(session, fake, recorder)
+        await _until(lambda: fake.compact_calls == 1)
+        before = len(fake.prompt_calls)
+        await session.submit_turn(_text("back again"))
+        await asyncio.sleep(0.1)
+        assert len(fake.prompt_calls) == before  # held, not handed to omp mid-compaction
+        release.set()
+        await _until(lambda: len(fake.prompt_calls) == before + 1)
+        assert fake.prompt_calls[-1].message == "back again"
+    finally:
+        release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_compaction_omp_refuses_leaves_the_session_ready_and_the_next_turn_working():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.05
+    )
+    fake.compact_error = RpcCommandError("Nothing to compact")
+    try:
+        _big_context(fake)
+        await _finish_turn(session, fake, recorder)
+        await _until(lambda: fake.compact_calls == 1)
+        await _until(lambda: session._compact_task is None)
+        assert session.agent_status() == AGENT_READY
+        await session.submit_turn(_text("still works"))
+        await _until(lambda: fake.prompt_calls[-1].message == "still works")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_during_a_compaction_does_not_wait_for_it():
+    session, fake, recorder, _ = await _started_session(
+        idle_compact_tokens=100000, idle_compact_after=0.05
+    )
+    release = threading.Event()
+    fake.compact_hook = lambda: release.wait(5)
+    try:
+        _big_context(fake)
+        await _finish_turn(session, fake, recorder)
+        await _until(lambda: fake.compact_calls == 1)
+        await asyncio.wait_for(session.close(), 1.0)
+        assert fake.stopped and session._compact_task is None
+    finally:
+        release.set()
+
+
+def test_idle_compaction_thresholds_must_be_positive():
+    with pytest.raises(ValueError):
+        OmpSession(lambda event: None, cwd="/p", session_id="s", idle_compact_after=0)

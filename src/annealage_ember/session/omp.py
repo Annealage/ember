@@ -58,6 +58,28 @@ tool call the way it would if execution ran inline. The one request kept off
 (``_emit_available_models``): the suggestions it fetches are worth no wait,
 so an omp slow to answer it must not queue a prompt or an abort behind it.
 
+**Idle compaction.** omp compacts an idle conversation itself (``compaction.idleEnabled``,
+``idleThresholdTokens``, ``idleTimeoutSeconds``), but its timer lives in the interactive
+mode's event controller and is never armed under RPC, so a session driven from here would
+never run it whatever ``config.yml`` says. ``OmpSession`` keeps the clock instead and sends
+omp's own ``compact`` command. ``_emit_turn_end`` arms a ``call_later`` timer
+(``IDLE_COMPACT_AFTER``, 20 minutes) when the last reported context fill is at least
+``IDLE_COMPACT_TOKENS`` (100,000); ``_send_input`` and ``close`` cancel it. When it fires
+``_idle_compaction_due`` checks that nothing else is going on and creates ``_compact_task``
+in the same step. That task is a barrier to input in the same way ``_profile_task`` is:
+``submit_turn`` queues behind it, ``_send_next_queued`` and ``_start_profile_apply`` stand
+off, ``submit_automated_turn`` waits for it, and it drains the queue when it ends. The
+barrier matters because omp parks a prompt sent mid-compaction and would not acknowledge it
+inside the 30 second request timeout. The task re-reads ``get_state`` before compacting, as
+the turn's figure may be stale or omp may be running work of its own. ``compact`` runs on its
+own pool (``_compact_executor``), so a summary taking minutes cannot hold up ``close``'s
+stop, and with a 600 second wait taken per thread through
+``LeanRpcClient.extended_timeout``. ``compact`` is in the lean client's send-gate commands, so
+a hosted session's revocation check applies at the write as it does for a prompt. A refusal
+from omp ("Nothing to compact (session too small)", under about 20k tokens) is logged and
+leaves the session ready, and the clock only restarts at the next turn end. Only a turn that
+ended in this process arms it: a resumed conversation's cache has already lapsed.
+
 **Permission design -- two independent, broker-backed gates, not one.** The
 ticket's approach sketch flags ``extension_ui_request{method:"confirm"}`` as
 the write-class approval surface; reading the actual bundled
@@ -190,6 +212,7 @@ not fighting it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -275,6 +298,18 @@ _MODEL_LIST_TIMEOUT = 10.0
 # How often a ready session looks at whether its `omp` child is still there.
 _CHILD_POLL_INTERVAL = 1.0
 
+#: Idle compaction: a session whose context holds at least this many tokens, left alone for
+#: ``IDLE_COMPACT_AFTER`` seconds after a turn ends, is compacted so the next turn does not
+#: pay a cold read of a large prompt once the provider's prompt cache has lapsed. omp has the
+#: same feature (``compaction.idle*``) but arms it from its interactive UI's timer only, so an
+#: RPC-driven omp never runs it; this session drives omp's ``compact`` command itself.
+IDLE_COMPACT_TOKENS = 100_000
+IDLE_COMPACT_AFTER = 20 * 60.0
+
+# How long the ``compact`` request is waited for: it summarises the whole conversation, which
+# outlasts ``RpcClient``'s 30-second default for ordinary requests.
+_COMPACT_REQUEST_TIMEOUT = 600.0
+
 
 class OmpSession:
     """An ``AgentSession`` driving a real ``omp_rpc.RpcClient``.
@@ -322,6 +357,13 @@ class OmpSession:
     sets it, from a short allowlist of network-read tools. Such a tool runs
     inside omp: the ``host_tool_call`` broker gate, grading and permission cards
     never see it, and omp runs with ``--auto-approve``.
+
+    ``idle_compact_tokens`` and ``idle_compact_after`` are the context size (tokens) and the
+    idle time (seconds since a turn ended) past which the session compacts itself
+    (``IDLE_COMPACT_TOKENS``, ``IDLE_COMPACT_AFTER``); always on, the parameters only
+    move the thresholds. While it runs, a message is held like any other queued input and sent
+    when the compaction ends. Only a turn that ended in this process arms it: a resumed
+    conversation's cache is already cold.
     """
 
     #: No positive steering capability is negotiated by the observed RPC API.
@@ -358,6 +400,8 @@ class OmpSession:
         builtin_tools: Sequence[str] = (),
         provider_session_id: Optional[str] = None,
         cache_retention: Optional[str] = None,
+        idle_compact_tokens: int = IDLE_COMPACT_TOKENS,
+        idle_compact_after: float = IDLE_COMPACT_AFTER,
     ):
         # omp's own tools to leave enabled (``--tools``); none by default, which
         # is ``--no-tools``. They run inside omp, outside the broker.
@@ -488,6 +532,17 @@ class OmpSession:
         self._abort_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-abort")
         self._models_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-models")
         self._models_task: Optional[asyncio.Future] = None
+        if not idle_compact_tokens > 0 or not idle_compact_after > 0:
+            raise ValueError("idle compaction thresholds must be positive")
+        self._idle_compact_tokens = idle_compact_tokens
+        self._idle_compact_after = idle_compact_after
+        # The context fill the last turn's usage reported (None: unknown), the idle clock, and
+        # the compaction task, which is a barrier to input exactly as ``_profile_task`` is.
+        self._context_tokens: Optional[int] = None
+        self._idle_compact_handle: Optional[asyncio.TimerHandle] = None
+        self._compact_task: Optional[asyncio.Future] = None
+        # Its own pool: a minutes-long ``compact`` on ``_executor`` would hold up ``close``'s stop.
+        self._compact_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-compact")
 
     # -- AgentSession surface -------------------------------------------------
 
@@ -580,6 +635,8 @@ class OmpSession:
             raise ValueError("attempt_id must be a non-empty string")
         if not callable(on_admitted):
             raise ValueError("on_admitted must be callable")
+        if self._compact_task is not None:
+            await asyncio.shield(self._compact_task)
         if (
             self._client is None
             or self._status != AGENT_READY
@@ -637,7 +694,13 @@ class OmpSession:
         turn = self._next_input_turn
         self._emit(InputState(input_id, turn, "received"))
         job = (input_id, turn, blocks, viewer)
-        if self._running or self._input_queue or self._profile_pending is not None or self._profile_task is not None:
+        if (
+            self._running
+            or self._input_queue
+            or self._profile_pending is not None
+            or self._profile_task is not None
+            or self._compact_task is not None
+        ):
             if len(self._input_queue) >= 8:
                 self._emit(InputState(input_id, turn, "rejected", "input queue is full"))
                 self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
@@ -652,6 +715,7 @@ class OmpSession:
         self._turn = turn
         self._turn_started = time.monotonic()
         self._active_input_id = input_id
+        self._cancel_idle_compaction()
         self._running = True
         stage = "pre"
         try:
@@ -731,7 +795,7 @@ class OmpSession:
         )
 
     async def _send_next_queued(self) -> None:
-        if self._running or self._status != AGENT_READY:
+        if self._running or self._status != AGENT_READY or self._compact_task is not None:
             return
         if self._profile_pending is not None or self._profile_task is not None:
             self._start_profile_apply()
@@ -945,7 +1009,8 @@ class OmpSession:
 
     def _start_profile_apply(self) -> None:
         if (self._profile_pending is None or self._profile_task is not None
-                or self._running or self._closing or self._status != AGENT_READY):
+                or self._running or self._closing or self._status != AGENT_READY
+                or self._compact_task is not None):
             return
         self._profile_task = asyncio.create_task(self._apply_pending_profile())
 
@@ -1355,6 +1420,9 @@ class OmpSession:
 
     async def close(self) -> None:
         self._closing = True
+        self._cancel_idle_compaction()
+        if self._compact_task is not None:
+            self._compact_task.cancel()
         if self._profile_status and self._profile_status["status"] == "pending":
             self._profile_status = {"status": "error", "error": "session closed before profile applied"}
             self._profile_pending = None
@@ -1379,6 +1447,7 @@ class OmpSession:
         # Not waited for: a listing omp never answered holds its thread until
         # the stop above fails it, and nothing needs that answer now.
         self._models_executor.shutdown(wait=False)
+        self._compact_executor.shutdown(wait=False)
         self._abort_executor.shutdown(wait=False)
         self._discard_agent_dir()
         self._set_status(AGENT_UNAVAILABLE)
@@ -1766,6 +1835,7 @@ class OmpSession:
             )
         )
         await self._emit_usage(usage)
+        self._arm_idle_compaction()
         await self._send_next_queued()
 
     async def _read_usage(self) -> Optional[dict]:
@@ -1799,6 +1869,7 @@ class OmpSession:
             figures = getattr(state, "context_usage", None)
             if figures is not None:
                 context = context_figures(figures.tokens, figures.context_window)
+            self._context_tokens = context["used_tokens"] if context is not None else None
         except Exception as exc:
             sys.stderr.write("warning: could not read the omp context usage: %r\n" % (exc,))
         if usage is None and context is None:
@@ -1882,6 +1953,97 @@ class OmpSession:
             self._client.send_ui_confirmation(request_id, confirmed)
         except Exception as exc:
             sys.stderr.write("warning: could not answer a confirm UI request: %r\n" % (exc,))
+
+    # -- idle compaction ------------------------------------------------------------
+
+    def _cancel_idle_compaction(self) -> None:
+        handle, self._idle_compact_handle = self._idle_compact_handle, None
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_idle_compaction(self) -> None:
+        """Start the idle clock at a turn's end (the one place a turn's cache is last touched), when
+        the context is large enough to be worth compacting. Any later turn cancels it."""
+        self._cancel_idle_compaction()
+        if (
+            self._closing
+            or self._loop is None
+            or self._status != AGENT_READY
+            or self._context_tokens is None
+            or self._context_tokens < self._idle_compact_tokens
+        ):
+            return
+        self._idle_compact_handle = self._loop.call_later(
+            self._idle_compact_after, self._idle_compaction_due
+        )
+
+    def _idle_compaction_due(self) -> None:
+        """The idle clock ran out. Compacts only a session with nothing else going on; the task is
+        made here, not later, so a message arriving from now on queues behind it."""
+        self._idle_compact_handle = None
+        if (
+            self._closing
+            or self._client is None
+            or self._status != AGENT_READY
+            or self._running
+            or self._input_queue
+            or self._profile_pending is not None
+            or self._profile_task is not None
+            or self._compact_task is not None
+            or self._automation_attempt_id is not None
+            or (self._broker is not None and self._broker.pending_requests())
+        ):
+            return
+        self._compact_task = asyncio.ensure_future(self._run_idle_compaction())
+
+    async def _run_idle_compaction(self) -> None:
+        try:
+            # Asked again, not trusted from the last turn: omp may have pruned the context, or be
+            # running work of its own (a background job waking the agent).
+            state = await self._run_blocking(self._client.get_state)
+            tokens = getattr(getattr(state, "context_usage", None), "tokens", None)
+            if (
+                getattr(state, "is_streaming", False)
+                or getattr(state, "is_compacting", False)
+                or not isinstance(tokens, int)
+                or tokens < self._idle_compact_tokens
+            ):
+                return
+            check = self.send_guard() if self.send_guard is not None else None
+            if check is not None and check():
+                return
+            await asyncio.get_running_loop().run_in_executor(
+                self._compact_executor, self._compact_call, check
+            )
+            await self._emit_usage(await self._read_usage())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._closing:
+                return
+            if _process_gone(exc):
+                self._fail(exc)
+            else:
+                # Nothing to compact, or omp refused: the conversation is as it was, and the next
+                # turn's end starts the clock again.
+                sys.stderr.write("warning: idle compaction did not run: %r\n" % (exc,))
+        finally:
+            self._compact_task = None
+            if not self._closing:
+                await self._send_next_queued()
+
+    def _compact_call(self, check) -> None:
+        """``compact`` on the compaction pool's thread: the send gate re-asks ``check`` at the write
+        (as for a prompt) and the wait is the compaction's own, not an ordinary request's."""
+        client = self._client
+        with contextlib.ExitStack() as stack:
+            extended = getattr(client, "extended_timeout", None)
+            if extended is not None:
+                stack.enter_context(extended(_COMPACT_REQUEST_TIMEOUT))
+            gate = getattr(client, "send_gate", None)
+            if check is not None and gate is not None:
+                stack.enter_context(gate(check))
+            client.compact()
 
     # -- helpers -------------------------------------------------------------
 

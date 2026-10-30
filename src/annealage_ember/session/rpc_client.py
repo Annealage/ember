@@ -32,7 +32,8 @@ not of the Python objects, and not of the bytes omp sent) are exposed through
 **Pinned private surface.** omp-rpc is a third-party package installed from a git
 commit (``PINNED_OMP_RPC``). This subclass reaches these names of it and no others:
 ``omp_rpc.client._clone_json_object`` and ``RpcProcessExitError``; on ``RpcClient``:
-``_write_lock`` and ``_write_json`` (re-implemented under the lock for the send gate), ``_append_event``,
+``_write_lock`` and ``_write_json`` (re-implemented under the lock for the send gate), ``_request_timeout``
+(read per request, so one thread can lengthen its own wait), ``_append_event``,
 ``_events`` (``limit``, ``items``, ``offset``, ``clear``, ``current_index``,
 ``snapshot``, ``snapshot_from``, as ``_BoundedHistory`` has them), ``_event_condition``,
 ``_state_lock``, ``_pending``, ``_pending_host_tool_calls``,
@@ -143,8 +144,9 @@ def estimated_size(payload: Dict[str, Any]) -> int:
     return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
-#: Commands that make omp start or feed agent work: the ones a revoked grant must not send.
-_WORK_COMMANDS = frozenset({"prompt", "abort_and_prompt", "steer", "follow_up"})
+#: Commands that make omp start or feed agent work, or spend model tokens on its own (a compaction
+#: summarises through the provider): the ones a revoked grant must not send.
+_WORK_COMMANDS = frozenset({"prompt", "abort_and_prompt", "steer", "follow_up", "compact"})
 
 
 class SendRefused(RuntimeError):
@@ -192,6 +194,30 @@ class LeanRpcClient(RpcClient):
             yield
         finally:
             local.check = previous
+
+    @property
+    def _request_timeout(self) -> float:
+        """How long ``_request`` waits for a response: the longer wait the calling thread asked for
+        in ``extended_timeout``, else the constructor's ``request_timeout``."""
+        override = getattr(self._gate_local, "timeout", None)
+        return self._base_request_timeout if override is None else override
+
+    @_request_timeout.setter
+    def _request_timeout(self, value: float) -> None:
+        self._base_request_timeout = value
+
+    @contextlib.contextmanager
+    def extended_timeout(self, seconds: float):
+        """Within this block, a request made on THIS thread waits up to ``seconds`` for its response
+        instead of the client's ``request_timeout``. For a command that legitimately takes minutes
+        (``compact`` summarises the whole conversation); every other thread keeps the default."""
+        local = self._gate_local
+        previous = getattr(local, "timeout", None)
+        local.timeout = seconds
+        try:
+            yield
+        finally:
+            local.timeout = previous
 
     def kill(self) -> bool:
         """End omp and every descendant now, from any thread, and say whether

@@ -221,3 +221,36 @@ def test_a_group_signal_that_fails_makes_the_kill_unverified(monkeypatch):
     finally:
         leader.kill()
         leader.wait()
+
+
+def test_a_compaction_is_gated_like_other_work_and_waits_only_as_long_as_its_own_thread_asked():
+    client, stdin = _client()  # request_timeout=0.3
+    with client.send_gate(lambda: "revoked"):
+        with pytest.raises(SendRefused, match="revoked"):
+            client.compact()
+    assert stdin.lines == []
+
+    started = time.monotonic()
+    with client.extended_timeout(0.8):
+        with pytest.raises(RpcTimeoutError):
+            client.compact()
+    assert time.monotonic() - started >= 0.7
+
+    # Another thread, meanwhile, keeps the client's own wait, and so does this one afterwards.
+    waits = []
+
+    def other():
+        began = time.monotonic()
+        with pytest.raises(RpcTimeoutError):
+            client.abort()
+        waits.append(time.monotonic() - began)
+
+    with client.extended_timeout(0.8):
+        worker = threading.Thread(target=other)
+        worker.start()
+        worker.join(5)
+    assert 0.25 <= waits[0] < 0.7
+    began = time.monotonic()
+    with pytest.raises(RpcTimeoutError):
+        client.abort()
+    assert time.monotonic() - began < 0.7
