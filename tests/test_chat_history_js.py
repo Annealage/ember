@@ -289,7 +289,7 @@ def test_long_collapsed_runs_do_not_materialize_cards_or_format_payloads(observe
     assert observed["lazyCollapsed"] == {
         "cards": 0,
         "formatted": 0,
-        "summary": "300 tool calls · 1 failed",
+        "summary": "read (300) · 1 failed",
     }
     assert observed["lazyRunOpen"] == {
         "cards": 300,
@@ -316,7 +316,7 @@ def test_lazy_disclosures_keep_identity_live_results_and_reading_state(observed)
     assert observed["lazyReopenedResult"] == "deferred result"
     assert observed["lazyClosedRunUpdate"] == {
         "cards": 300,
-        "summary": "301 tool calls · 1 running · 1 failed",
+        "summary": "read (301) · 1 running · 1 failed",
     }
     assert observed["lazyReopenedRun"] == {
         "cards": 301,

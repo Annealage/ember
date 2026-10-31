@@ -807,9 +807,8 @@ export function initChat({
       else if (tool.result.isError) failed++;
     }
     const count = segment.tools.length;
-    const label = count === 1
-      ? shortToolName(segment.tools[0].name)
-      : `${count} tool calls`;
+    const name = shortToolName(segment.tools[0].name);
+    const label = count === 1 ? name : `${name} (${count})`;
     rec.summary.textContent = label
       + (pending ? ` · ${pending} running` : "")
       + (failed ? ` · ${failed} failed` : "");

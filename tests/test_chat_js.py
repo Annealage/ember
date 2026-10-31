@@ -489,6 +489,16 @@ out.inlineLateResult = {
   nextTurn: segmentContainer(10).children[0].children[1].children.map((c) => c.dataset.toolId),
 };
 
+// Different tools get a line each; only the same tool in a row is counted.
+chat.handleHello({ id: "mixed", agent: "ready", agent_error: null });
+chat.handleEvent(user(12));
+for (const [id, name] of [["m1", "read"], ["m2", "read"], ["m3", "edit_file"],
+    ["m4", "edit_file"], ["m5", "edit_file"], ["m6", "read"]]) {
+  chat.handleEvent({ kind: "tool_use", turn: 12, tool_use_id: id, name, input: {} });
+  chat.handleEvent({ kind: "tool_result", tool_use_id: id, is_error: id === "m3", text: "x" });
+}
+out.mixedTools = segmentContainer(12).children.map((n) => n.children[0].textContent);
+
 chat.handleHello({ id: "inline-replay", agent: "ready", agent_error: null });
 for (const event of [
   user(9),
@@ -746,7 +756,7 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
         "tag": "details",
         "className": "toolgroup",
         "collapsed": True,
-        "summary": "120 tool calls · 1 failed",
+        "summary": "read (120) · 1 failed",
         "count": 0,
         "nextTurnTools": 0,
     }
@@ -771,13 +781,21 @@ def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
         "sameNodes": True,
         "sameCard": True,
         "result": "late earlier result",
-        "summaryA": "2 tool calls · 1 failed",
+        "summaryA": "read (2) · 1 failed",
         "summaryB": "write · 1 running",
         "inspector": [True, True, 42, 17],
         "nextTurn": ["next"],
     }
     assert observed["inlineReplayOrder"] == observed["inlineOrder"]
     assert observed["inlineReplayResult"] == "late earlier result"
+
+
+def test_different_tools_get_their_own_line_and_only_repeats_are_counted(observed):
+    assert observed["mixedTools"] == [
+        "read (2)",
+        "edit_file (3) · 1 failed",
+        "read",
+    ]
 
 
 def test_thinking_is_a_closed_block_in_event_order_and_never_raises_activity(observed):

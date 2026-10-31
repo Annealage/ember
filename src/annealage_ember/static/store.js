@@ -58,7 +58,7 @@
  *                 inputState, inputDetail}`, built by conversation and
  *                 input_state events. `segments` is the ordered transcript:
  *                 `{kind: "text", text}`, `{kind: "thinking", text, truncated}` or `{kind: "tools", tools}`, grouping
- *                 only adjacent activity. Each tool has `{tool_use_id, name,
+ *                 only adjacent activity (a tools segment is a run of one tool). Each tool has `{tool_use_id, name,
  *                 input, result}`; a result updates that original tool without
  *                 changing segment order. `user` is the blocks the human sent as
  *                 that turn, from its `user_turn` event: the one source of
@@ -396,11 +396,15 @@ function setChatUserTurn(turn, blocks, clientId = null, automationSource = null,
   }, ["chat"]);
 }
 
-// Adjacent activity of the same kind extends its existing segment. Results
-// never enter this stream: they update the original tool at its original slot.
+// Adjacent activity of the same kind extends its existing segment; tool calls
+// only extend a run of the same tool, so a different tool starts its own
+// segment (and its own line in the chat). Results never enter this stream:
+// they update the original tool at its original slot.
 function appendSegment(segments, segment) {
   const last = segments[segments.length - 1];
-  if (last?.kind !== segment.kind) {
+  if (last?.kind !== segment.kind
+      || (segment.kind === "tools"
+        && last.tools[last.tools.length - 1].name !== segment.tools[0].name)) {
     return Object.freeze([...segments, Object.freeze(segment)]);
   }
   const merged = segment.kind === "text"
