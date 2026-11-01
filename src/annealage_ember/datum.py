@@ -98,7 +98,7 @@ def upload_action(project_tag):
     """A PDF upload action that asks the human for its exact source URL."""
     return UploadAction(
         name="datum",
-        label="Submit to Datum",
+        label="Add to datasheet library",
         tool=(SERVER, SUBMIT_TOOL),
         build_args=lambda upload, human: {
             "project_tag": project_tag,
