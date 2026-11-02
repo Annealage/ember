@@ -58,6 +58,19 @@ tool call the way it would if execution ran inline. The one request kept off
 (``_emit_available_models``): the suggestions it fetches are worth no wait,
 so an omp slow to answer it must not queue a prompt or an abort behind it.
 
+**System prompt replacement.** ``instructions_mode='replace'`` (headless ``system_mode``)
+writes the instructions and the renamed-tools note to a file and passes omp ``--system-prompt
+<path>`` through ``extra_args`` (``omp_rpc`` has no keyword for it) instead of
+``append_system_prompt``. The file is in a ``mkdtemp`` directory (0700) as a 0600 file with
+exactly the text the model is to read, and the path is not part of it. It is a file because
+the text can be hundreds of KiB, past the kernel's limit on one argument, and because argv
+is readable by other users. ``_discard_agent_dir`` removes it at close and when start fails.
+omp renders a custom prompt into the leading static block and keeps the working directory
+and context files in the trailing project block; an appended prompt lands inside that
+trailing block, after the working directory, so a prefix cache sees a different directory
+ahead of it. Replace changes the prompt text only: tools, approvals and extension loading
+are untouched, and omp's own tool guidance is no longer in the prompt.
+
 **Permission design -- two independent, broker-backed gates, not one.** The
 ticket's approach sketch flags ``extension_ui_request{method:"confirm"}`` as
 the write-class approval surface; reading the actual bundled
@@ -341,6 +354,7 @@ class OmpSession:
         on_sdk_session_id=None,
         client_factory: Optional[Callable[..., Any]] = None,
         instructions: Optional[str] = None,
+        instructions_mode: str = "append",
         agent_dir=None,
         config_dir=None,
         binary: Optional[str] = None,
@@ -376,6 +390,11 @@ class OmpSession:
         self._model_role = model_role
         # exactly today's keywords otherwise.
         self._instructions = instructions or None
+        if instructions_mode not in ("append", "replace"):
+            raise ValueError("instructions_mode must be 'append' or 'replace'")
+        if instructions_mode == "replace" and not self._instructions:
+            raise ValueError("instructions_mode='replace' needs instructions to replace with")
+        self._instructions_mode = instructions_mode
         self._base_url = base_url
         self._api_key = api_key
         self._tool_table = dict(tool_table or {})
@@ -419,6 +438,8 @@ class OmpSession:
         # The throwaway PI_CODING_AGENT_DIR an omp_base_url run writes its
         # models.yml into, removed by close(); never where a conversation is.
         self._temp_agent_dir: Optional[Path] = None
+        # The private directory holding the replacement system prompt file.
+        self._system_prompt_dir: Optional[Path] = None
         # The last turn of a resumed session's history (launch passes
         # bus.turn), so the next one continues its numbering.
         self._turn = int(turn)
@@ -884,7 +905,18 @@ class OmpSession:
             instructions = "\n\n".join(
                 p for p in (self._instructions, _renamed_tools_note(self._tool_table)) if p
             )
-            if instructions:
+            system_args = ()
+            if instructions and self._instructions_mode == "replace":
+                # A file, not argv: the text can run to hundreds of KiB, past one
+                # argument's kernel limit, and argv is readable by other users.
+                # omp reads a one-line value that names a file as that file.
+                self._system_prompt_dir = Path(tempfile.mkdtemp(prefix="annealage-system-"))
+                prompt_file = self._system_prompt_dir / "system.md"
+                fd = os.open(prompt_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(instructions)
+                system_args = ("--system-prompt", str(prompt_file))
+            elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
             if self._session_dir is not None:
                 self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -914,6 +946,7 @@ class OmpSession:
                 extra_args=(
                     "--auto-approve",
                     "--no-extensions",
+                    *system_args,
                     *(("--thinking", self._thinking) if self._thinking else ()),
                 ),
             )
@@ -1218,6 +1251,9 @@ class OmpSession:
         if self._temp_agent_dir is not None:
             shutil.rmtree(self._temp_agent_dir, ignore_errors=True)
             self._temp_agent_dir = None
+        if self._system_prompt_dir is not None:
+            shutil.rmtree(self._system_prompt_dir, ignore_errors=True)
+            self._system_prompt_dir = None
 
     # -- host tools -------------------------------------------------------------
 

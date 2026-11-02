@@ -279,6 +279,40 @@ async def test_provider_affinity_and_cache_retention_reach_omp(omp_client, tmp_p
     assert os.environ["PI_CACHE_RETENTION"] == "short"
 
 
+async def test_replace_mode_hands_omp_a_private_file_with_exactly_the_system_text(
+    omp_client, tmp_path
+):
+    # Bigger than one argv string may be (MAX_ARG_STRLEN is 128 KiB on Linux).
+    text = "stable review rules\n" + "x" * 200_000
+    seen = {}
+
+    def script(client):
+        extra = client.kwargs["extra_args"]
+        path = Path(extra[extra.index("--system-prompt") + 1])
+        seen["path"] = path
+        seen["text"] = path.read_text(encoding="utf-8")
+        seen["file_mode"] = path.stat().st_mode & 0o777
+        seen["dir_mode"] = path.parent.stat().st_mode & 0o777
+        seen["argv"] = extra
+        client.end()
+
+    omp_client.script = script
+    await run_prompt("do it", **make_args(tmp_path, system=text, system_mode="replace"))
+
+    (client,) = omp_client.instances
+    assert "append_system_prompt" not in client.kwargs
+    # The file is the text itself: the model reads nothing else, and no path in it.
+    assert seen["text"] == text
+    assert str(seen["path"]) not in seen["text"]
+    assert (seen["file_mode"], seen["dir_mode"]) == (0o600, 0o700)
+    assert text not in seen["argv"]
+    # Owned by the session: gone once the run has closed it.
+    assert not seen["path"].parent.exists()
+    # Nothing else about the run widened: no extensions, no built-in tools, same approval flag.
+    assert "--no-extensions" in seen["argv"] and "--auto-approve" in seen["argv"]
+    assert client.kwargs["tools"] == ()
+
+
 async def test_default_cache_retention_leaves_child_override_unset(
     omp_client, tmp_path, monkeypatch
 ):

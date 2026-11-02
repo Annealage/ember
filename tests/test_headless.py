@@ -531,6 +531,24 @@ async def test_omp_affinity_options_are_validated(options, message, backend, tmp
         await run_prompt("go", **make_args(tmp_path, backend=backend, **options))
 
 
+@pytest.mark.parametrize(
+    "options, message, backend",
+    [
+        (
+            {"system_mode": "replace", "system": "rules"},
+            "only supported with backend='omp'",
+            "claude",
+        ),
+        ({"system_mode": "replace"}, "needs a non-empty system", "omp"),
+        ({"system_mode": "replace", "system": "  "}, "needs a non-empty system", "omp"),
+        ({"system_mode": "swap", "system": "rules"}, "system_mode must be", "omp"),
+    ],
+)
+async def test_system_replace_is_refused_where_it_cannot_apply(options, message, backend, tmp_path):
+    with pytest.raises(ValueError, match=message):
+        await run_prompt("go", **make_args(tmp_path, backend=backend, **options))
+
+
 @pytest.mark.parametrize("cache_retention", ["short", "long", "none"])
 async def test_cache_retention_accepts_documented_values(cache_retention, tmp_path):
     headless._check_arguments(

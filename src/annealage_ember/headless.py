@@ -583,7 +583,16 @@ def _check_arguments(
     model_role=None,
     on_turn_result=None,
     max_followups=0,
+    system=None,
+    system_mode="append",
 ):
+    if system_mode not in ("append", "replace"):
+        raise ValueError("system_mode must be 'append' or 'replace', not %r" % (system_mode,))
+    if system_mode == "replace":
+        if backend != "omp":
+            raise ValueError("system_mode='replace' is only supported with backend='omp'")
+        if not isinstance(system, str) or not system.strip():
+            raise ValueError("system_mode='replace' needs a non-empty system string")
     if backend == "codex":
         raise ValueError(
             "run_prompt does not support the codex backend: it reaches its tools "
@@ -728,6 +737,7 @@ def _build_session(
     omp_request_timeout,
     session_id,
     on_request_usage,
+    system_mode="append",
     builtin_tools=(),
     max_budget_usd,
     native_max_turns,
@@ -757,6 +767,7 @@ def _build_session(
             tool_table=server.host_tool_table(),
             thinking=thinking,
             instructions=instructions,
+            instructions_mode=system_mode,
             agent_dir=omp_agent_dir,
             config_dir=omp_config_dir,
             binary=omp_binary,
@@ -1138,6 +1149,7 @@ async def run_prompt(
     cwd,
     timeout,
     system=None,
+    system_mode="append",
     thinking=None,
     model_role=None,
     omp_agent_dir=None,
@@ -1213,7 +1225,13 @@ async def run_prompt(
     Claude durable state/resume is not supported by this API. Without
     ``state_dir`` the default remains temporary state, deleted at return.
     Recovery metadata reports capability, not proof of native file integrity.
-    ``system`` is appended to the backend's system prompt. ``thinking`` is
+    ``system`` is appended to the backend's system prompt, or with
+    ``system_mode='replace'`` (omp only, needs a non-empty ``system``) it replaces
+    omp's own system prompt through ``--system-prompt``. Replace changes the
+    prompt text and nothing else: the tools, approvals and sandbox are the
+    arguments' own. omp then puts ``system`` (and its renamed-tool note) in the
+    leading static block and keeps the working directory in the trailing
+    project block, where append puts ``system`` after it. ``thinking`` is
     ``low``, ``medium`` or ``high``; OMP also accepts ``xhigh``. ``None`` leaves
     the backend's own default unchanged. OMP receives ``--thinking`` and Claude receives the SDK's
     ``effort`` option. These are backend-native settings, not calibrated levels
@@ -1325,6 +1343,8 @@ async def run_prompt(
         model_role,
         on_turn_result,
         max_followups,
+        system,
+        system_mode,
     )
     for name, value in (("work_timeout", work_timeout), ("interrupt_timeout", interrupt_timeout)):
         if value is None and name == "work_timeout":
@@ -1425,6 +1445,7 @@ async def run_prompt(
                     cwd=cwd,
                     state_dir=str(state.path),
                     instructions=system or None,
+                    system_mode=system_mode,
                     omp_agent_dir=omp_agent_dir,
                     omp_session_dir=omp_session_dir,
                     omp_binary=omp_binary,
