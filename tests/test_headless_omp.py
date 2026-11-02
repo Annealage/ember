@@ -279,6 +279,26 @@ async def test_provider_affinity_and_cache_retention_reach_omp(omp_client, tmp_p
     assert os.environ["PI_CACHE_RETENTION"] == "short"
 
 
+async def test_replace_mode_sends_the_system_text_as_omp_system_prompt_and_keeps_the_rest(
+    omp_client, tmp_path
+):
+    omp_client.script = lambda client: client.end()
+    await run_prompt(
+        "do it",
+        **make_args(tmp_path, system="stable review rules", system_mode="replace"),
+    )
+
+    (client,) = omp_client.instances
+    assert "append_system_prompt" not in client.kwargs
+    extra = client.kwargs["extra_args"]
+    flag = extra.index("--system-prompt")
+    # One value, newline-terminated so omp never reads a one-line text as a file name.
+    assert extra[flag + 1] == "stable review rules\n"
+    # Nothing else about the run widened: no extensions, no built-in tools, same approval flag.
+    assert "--no-extensions" in extra and "--auto-approve" in extra
+    assert client.kwargs["tools"] == ()
+
+
 async def test_default_cache_retention_leaves_child_override_unset(
     omp_client, tmp_path, monkeypatch
 ):

@@ -80,6 +80,16 @@ from omp ("Nothing to compact (session too small)", under about 20k tokens) is l
 leaves the session ready, and the clock only restarts at the next turn end. Only a turn that
 ended in this process arms it: a resumed conversation's cache has already lapsed.
 
+**System prompt replacement.** ``instructions_mode='replace'`` (headless ``system_mode``)
+sends the instructions and the renamed-tools note as omp's ``--system-prompt`` through
+``extra_args`` (``omp_rpc`` has no keyword for it) instead of ``append_system_prompt``. omp
+renders a custom prompt into the leading static block and keeps the working directory and
+context files in the trailing project block; an appended prompt lands inside that trailing
+block, after the working directory, so a prefix cache sees a different directory ahead of
+it. Replace changes the prompt text only: tools, approvals and extension loading are
+untouched, and omp's own tool guidance is no longer in the prompt. Without a newline omp
+would read a one-line text that names a file as that file, so one is always added.
+
 **Permission design -- two independent, broker-backed gates, not one.** The
 ticket's approach sketch flags ``extension_ui_request{method:"confirm"}`` as
 the write-class approval surface; reading the actual bundled
@@ -385,6 +395,7 @@ class OmpSession:
         on_sdk_session_id=None,
         client_factory: Optional[Callable[..., Any]] = None,
         instructions: Optional[str] = None,
+        instructions_mode: str = "append",
         agent_dir=None,
         config_dir=None,
         binary: Optional[str] = None,
@@ -422,6 +433,11 @@ class OmpSession:
         self._model_role = model_role
         # exactly today's keywords otherwise.
         self._instructions = instructions or None
+        if instructions_mode not in ("append", "replace"):
+            raise ValueError("instructions_mode must be 'append' or 'replace'")
+        if instructions_mode == "replace" and not self._instructions:
+            raise ValueError("instructions_mode='replace' needs instructions to replace with")
+        self._instructions_mode = instructions_mode
         self._base_url = base_url
         self._api_key = api_key
         self._tool_table = dict(tool_table or {})
@@ -1162,7 +1178,12 @@ class OmpSession:
             instructions = "\n\n".join(
                 p for p in (self._instructions, _renamed_tools_note(self._tool_table)) if p
             )
-            if instructions:
+            system_args = ()
+            if instructions and self._instructions_mode == "replace":
+                # omp reads a one-line value that names a file as that file, so
+                # the text always carries a newline.
+                system_args = ("--system-prompt", instructions.rstrip("\n") + "\n")
+            elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
             if self._session_dir is not None:
                 self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -1192,6 +1213,7 @@ class OmpSession:
                 extra_args=(
                     "--auto-approve",
                     "--no-extensions",
+                    *system_args,
                     *(("--thinking", self._thinking) if self._thinking else ()),
                 ),
             )

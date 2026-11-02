@@ -3238,3 +3238,34 @@ async def test_closing_during_a_compaction_does_not_wait_for_it():
 def test_idle_compaction_thresholds_must_be_positive():
     with pytest.raises(ValueError):
         OmpSession(lambda event: None, cwd="/p", session_id="s", idle_compact_after=0)
+
+
+@pytest.mark.asyncio
+async def test_replace_mode_keeps_the_renamed_tool_note_after_the_text():
+    table = dict(_tool_table())
+    table["checkpoint"] = ToolSpec(
+        schema={"type": "object", "properties": {}},
+        description="hand back",
+        handler=_read_handler,
+        write=False,
+    )
+    session, fake, _, _ = await _started_session(
+        tool_table=table, instructions="stable rules", instructions_mode="replace"
+    )
+    try:
+        assert "append_system_prompt" not in fake.kwargs
+        extra = fake.kwargs["extra_args"]
+        text = extra[extra.index("--system-prompt") + 1]
+        assert text.startswith("stable rules\n\n")
+        assert "`checkpoint` is `toy__checkpoint`" in text
+    finally:
+        await session.close()
+
+
+def test_instructions_mode_is_checked_at_construction():
+    with pytest.raises(ValueError, match="'append' or 'replace'"):
+        OmpSession(lambda e: None, cwd=".", session_id="s", broker=None, instructions_mode="swap")
+    with pytest.raises(ValueError, match="needs instructions"):
+        OmpSession(
+            lambda e: None, cwd=".", session_id="s", broker=None, instructions_mode="replace"
+        )
