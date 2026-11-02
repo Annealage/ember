@@ -81,14 +81,17 @@ leaves the session ready, and the clock only restarts at the next turn end. Only
 ended in this process arms it: a resumed conversation's cache has already lapsed.
 
 **System prompt replacement.** ``instructions_mode='replace'`` (headless ``system_mode``)
-sends the instructions and the renamed-tools note as omp's ``--system-prompt`` through
-``extra_args`` (``omp_rpc`` has no keyword for it) instead of ``append_system_prompt``. omp
-renders a custom prompt into the leading static block and keeps the working directory and
-context files in the trailing project block; an appended prompt lands inside that trailing
-block, after the working directory, so a prefix cache sees a different directory ahead of
-it. Replace changes the prompt text only: tools, approvals and extension loading are
-untouched, and omp's own tool guidance is no longer in the prompt. Without a newline omp
-would read a one-line text that names a file as that file, so one is always added.
+writes the instructions and the renamed-tools note to a file and passes omp ``--system-prompt
+<path>`` through ``extra_args`` (``omp_rpc`` has no keyword for it) instead of
+``append_system_prompt``. The file is in a ``mkdtemp`` directory (0700) as a 0600 file with
+exactly the text the model is to read, and the path is not part of it. It is a file because
+the text can be hundreds of KiB, past the kernel's limit on one argument, and because argv
+is readable by other users. ``_discard_agent_dir`` removes it at close and when start fails.
+omp renders a custom prompt into the leading static block and keeps the working directory
+and context files in the trailing project block; an appended prompt lands inside that
+trailing block, after the working directory, so a prefix cache sees a different directory
+ahead of it. Replace changes the prompt text only: tools, approvals and extension loading
+are untouched, and omp's own tool guidance is no longer in the prompt.
 
 **Permission design -- two independent, broker-backed gates, not one.** The
 ticket's approach sketch flags ``extension_ui_request{method:"confirm"}`` as
@@ -490,6 +493,8 @@ class OmpSession:
         # The throwaway PI_CODING_AGENT_DIR an omp_base_url run writes its
         # models.yml into, removed by close(); never where a conversation is.
         self._temp_agent_dir: Optional[Path] = None
+        # The private directory holding the replacement system prompt file.
+        self._system_prompt_dir: Optional[Path] = None
         # The last turn of a resumed session's history (launch passes
         # bus.turn), so the next one continues its numbering.
         self._turn = int(turn)
@@ -1180,9 +1185,15 @@ class OmpSession:
             )
             system_args = ()
             if instructions and self._instructions_mode == "replace":
-                # omp reads a one-line value that names a file as that file, so
-                # the text always carries a newline.
-                system_args = ("--system-prompt", instructions.rstrip("\n") + "\n")
+                # A file, not argv: the text can run to hundreds of KiB, past one
+                # argument's kernel limit, and argv is readable by other users.
+                # omp reads a one-line value that names a file as that file.
+                self._system_prompt_dir = Path(tempfile.mkdtemp(prefix="annealage-system-"))
+                prompt_file = self._system_prompt_dir / "system.md"
+                fd = os.open(prompt_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(instructions)
+                system_args = ("--system-prompt", str(prompt_file))
             elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
             if self._session_dir is not None:
@@ -1527,6 +1538,9 @@ class OmpSession:
         if self._temp_agent_dir is not None:
             shutil.rmtree(self._temp_agent_dir, ignore_errors=True)
             self._temp_agent_dir = None
+        if self._system_prompt_dir is not None:
+            shutil.rmtree(self._system_prompt_dir, ignore_errors=True)
+            self._system_prompt_dir = None
 
     # -- host tools -------------------------------------------------------------
 

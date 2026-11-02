@@ -2599,6 +2599,29 @@ def _exits_before_ready(stderr):
     return ExitsBeforeReady
 
 
+@pytest.mark.asyncio
+async def test_replace_mode_file_is_removed_when_omp_fails_to_start(tmp_path):
+    made = []
+
+    def factory(**kwargs):
+        made.append(_exits_before_ready("boom")(**kwargs))
+        return made[-1]
+
+    session = OmpSession(
+        EventRecorder(),
+        cwd=tmp_path,
+        session_id="s",
+        tool_table=_tool_table(),
+        client_factory=factory,
+        instructions="stable rules",
+        instructions_mode="replace",
+    )
+    await session.start()
+    extra = made[0].kwargs["extra_args"]
+    assert not Path(extra[extra.index("--system-prompt") + 1]).parent.exists()
+    await session.close()
+
+
 _NO_MODELS = (
     "No models available. Use /login or set an API key environment variable. "
     "Then use /model to select a model.\n"
@@ -3255,11 +3278,13 @@ async def test_replace_mode_keeps_the_renamed_tool_note_after_the_text():
     try:
         assert "append_system_prompt" not in fake.kwargs
         extra = fake.kwargs["extra_args"]
-        text = extra[extra.index("--system-prompt") + 1]
+        path = Path(extra[extra.index("--system-prompt") + 1])
+        text = path.read_text(encoding="utf-8")
         assert text.startswith("stable rules\n\n")
         assert "`checkpoint` is `toy__checkpoint`" in text
     finally:
         await session.close()
+    assert not path.exists() and not path.parent.exists()
 
 
 def test_instructions_mode_is_checked_at_construction():
