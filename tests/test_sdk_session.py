@@ -229,6 +229,21 @@ async def _started_session(**kwargs):
     return session, transport, recorder
 
 
+async def _pre_tool_decision(session, tool_name, tool_input):
+    """Exercise the registered callbacks as the SDK does for a tool call."""
+    import re
+
+    for matcher in session._client.options.hooks.get("PreToolUse", []):
+        if matcher.matcher is not None and not re.search(matcher.matcher, tool_name):
+            continue
+        for hook in matcher.hooks:
+            result = await hook({"tool_name": tool_name, "tool_input": tool_input}, "tu_1", None)
+            output = result.get("hookSpecificOutput", {})
+            if output.get("permissionDecision") == "deny":
+                return output
+    return {}
+
+
 def test_fake_transport_is_a_real_transport():
     """``FakeTransport`` satisfies the SDK's own ``Transport`` ABC by
     construction: instantiating a subclass missing one of the six abstract
@@ -516,39 +531,40 @@ async def test_the_product_tool_server_is_passed_through_under_its_own_name():
 
 @pytest.mark.asyncio
 @pytest.mark.filterwarnings("ignore::claude_agent_sdk.CanUseToolShadowedWarning")
-async def test_no_tripwire_hook_without_an_accepted_digest():
-    """A session given no accepted digest carries no configuration tripwire, so a
-    caller that never ran the gate does not get a control that would deny every
-    call for want of a digest to compare against. The credential refusal beside
-    it is unconditional and stays."""
-    session, _transport, _recorder = await _started_session()
+async def test_no_tripwire_hook_without_an_accepted_digest(tmp_path):
+    """Without an accepted digest ordinary work remains allowed."""
+    session = SdkSession(EventRecorder(), cwd=tmp_path, session_id="s", transport=FakeTransport())
+    await session.start()
     try:
-        # Hooks are installed either way, because the credential refusal is
-        # unconditional; what a session with no accepted digest must not carry
-        # is the configuration tripwire, which would have nothing to compare a
-        # digest against.
-        matchers = session._client.options.hooks["PreToolUse"]
-        assert matchers[0].hooks == [session._guard_secret_paths]
-        assert session._guard_config not in matchers[0].hooks
+        (tmp_path / ".mcp.json").write_text('{"mcpServers":{}}')
+        assert await _pre_tool_decision(session, "Bash", {"command": "echo hello"}) == {}
     finally:
         await session.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.filterwarnings("ignore::claude_agent_sdk.CanUseToolShadowedWarning")
-async def test_the_tripwire_is_installed_as_a_pre_tool_use_hook_matching_every_tool():
-    """PreToolUse is the only event early enough: a settings allow rule is
-    applied before ``can_use_tool``, and the sandbox waves some bash through
-    without consulting it at all, so a control bound to either would miss
-    exactly the calls that matter."""
-    session, _transport, _recorder = await _started_session(trusted_config_digest="accepted-digest")
+async def test_the_tripwire_denies_tool_calls_after_configuration_changes(tmp_path):
+    from annealage_ember.session import workspace_trust as wt
+
+    session = SdkSession(
+        EventRecorder(),
+        cwd=tmp_path,
+        session_id="s",
+        transport=FakeTransport(),
+        trusted_config_digest=wt.config_digest(tmp_path),
+    )
+    await session.start()
     try:
-        hooks = session._client.options.hooks
-        assert list(hooks) == ["PreToolUse"]
-        matchers = hooks["PreToolUse"]
-        assert len(matchers) == 1
-        assert matchers[0].matcher is None
-        assert matchers[0].hooks == [session._guard_config, session._guard_secret_paths]
+        (tmp_path / ".mcp.json").write_text('{"mcpServers":{}}')
+        for tool_name, tool_input in (
+            ("Bash", {"command": "echo hello"}),
+            ("Read", {"file_path": "notes.txt"}),
+            ("mcp__toy__list_notes", {}),
+        ):
+            decision = await _pre_tool_decision(session, tool_name, tool_input)
+            assert decision["permissionDecision"] == "deny"
+            assert "configuration" in decision["permissionDecisionReason"]
     finally:
         await session.close()
 
@@ -1602,14 +1618,17 @@ async def test_the_secret_path_hook_denies_when_it_cannot_decide(monkeypatch):
 async def test_the_secret_path_hook_is_installed_even_with_no_accepted_digest(
     tmp_path, monkeypatch
 ):
-    """The two hooks answer different questions, so the credential refusal must
-    not depend on the served directory having had configuration to accept: a
-    folder with no .claude/ at all is the ordinary case."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    """Credential refusal does not depend on an accepted configuration digest."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
     session, _transport, _recorder = await _started_session()
     try:
-        matchers = session._client.options.hooks["PreToolUse"]
-        assert matchers[0].hooks == [session._guard_secret_paths]
+        decision = await _pre_tool_decision(
+            session, "Read", {"file_path": str(home / ".ssh" / "id_rsa")}
+        )
+        assert decision["permissionDecision"] == "deny"
+        assert "credential" in decision["permissionDecisionReason"]
     finally:
         await session.close()
 

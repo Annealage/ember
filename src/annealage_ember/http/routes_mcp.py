@@ -65,6 +65,7 @@ carries (``ToolSpec.write``) to this particular driver's approval mechanism,
 exactly as ``session/sdk.py`` does for its own.
 """
 
+import asyncio
 import hmac
 import time
 
@@ -127,18 +128,37 @@ async def _call_tool_result(tool_table, broker, name, arguments, *, server_name)
             # Fail closed: a session with no broker configured is not a
             # session a write-class tool should ever run unsupervised in,
             # whatever the reason it is missing.
+            message = "no permission broker is configured for this session, so %s cannot run" % name
+            record = getattr(spec.handler, "_annealage_record_refusal", None)
+            if record is not None:
+                record(
+                    arguments,
+                    "rejected",
+                    {"isError": True, "content": [{"type": "text", "text": message}]},
+                )
             return types.CallToolResult(
-                isError=True,
-                content=[
-                    types.TextContent(
-                        type="text",
-                        text="no permission broker is configured for this session, so "
-                        "%s cannot run" % name,
-                    )
-                ],
+                isError=True, content=[types.TextContent(type="text", text=message)]
             )
-        decision = await broker.ask(namespaced(server_name, name), arguments, None)
+        try:
+            decision = await broker.ask(namespaced(server_name, name), arguments, None)
+        except asyncio.CancelledError:
+            record = getattr(spec.handler, "_annealage_record_refusal", None)
+            if record is not None:
+                record(arguments, "cancelled")
+            raise
+        except BaseException:
+            record = getattr(spec.handler, "_annealage_record_refusal", None)
+            if record is not None:
+                record(arguments, "incomplete")
+            raise
         if not decision.allow:
+            record = getattr(spec.handler, "_annealage_record_refusal", None)
+            if record is not None:
+                record(
+                    arguments,
+                    "rejected",
+                    {"isError": True, "content": [{"type": "text", "text": decision.message}]},
+                )
             return types.CallToolResult(
                 isError=True, content=[types.TextContent(type="text", text=decision.message)]
             )

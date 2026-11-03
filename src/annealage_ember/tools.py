@@ -58,6 +58,14 @@ and what to do instead. That second half matters more than it looks: a deny's
 message reaches the model verbatim (plan section 2a, fact 15), so "no viewer
 connected; ask the human to open <url>" is worth more than a status code.
 
+A session may supply one synchronous ``call_recorder`` to ``ToolServer``.
+It receives a bounded, value-free terminal summary for each call reaching
+the wrapper, SDK middleware, or Ember's transport permission gates. Value
+summaries use a private, ephemeral key shared within that server, so equal
+values correlate within a session but not across servers. It is not a
+permission gate or replay log. Calls refused by a backend before it invokes
+those boundaries are not visible. Recorder failures do not change tool execution.
+
 Importing this module imports ``claude_agent_sdk``, so only agent-mode code
 paths import it; a viewer-only run never does.
 """
@@ -67,10 +75,12 @@ import contextvars
 import copy
 import dataclasses
 import functools
+import hmac
 import itertools
 import json
 import math
 import re
+import secrets
 import sys
 import time
 from collections import namedtuple
@@ -600,6 +610,72 @@ def _verify(tools, grading):
 
 
 _SDK_CALL = contextvars.ContextVar("ember_sdk_call", default=None)
+_CALL_RECORD = contextvars.ContextVar("ember_call_record", default=None)
+
+
+def _record_stage(stage, outcome=None):
+    record = _CALL_RECORD.get()
+    if record is not None:
+        record["stage"] = stage
+        if outcome is not None:
+            record["outcome"] = outcome
+
+
+class _CallRecorder:
+    """Keep a session-local summary key separate from the emitted events."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        key = secrets.token_bytes(32)
+
+        def summarize(value):
+            try:
+                if _input_diagnostic(None, (), value, resource_only=True) is not None:
+                    return {"hmac_sha256": None, "size": None}
+                encoded = json.dumps(
+                    value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                return {
+                    "hmac_sha256": hmac.digest(key, encoded, "sha256").hex(),
+                    "size": len(encoded),
+                }
+            except (TypeError, ValueError, RecursionError, OverflowError):
+                return {"hmac_sha256": None, "size": None}
+
+        self.summarize = summarize
+
+    def __call__(self, event):
+        self.callback(event)
+
+
+def _call_recorder(recorder):
+    if recorder is None or isinstance(recorder, _CallRecorder):
+        return recorder
+    return _CallRecorder(recorder)
+
+
+def _emit_call(recorder, server, tool, arguments, result, outcome, stage):
+    if recorder is None:
+        return
+    try:
+        recorder(
+            {
+                "server": server,
+                "tool": tool,
+                "outcome": outcome,
+                "is_error": (
+                    bool(result.get("is_error", result.get("isError", False)))
+                    if isinstance(result, dict)
+                    else None
+                ),
+                "stage": stage,
+                "arguments": arguments,
+                "result": recorder.summarize(result) if result is not None else None,
+            }
+        )
+    except BaseException:
+        # Observability is never authority, including during cancellation.
+        pass
 
 
 # The attribute ``asks_the_human`` sets on a tool's handler function.
@@ -626,7 +702,17 @@ def asks_the_human(tool_def):
     return tool_def
 
 
-def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_schema=True):
+def _wrap(
+    tool_def,
+    *,
+    bus,
+    gated,
+    paused_message,
+    hosted_key=None,
+    trusted_schema=True,
+    call_recorder=None,
+    server_name=None,
+):
     """Apply the pause gate and the failure mapping to one tool.
 
     Both live here rather than in each handler, which is what lets the handler
@@ -649,6 +735,7 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
     message that depends on what the server turned out to hold (which remote
     MCP servers it reached, say).
     """
+    call_recorder = _call_recorder(call_recorder)
     name = product.current().name
     schema = _tool_json_schema(tool_def.input_schema)
     validator, names = _compile_schema(schema)
@@ -656,10 +743,7 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
     def input_diagnostic(args):
         return _input_diagnostic(validator, names, args, trusted_schema=trusted_schema)
 
-    async def handler(args):
-        marker = _SDK_CALL.get()
-        if marker is not None:
-            marker["entered"] = True
+    async def execute(args):
         if getattr(bus, "hosted_mode", False):
             operation = bus.hosted_tool_ops.get(hosted_key)
             if (
@@ -668,30 +752,37 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
                 or time.time() >= bus.hosted_turn_exp
                 or operation not in bus.hosted_turn_ops
             ):
+                _record_stage("hosted", "rejected")
                 return fail("hosted operation is not granted for this tool call")
         automatically_gated = getattr(bus, "auto_approve_included_tools", False) and getattr(
             tool_def.handler, _ASKS_THE_HUMAN, False
         )
         if (gated or automatically_gated) and bus.paused:
+            _record_stage("pause", "rejected")
             return fail(paused_message() if callable(paused_message) else paused_message)
         diagnostic = input_diagnostic(args)
         if diagnostic is not None:
+            _record_stage("schema", "rejected")
             return fail("Tool input does not match its declared schema", diagnostic=diagnostic)
         try:
             result = await tool_def.handler(args)
         except ValueError as exc:
+            _record_stage("handler", "exception")
             return fail(str(exc))
         except NoViewerConnected as exc:
+            _record_stage("handler", "exception")
             # Carries plan section 3.3's exact wording, including the URL to
             # ask the human to open, so it is passed through unedited.
             return fail(str(exc))
         except ViewerGone:
+            _record_stage("handler", "exception")
             return fail(
                 "the view this went to closed before it answered, so %s "
                 "did not happen; ask the product owner whether the page is still "
                 "open, then try again" % tool_def.name
             )
         except ViewerTimeout:
+            _record_stage("handler", "incomplete")
             return fail(
                 "the viewer did not answer %s in time, so it may or may "
                 "not have happened; the page may be busy or in a "
@@ -699,12 +790,14 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
                 "either way" % tool_def.name
             )
         except (TimeoutError, asyncio.TimeoutError):
+            _record_stage("handler", "incomplete")
             return fail(
                 "%s reached a host/tool deadline; its outcome is not established. "
                 "Read the relevant state back before assuming completion or "
                 "retrying" % tool_def.name
             )
         except CallError as exc:
+            _record_stage("handler", "exception")
             error = exc.error or {}
             return fail(
                 "the viewer refused %s: %s (%s)"
@@ -715,6 +808,7 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
                 )
             )
         except Exception as exc:
+            _record_stage("handler", "exception")
             sys.stderr.write("error: %s tool %s failed: %r\n" % (name, tool_def.name, exc))
             return fail(
                 "%s failed inside %s itself (%s), which is a bug rather "
@@ -730,11 +824,66 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_sche
             bus.request_end_turn()
         return result
 
+    async def handler(args):
+        marker = _SDK_CALL.get()
+        if marker is not None:
+            marker["entered"] = True
+        if call_recorder is None:
+            return await execute(args)
+        arguments = call_recorder.summarize(args)
+        record = {"stage": "handler", "outcome": None}
+        token = _CALL_RECORD.set(record)
+        result = None
+        try:
+            result = await execute(args)
+            if record["outcome"] is None:
+                record["outcome"] = (
+                    "failure"
+                    if isinstance(result, dict)
+                    and result.get("is_error", result.get("isError", False))
+                    else "success"
+                )
+            return result
+        except asyncio.CancelledError:
+            record["outcome"] = "cancelled"
+            raise
+        except BaseException:
+            record["outcome"] = "exception"
+            raise
+        finally:
+            _CALL_RECORD.reset(token)
+            if marker is not None:
+                marker["record"] = (arguments, record["outcome"] or "incomplete", record["stage"])
+            else:
+                _emit_call(
+                    call_recorder,
+                    server_name,
+                    tool_def.name,
+                    arguments,
+                    result,
+                    record["outcome"] or "incomplete",
+                    record["stage"],
+                )
+
+    def record_refusal(args, outcome="rejected", result=None):
+        if call_recorder is not None:
+            _emit_call(
+                call_recorder,
+                server_name,
+                tool_def.name,
+                call_recorder.summarize(args),
+                result,
+                outcome,
+                "policy",
+            )
+
+    handler._annealage_record_refusal = record_refusal
+    handler._annealage_call_recorder = call_recorder
     handler._annealage_input_diagnostic = input_diagnostic
     return dataclasses.replace(tool_def, input_schema=schema, handler=handler)
 
 
-def _attach_sdk_diagnostics(server, tools):
+def _attach_sdk_diagnostics(server, tools, *, call_recorder=None, server_name=None):
     """Attach bounded preflight and safe post-validation diagnostics to an SDK server.
 
     ``tools`` must be the same wrapped tools supplied to the SDK. In-bounds
@@ -746,32 +895,75 @@ def _attach_sdk_diagnostics(server, tools):
     if not isinstance(middleware, list):
         raise RuntimeError("MCP server middleware is required for safe SDK diagnostics")
     handlers = {tool.name: tool.handler for tool in tools}
+    if call_recorder is not None:
+        call_recorder = next(
+            (
+                handler._annealage_call_recorder
+                for handler in handlers.values()
+                if getattr(handler, "_annealage_call_recorder", None) is not None
+            ),
+            None,
+        ) or _call_recorder(call_recorder)
+
+    def record_refusal(name, args, outcome="rejected", result=None):
+        handler = handlers.get(name)
+        if handler is not None:
+            handler._annealage_record_refusal(args, outcome, result)
 
     async def safe_rejection(ctx, call_next):
         if ctx.method != "tools/call":
             return await call_next(ctx)
         params = ctx.params or {}
+        supplied_name = params.get("name")
+        handler = handlers.get(supplied_name) if isinstance(supplied_name, str) else None
+        safe_name = supplied_name if handler is not None else "<unknown>"
+        arguments = (
+            call_recorder.summarize(params.get("arguments")) if call_recorder is not None else None
+        )
+
+        def recorded(result, outcome):
+            _emit_call(call_recorder, server_name, safe_name, arguments, result, outcome, "sdk")
+            return result
+
         if _input_diagnostic(None, (), params.get("arguments"), resource_only=True) is not None:
             replacement = fail("Tool input exceeds safe structural limits; no values are echoed.")
-            return {"isError": True, "content": replacement["content"]}
+            return recorded({"isError": True, "content": replacement["content"]}, "rejected")
         marker = {"entered": False}
         token = _SDK_CALL.set(marker)
         try:
             result = await call_next(ctx)
+        except BaseException as exc:
+            saved = marker.get("record")
+            outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "incomplete"
+            if saved is not None:
+                _emit_call(call_recorder, server_name, safe_name, saved[0], None, outcome, saved[2])
+            elif not marker["entered"]:
+                recorded(None, outcome)
+            raise
         finally:
             _SDK_CALL.reset(token)
         if marker["entered"]:
+            saved = marker.get("record")
+            if saved is not None:
+                outcome = saved[1]
+                if outcome in ("success", "failure") and isinstance(result, dict):
+                    outcome = (
+                        "failure"
+                        if result.get("isError", result.get("is_error", False))
+                        else "success"
+                    )
+                _emit_call(
+                    call_recorder, server_name, safe_name, saved[0], result, outcome, saved[2]
+                )
             return result
         if not isinstance(result, dict):
+            recorded(None, "incomplete")
             raise RuntimeError("Unexpected MCP middleware result shape")
         if not result.get("isError"):
-            return result
-        params = ctx.params or {}
-        name = params.get("name")
-        handler = handlers.get(name) if isinstance(name, str) else None
+            return recorded(result, "success")
         if handler is None:
             replacement = fail("Unknown tool.")
-            return {"isError": True, "content": replacement["content"]}
+            return recorded({"isError": True, "content": replacement["content"]}, "rejected")
         diagnostic = None
         try:
             diagnostic = handler._annealage_input_diagnostic(params.get("arguments") or {})
@@ -784,7 +976,9 @@ def _attach_sdk_diagnostics(server, tools):
             replacement = fail(
                 "Tool input does not match its declared schema", diagnostic=diagnostic
             )
-        return {"isError": True, "content": replacement["content"]}
+        return recorded({"isError": True, "content": replacement["content"]}, "rejected")
+
+    safe_rejection._annealage_record_refusal = record_refusal
 
     middleware.append(safe_rejection)
     return server
@@ -861,6 +1055,7 @@ class ToolServer:
         remote_guard=None,
         request_guard=None,
         never_remembered=(),
+        call_recorder=None,
     ):
         """Build one session's tool server.
 
@@ -875,6 +1070,7 @@ class ToolServer:
         backend broker names; legacy standing grants are ignored by the broker.
         """
         _verify(tools, grading)
+        call_recorder = _call_recorder(call_recorder)
         self.request_guard = (
             request_guard if request_guard is not None else getattr(bus, "request_guard", None)
         )
@@ -904,12 +1100,16 @@ class ToolServer:
                 gated=tool_def.name in gated,
                 paused_message=paused_message,
                 hosted_key=namespaced(self.name, tool_def.name),
+                call_recorder=call_recorder,
+                server_name=self.name,
             )
             for tool_def in tools
         )
         self.server = _attach_sdk_diagnostics(
             create_sdk_mcp_server(self.name, version=installed.version, tools=list(self.tools)),
             self.tools,
+            call_recorder=call_recorder,
+            server_name=self.name,
         )
         remote = tuple(remote)
         self.remotes = ()
@@ -918,6 +1118,7 @@ class ToolServer:
         self._bus = bus
         self._remote_snapshot = remote_snapshot
         self._remote_guard = remote_guard
+        self._call_recorder = call_recorder
         self._paused_message = paused_message
         if remote or remote_snapshot is not None:
             # The same discovery and binding path serves interactive and headless.
@@ -930,6 +1131,7 @@ class ToolServer:
                 paused_message=paused_message,
                 snapshot=remote_snapshot,
                 guard=remote_guard,
+                call_recorder=call_recorder,
             )
 
     async def reconnect(self):
@@ -951,6 +1153,7 @@ class ToolServer:
                 paused_message=self._paused_message,
                 retry=True,
                 guard=self._remote_guard,
+                call_recorder=self._call_recorder,
             ),
         )
         self.remotes += reached

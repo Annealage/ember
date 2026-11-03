@@ -981,6 +981,20 @@ class SdkSession:
         finally:
             self._report_owner_termination()
 
+    def _record_tool_refusal(self, tool_name, input_data, outcome):
+        if not isinstance(tool_name, str):
+            return
+        for server_name, server in self._mcp_servers.items():
+            prefix = "mcp__%s__" % server_name
+            if tool_name.startswith(prefix) and isinstance(server, dict):
+                instance = server.get("instance")
+                for middleware in getattr(instance, "middleware", ()):
+                    record = getattr(middleware, "_annealage_record_refusal", None)
+                    if record is not None:
+                        record(tool_name[len(prefix) :], input_data, outcome)
+                        break
+                break
+
     async def _can_use_tool(
         self, tool_name: str, input_data: dict, context: ToolPermissionContext
     ) -> PermissionResult:
@@ -995,7 +1009,20 @@ class SdkSession:
         never raises, so this preserves ``ask``'s own "never raises, always
         returns a decision" guarantee end to end.
         """
-        decision = await self._broker.ask(tool_name, input_data, context)
+
+        def record_refusal(outcome):
+            self._record_tool_refusal(tool_name, input_data, outcome)
+
+        try:
+            decision = await self._broker.ask(tool_name, input_data, context)
+        except asyncio.CancelledError:
+            record_refusal("cancelled")
+            raise
+        except BaseException:
+            record_refusal("incomplete")
+            raise
+        if not decision.allow:
+            record_refusal("rejected")
         return _to_claude_result(decision)
 
     def _build_options(self) -> ClaudeAgentOptions:
@@ -1029,10 +1056,7 @@ class SdkSession:
         # of a settings allow rule and of the sandbox's auto-approval, but they
         # answer different questions and must not share a precondition: a
         # session built without a digest is still holding a shell.
-        pre_tool_use = [self._guard_secret_paths]
-        if self._trusted_config_digest is not None:
-            pre_tool_use.insert(0, self._guard_config)
-        kwargs["hooks"] = {"PreToolUse": [HookMatcher(matcher=None, hooks=pre_tool_use)]}
+        kwargs["hooks"] = {"PreToolUse": [HookMatcher(matcher=None, hooks=[self._guard_tools])]}
         if self._broker is not None:
             kwargs["can_use_tool"] = self._can_use_tool
         if self._model:
@@ -1057,6 +1081,18 @@ class SdkSession:
         return ClaudeAgentOptions(**kwargs)
 
     # -- the configuration tripwire ----------------------------------------
+
+    async def _guard_tools(self, hook_input, tool_use_id, context):
+        config = {}
+        if self._trusted_config_digest is not None:
+            config = await self._guard_config(hook_input, tool_use_id, context)
+        paths = await self._guard_secret_paths(hook_input, tool_use_id, context)
+        refusal = config or paths
+        if refusal:
+            self._record_tool_refusal(
+                hook_input.get("tool_name"), hook_input.get("tool_input"), "rejected"
+            )
+        return refusal
 
     async def _guard_config(self, hook_input, tool_use_id, context) -> dict:
         """Refuse every tool call once this directory's Claude configuration changes.

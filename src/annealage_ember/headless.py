@@ -149,6 +149,7 @@ class ToolSet:
     ``remote`` contains the same RemoteServer declarations as ToolServer;
     ``remote_snapshot`` may freeze their discovered definitions across runs.
     ``remote_result_observer`` is the per-run awaited successful-read callback.
+    ``call_recorder`` is the same optional terminal call hook as ToolServer.
     Remote writes are not granted by ``grant``.
 
     ``ValueError`` for a ``tools``/``grading`` pair ``ToolServer`` would refuse
@@ -165,6 +166,7 @@ class ToolSet:
     remote: Tuple[Any, ...] = ()
     remote_snapshot: Any = None
     remote_result_observer: Any = None
+    call_recorder: Any = None
 
     def __post_init__(self):
         object.__setattr__(self, "tools", tuple(self.tools))
@@ -1436,6 +1438,7 @@ async def run_prompt(
             remote=tools.remote,
             remote_snapshot=tools.remote_snapshot,
             remote_guard=run.guard,
+            call_recorder=tools.call_recorder,
         )
         # OMP combines bare local names with <remote>__<tool> names. A
         # collision could replace a granted local write under the broker name.

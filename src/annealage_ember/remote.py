@@ -84,7 +84,15 @@ from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 
 from . import product, remote_actions
-from .tools import Grading, _attach_sdk_diagnostics, _compile_schema, _wrap, fail, namespaced
+from .tools import (
+    Grading,
+    _attach_sdk_diagnostics,
+    _compile_schema,
+    _record_stage,
+    _wrap,
+    fail,
+    namespaced,
+)
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
 #: may take together for one remote at startup. Remotes are reached
@@ -307,7 +315,15 @@ Connected = namedtuple("Connected", "name grading tools server instructions")
 
 
 def connect(
-    servers, *, product_server, bus, paused_message, retry=False, snapshot=None, guard=None
+    servers,
+    *,
+    product_server,
+    bus,
+    paused_message,
+    retry=False,
+    snapshot=None,
+    guard=None,
+    call_recorder=None,
 ):
     """Bind per-session proxies from a snapshot, or discover interactively."""
     servers = tuple(servers)
@@ -338,6 +354,8 @@ def connect(
                     paused_message=paused_message,
                     hosted_key=namespaced(server.name, tool.name),
                     trusted_schema=False,
+                    call_recorder=call_recorder,
+                    server_name=server.name,
                 )
             )
         tools = tuple(tools)
@@ -347,7 +365,10 @@ def connect(
                 grading=grading,
                 tools=tools,
                 server=_attach_sdk_diagnostics(
-                    create_sdk_mcp_server(server.name, version=version, tools=list(tools)), tools
+                    create_sdk_mcp_server(server.name, version=version, tools=list(tools)),
+                    tools,
+                    call_recorder=call_recorder,
+                    server_name=server.name,
                 ),
                 instructions=definition.instructions,
             )
@@ -535,6 +556,7 @@ def _proxied(server, tool, bus=None):
                         "context_verified"
                     ]
                 ):
+                    _record_stage("policy", "rejected")
                     return fail(
                         "remote write refused: its approved source context is unavailable or invalid"
                     )
@@ -559,6 +581,7 @@ def _proxied(server, tool, bus=None):
                 # result or the caller's arguments, even through nested values.
                 await observer(server.name, name, copy.deepcopy(args), copy.deepcopy(result))
             except Exception:
+                _record_stage("observer", "failure")
                 return fail("remote result observation failed")
         return result
 
@@ -585,6 +608,7 @@ async def call(
     """Call a remote tool, enforcing its read policy and recording writes."""
     timeout = CALL_TIMEOUT if timeout is None else timeout
     if name in server.denied:
+        _record_stage("policy", "rejected")
         return fail("remote call refused: %s is denied" % name)
     if (
         server.read_tools
@@ -593,6 +617,7 @@ async def call(
         and name not in allowed_reads
         and name not in allowed_writes
     ):
+        _record_stage("policy", "rejected")
         return fail(
             "remote call refused: %s is not read-only; name it in allowed_reads "
             "or allowed_writes to permit it" % name
@@ -600,21 +625,25 @@ async def call(
     invocation = None
     if not read_only:
         if action_store is None:
+            _record_stage("policy", "rejected")
             return fail("remote write refused: durable action ledger is unavailable")
         if expected_context is not None:
             before = remote_actions.safe_context(expected_context, action_store.project)
             current = remote_actions.safe_context(context, action_store.project)
             if before != current:
+                _record_stage("policy", "rejected")
                 return fail("remote write refused because its approved authority context changed")
         try:
             invocation, blocked = action_store.begin(
                 server.name, name, arguments, source=source, approval=approval, context=context
             )
         except Exception:
+            _record_stage("policy", "rejected")
             return fail(
                 "remote write refused: durable action ledger could not reserve it; nothing was sent"
             )
         if blocked:
+            _record_stage("policy", "rejected")
             return fail(
                 "%s on %s has an unresolved prior invocation (%s); it was not sent again. "
                 "Ask the product owner to inspect and explicitly reconcile action %s."
@@ -651,6 +680,7 @@ async def call(
             return _result(server.name, name, result, diagnostic_fields)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
+            _record_stage("handler", "incomplete")
             code = leaf.error.code
             reason = {
                 -32600: "Remote server rejected the request",
@@ -682,6 +712,7 @@ async def call(
         if reason is None:
             raise
         if sent:
+            _record_stage("handler", "incomplete")
             return fail(
                 "%s was sent to the %s MCP server but no answer came back (%s), so it "
                 "may or may not have happened; check before retrying. Invocation %s is blocked."
@@ -692,6 +723,7 @@ async def call(
             % (name, server.name, reason)
         )
     if stale_context:
+        _record_stage("policy", "rejected")
         action_store.outcome(invocation, "not_sent")
         return fail("remote write refused because its approved authority context changed")
     if invocation:

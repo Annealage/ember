@@ -1029,9 +1029,14 @@ class OmpSession:
         return self.model_profile_status
 
     def _start_profile_apply(self) -> None:
-        if (self._profile_pending is None or self._profile_task is not None
-                or self._running or self._closing or self._status != AGENT_READY
-                or self._compact_task is not None):
+        if (
+            self._profile_pending is None
+            or self._profile_task is not None
+            or self._running
+            or self._closing
+            or self._status != AGENT_READY
+            or self._compact_task is not None
+        ):
             return
         self._profile_task = asyncio.create_task(self._apply_pending_profile())
 
@@ -1041,44 +1046,70 @@ class OmpSession:
                 model, effort = self._profile_pending
                 self._profile_pending = None
                 try:
-                    if (not isinstance(model, str) or not model.strip()
-                            or not isinstance(effort, str) or not effort.strip()):
+                    if (
+                        not isinstance(model, str)
+                        or not model.strip()
+                        or not isinstance(effort, str)
+                        or not effort.strip()
+                    ):
                         raise ValueError("model and effort must be concrete non-empty strings")
                     if not self._base_url and ("/" not in model or not all(model.split("/", 1))):
                         raise ValueError("model must be a provider/model reference")
-                    provider, model_id = ((_provider_id(), model) if self._base_url
-                                          else model.split("/", 1))
+                    provider, model_id = (
+                        (_provider_id(), model) if self._base_url else model.split("/", 1)
+                    )
                     await self._run_blocking(self._client.set_model, provider, model_id)
                     await self._run_blocking(self._client.set_thinking_level, effort)
                     state = await self._run_blocking(self._client.get_state)
                     actual = getattr(state, "model", None)
-                    if (getattr(actual, "provider", None), getattr(actual, "id", None),
-                            getattr(state, "thinking_level", None)) != (provider, model_id, effort):
+                    if (
+                        getattr(actual, "provider", None),
+                        getattr(actual, "id", None),
+                        getattr(state, "thinking_level", None),
+                    ) != (provider, model_id, effort):
                         raise RuntimeError("OMP did not confirm the requested model and effort")
                     if self._closing or self._status != AGENT_READY:
                         raise RuntimeError("session closed while applying the model profile")
                     self._model, self._model_role, self._thinking = model, None, effort
                     if self.resolved_runtime:
                         self.resolved_runtime = {
-                            key: value for key, value in self.resolved_runtime.items()
+                            key: value
+                            for key, value in self.resolved_runtime.items()
                             if key not in ("requested_role", "resolved_role", "role_provenance")
                         }
-                    self._record_resolved_runtime(AgentRuntimeResolved(
-                        backend="omp", provider=provider, model=model_id,
-                        effort=effort, provenance="get_state",
-                    ))
+                    self._record_resolved_runtime(
+                        AgentRuntimeResolved(
+                            backend="omp",
+                            provider=provider,
+                            model=model_id,
+                            effort=effort,
+                            provenance="get_state",
+                        )
+                    )
                     self._emit(AgentModelChanged(model=model))
                 except Exception as exc:
                     self._profile_pending = None
-                    self._profile_status = {"status": "error", "error": str(exc) or type(exc).__name__}
-                    self._fail(exc, remediation="model settings could not be confirmed; reopen the session")
+                    self._profile_status = {
+                        "status": "error",
+                        "error": str(exc) or type(exc).__name__,
+                    }
+                    self._fail(
+                        exc, remediation="model settings could not be confirmed; reopen the session"
+                    )
                     return
                 if self._profile_pending is None:
                     self._profile_status = {"status": "applied"}
         finally:
             self._profile_task = None
-            if self._closing and self._profile_status and self._profile_status["status"] == "pending":
-                self._profile_status = {"status": "error", "error": "session closed before profile applied"}
+            if (
+                self._closing
+                and self._profile_status
+                and self._profile_status["status"] == "pending"
+            ):
+                self._profile_status = {
+                    "status": "error",
+                    "error": "session closed before profile applied",
+                }
             if not self._closing:
                 await self._send_next_queued()
 
@@ -1457,7 +1488,10 @@ class OmpSession:
         if self._compact_task is not None:
             self._compact_task.cancel()
         if self._profile_status and self._profile_status["status"] == "pending":
-            self._profile_status = {"status": "error", "error": "session closed before profile applied"}
+            self._profile_status = {
+                "status": "error",
+                "error": "session closed before profile applied",
+            }
             self._profile_pending = None
         if self._models_task is not None:
             self._models_task.cancel()
@@ -1590,8 +1624,29 @@ class OmpSession:
                 # end the turn: the task running this coroutine carries it.
                 _TOOL_CALL_ID.set(tool_call_id)
                 if write and self._broker is not None:
-                    decision = await self._broker.ask(name, dict(params), None)
+                    try:
+                        decision = await self._broker.ask(name, dict(params), None)
+                    except asyncio.CancelledError:
+                        record = getattr(handler, "_annealage_record_refusal", None)
+                        if record is not None:
+                            record(params, "cancelled")
+                        raise
+                    except BaseException:
+                        record = getattr(handler, "_annealage_record_refusal", None)
+                        if record is not None:
+                            record(params, "incomplete")
+                        raise
                     if not decision.allow:
+                        record = getattr(handler, "_annealage_record_refusal", None)
+                        if record is not None:
+                            record(
+                                params,
+                                "rejected",
+                                {
+                                    "isError": True,
+                                    "content": [{"type": "text", "text": decision.message}],
+                                },
+                            )
                         raise RuntimeError(decision.message)
                 return await handler(dict(params))
 
