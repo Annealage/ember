@@ -146,6 +146,10 @@ class ToolSet:
     passes to ``ToolServer``), ``grading`` the ``tools.Grading`` sorting every
     one of them, and ``grant`` the write-grade names pre-granted for this run.
     Built per call: the handlers close over the caller's per-run data.
+    ``remote`` contains the same RemoteServer declarations as ToolServer;
+    ``remote_snapshot`` may freeze their discovered definitions across runs.
+    ``remote_result_observer`` is the per-run awaited successful-read callback.
+    Remote writes are not granted by ``grant``.
 
     ``ValueError`` for a ``tools``/``grading`` pair ``ToolServer`` would refuse
     (a tool not graded, a graded name with no tool, a name in two grades, a
@@ -158,9 +162,13 @@ class ToolSet:
     tools: Tuple[Any, ...]
     grading: Grading
     grant: Tuple[str, ...] = ()
+    remote: Tuple[Any, ...] = ()
+    remote_snapshot: Any = None
+    remote_result_observer: Any = None
 
     def __post_init__(self):
         object.__setattr__(self, "tools", tuple(self.tools))
+        object.__setattr__(self, "remote", tuple(self.remote))
         grant = (self.grant,) if isinstance(self.grant, str) else self.grant
         object.__setattr__(self, "grant", tuple(grant))
         if not isinstance(self.grading, Grading):
@@ -1412,12 +1420,34 @@ async def run_prompt(
         if state.durable or work_timeout is not None or on_timeout is not None:
             run.recovery = recovery_info
         run.reserve_turn = state.reserve_turn
+        if tools.remote_result_observer is not None:
+
+            async def observe_remote(server_name, tool_name, args, result):
+                if run.over:
+                    raise RuntimeError("this run has ended")
+                await tools.remote_result_observer(server_name, tool_name, args, result)
+
+            bus.remote_result_observer = observe_remote
         server = ToolServer(
             [run.guard(t) for t in tools.tools],
             grading=tools.grading,
             bus=bus,
             paused_message=_PAUSED_MESSAGE,
+            remote=tools.remote,
+            remote_snapshot=tools.remote_snapshot,
+            remote_guard=run.guard,
         )
+        # OMP combines bare local names with <remote>__<tool> names. A
+        # collision could replace a granted local write under the broker name.
+        local_names = {tool.name for tool in tools.tools}
+        remote_names = {
+            remote.name + "__" + tool.name for remote in server.remotes for tool in remote.tools
+        }
+        if local_names & remote_names:
+            raise ValueError(
+                "local and remote host tool names collide: "
+                + ", ".join(sorted(local_names & remote_names))
+            )
         # Claude asks under ``mcp__<server>__<tool>``; omp's host-tool gate under the bare name.
         claude_grants = tuple(namespaced(server.name, g) for g in tools.grant)
         broker = HeadlessBroker(run.on_event, granted=tuple(tools.grant) + claude_grants)

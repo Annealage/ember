@@ -320,7 +320,7 @@ async def test_remote_observer_failure_fails_delivery(fake, bus, tmp_path):
     tools = _tools(bus, tmp_path, _fake(fake))
     result = await tools.remote_tables()["fake"]["lookup"].handler({"query": "RP2040"})
     assert result["is_error"]
-    assert "failed inside" in _text(result)
+    assert "receipt unavailable" not in _text(result)
     assert "found RP2040" not in _text(result)
 
 

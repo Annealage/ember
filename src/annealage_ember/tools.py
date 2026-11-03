@@ -857,6 +857,8 @@ class ToolServer:
         bus,
         paused_message,
         remote=(),
+        remote_snapshot=None,
+        remote_guard=None,
         request_guard=None,
         never_remembered=(),
     ):
@@ -914,21 +916,27 @@ class ToolServer:
         self.unreached = ()
         self.remote_servers = {server.name: server for server in remote}
         self._bus = bus
+        self._remote_snapshot = remote_snapshot
+        self._remote_guard = remote_guard
         self._paused_message = paused_message
-        if remote:
-            # Imported only here: a product with no remote server never loads
-            # the MCP client it connects with.
+        if remote or remote_snapshot is not None:
+            # The same discovery and binding path serves interactive and headless.
             from .remote import connect
 
             self.remotes, self.unreached = connect(
-                remote, product_server=self.name, bus=bus, paused_message=paused_message
+                remote,
+                product_server=self.name,
+                bus=bus,
+                paused_message=paused_message,
+                snapshot=remote_snapshot,
+                guard=remote_guard,
             )
 
     async def reconnect(self):
         """Try every remote in ``self.unreached`` again, off the event loop;
         move those reached now to ``self.remotes`` and return them (an empty
         tuple when none was reached, or none was missing)."""
-        if not self.unreached:
+        if self._remote_snapshot is not None or not self.unreached:
             return ()
         from .remote import connect
 
@@ -942,6 +950,7 @@ class ToolServer:
                 bus=self._bus,
                 paused_message=self._paused_message,
                 retry=True,
+                guard=self._remote_guard,
             ),
         )
         self.remotes += reached

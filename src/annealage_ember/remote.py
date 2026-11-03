@@ -66,6 +66,9 @@ because a remote's own advice on using its tools is what they are for.
 
 import asyncio
 import contextlib
+import copy
+import dataclasses
+import hashlib
 import json
 import re
 import sys
@@ -125,38 +128,97 @@ class RemoteServer(
     __slots__ = ()
 
 
-#: A remote this session reached at startup: its name, its grading narrowed
-#: to the tools it listed, those tools (``tools._wrap``-gated proxies), its
-#: in-process SDK server for Claude, and its ``initialize`` instructions.
-Connected = namedtuple("Connected", "name grading tools server instructions")
+@dataclasses.dataclass(frozen=True)
+class RemoteTool:
+    """Immutable discovered tool metadata; schema access returns a fresh value."""
+
+    name: str
+    description: str
+    schema_json: str
+
+    @property
+    def input_schema(self):
+        return json.loads(self.schema_json)
 
 
-def connect(servers, *, product_server, bus, paused_message, retry=False):
-    """``(connected, unreached)``: the ``Connected`` remotes of ``servers``,
-    in order, and the ``RemoteServer``s that could not be reached. Refuses,
-    before connecting to anything, a remote named like ``product_server``, two
-    remotes with one name, a name no backend can carry, a grading naming a
-    tool twice, or a tool both graded and excluded.
+@dataclasses.dataclass(frozen=True)
+class RemoteDefinition:
+    name: str
+    grading: Grading
+    tools: tuple
+    instructions: str | None
 
-    ``retry`` is a second attempt at remotes already reported unreachable
-    (``ToolServer.reconnect``): one still unreachable is not reported again,
-    and one reached now is."""
+
+@dataclasses.dataclass(frozen=True)
+class RemoteSnapshot:
+    """Unbound, immutable discovery metadata, suitable for sharing between runs."""
+
+    servers: tuple
+    unreached: tuple
+    _declarations_digest: str
+
+    @property
+    def digest(self):
+        """Identify the permitted frozen interface, independently of its binding."""
+        definitions = [
+            {
+                "name": server.name,
+                "grading": server.grading,
+                "instructions": server.instructions,
+                "tools": [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "schema": tool.input_schema,
+                    }
+                    for tool in server.tools
+                ],
+            }
+            for server in self.servers
+        ]
+        encoded = json.dumps(
+            definitions, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def available(self, server, tool):
+        """Whether a permitted, valid tool was discovered for this server."""
+        return any(
+            definition.name == server and any(item.name == tool for item in definition.tools)
+            for definition in self.servers
+        )
+
+
+def _declarations_digest(servers):
+    # The snapshot must not retain URLs, credentials, or mutable declarations.
+    return hashlib.sha256(repr(tuple(servers)).encode()).hexdigest()
+
+
+def discover(servers, *, product_server=None, _retry=False):
+    """Discover and freeze permitted remote definitions, without binding handlers.
+
+    ``unreached`` contains server names, including servers with invalid schemas.
+    Check ``available`` for required tools before dispatching a model. A new call
+    discovers anew; a snapshot never refreshes or reconnects on its own.
+    """
+    servers = tuple(servers)
+    if product_server is None:
+        product_server = product.current().mcp_server_name
     _check(servers, product_server)
     listings = _discover(servers)
-    version = product.current().version
-    connected = []
+    definitions = []
     unreached = []
     for server, listing in zip(servers, listings, strict=True):
         if isinstance(listing, BaseException):
-            unreached.append(server)
-            if not retry:
+            unreached.append(server.name)
+            if not _retry:
                 _warn(
                     "the %s MCP server could not be reached (%s), so this session starts "
                     "without its tools; it is tried again while the session runs"
                     % (server.name, _reason(listing, DISCOVERY_TIMEOUT) or repr(_leaf(listing)))
                 )
             continue
-        if retry:
+        if _retry:
             _warn("the %s MCP server, unreachable until now, has been reached" % server.name)
         instructions, listed = listing
         listed = {tool.name: tool for tool in listed}
@@ -171,6 +233,7 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
                 if getattr(annotations, "read_only_hint", None) is True and (
                     name not in product_only
                     and name not in denied
+                    and name not in server.excluded
                     and name not in explicit_view
                     and name not in explicit_write
                 ):
@@ -211,23 +274,73 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
             ),
             tuple(n for n in server.grading.write if n in listed and n not in denied),
         )
-        gated = set(grading.pause_gated)
         try:
-            tools = tuple(
-                _wrap(
-                    _proxied(server._replace(grading=grading), listed[name], bus),
-                    bus=bus,
-                    gated=name in gated,
-                    paused_message=paused_message,
-                    hosted_key=namespaced(server.name, name),
+            tools = []
+            for name in grading.read + grading.view + grading.write:
+                tool = listed[name]
+                schema = tool.input_schema
+                if not isinstance(schema, dict) or schema.get("type") != "object":
+                    raise ValueError("remote tool input schema must declare an object")
+                _compile_schema(schema)
+                description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
+                    name,
+                    server.name,
                 )
-                for name in grading.read + grading.view + grading.write
-            )
+                tools.append(RemoteTool(name, description, json.dumps(schema, allow_nan=False)))
         except Exception as exc:
-            _warn("the %s MCP server has an unsupported or invalid tool schema (%s); "
-                  "its tools are unavailable" % (server.name, type(exc).__name__))
-            unreached.append(server)
+            _warn(
+                "the %s MCP server has an unsupported or invalid tool schema (%s); "
+                "its tools are unavailable" % (server.name, type(exc).__name__)
+            )
+            unreached.append(server.name)
             continue
+        definitions.append(
+            RemoteDefinition(
+                server.name, grading, tuple(tools), (instructions or "").strip() or None
+            )
+        )
+    return RemoteSnapshot(tuple(definitions), tuple(unreached), _declarations_digest(servers))
+
+
+# A Connected is bound to a particular bus and must never be shared across runs.
+Connected = namedtuple("Connected", "name grading tools server instructions")
+
+
+def connect(
+    servers, *, product_server, bus, paused_message, retry=False, snapshot=None, guard=None
+):
+    """Bind per-session proxies from a snapshot, or discover interactively."""
+    servers = tuple(servers)
+    _check(servers, product_server)
+    if snapshot is None:
+        snapshot = discover(servers, product_server=product_server, _retry=retry)
+    if not isinstance(snapshot, RemoteSnapshot) or (
+        snapshot._declarations_digest != _declarations_digest(servers)
+    ):
+        raise ValueError("remote snapshot does not match the declared remotes")
+    by_name = {server.name: server for server in servers}
+    version = product.current().version
+    connected = []
+    for definition in snapshot.servers:
+        server = by_name[definition.name]
+        grading = definition.grading
+        gated = set(grading.pause_gated)
+        tools = []
+        for tool in definition.tools:
+            proxy = _proxied(server._replace(grading=grading), tool, bus)
+            if guard is not None:
+                proxy = guard(proxy)
+            tools.append(
+                _wrap(
+                    proxy,
+                    bus=bus,
+                    gated=tool.name in gated,
+                    paused_message=paused_message,
+                    hosted_key=namespaced(server.name, tool.name),
+                    trusted_schema=False,
+                )
+            )
+        tools = tuple(tools)
         connected.append(
             Connected(
                 name=server.name,
@@ -236,10 +349,10 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
                 server=_attach_sdk_diagnostics(
                     create_sdk_mcp_server(server.name, version=version, tools=list(tools)), tools
                 ),
-                instructions=(instructions or "").strip() or None,
+                instructions=definition.instructions,
             )
         )
-    return tuple(connected), tuple(unreached)
+    return tuple(connected), tuple(by_name[name] for name in snapshot.unreached)
 
 
 def _check(servers, product_server):
@@ -441,7 +554,12 @@ def _proxied(server, tool, bus=None):
         )
         observer = getattr(bus, "remote_result_observer", None)
         if name in server.grading.read and not result.get("is_error") and observer is not None:
-            await observer(server.name, name, args, result)
+            try:
+                # The receipt is informational: it cannot alter the delivered
+                # result or the caller's arguments, even through nested values.
+                await observer(server.name, name, copy.deepcopy(args), copy.deepcopy(result))
+            except Exception:
+                return fail("remote result observation failed")
         return result
 
     return SdkMcpTool(name=name, description=description, input_schema=schema, handler=handler)
@@ -657,9 +775,18 @@ def _result(server_name, tool_name, result, diagnostic_fields=()):
         issues, truncated = _remote_issues(result, diagnostic_fields)
         return fail(
             "The remote MCP tool reported failure; its outcome may be uncertain.",
-            diagnostic={"code": "remote_failure", "truncated": truncated,
-                        "issues": issues or [{"location": [], "code": "remote_error",
-                                              "message": "Remote tool reported an error"}]},
+            diagnostic={
+                "code": "remote_failure",
+                "truncated": truncated,
+                "issues": issues
+                or [
+                    {
+                        "location": [],
+                        "code": "remote_error",
+                        "message": "Remote tool reported an error",
+                    }
+                ],
+            },
         )
     content = []
     omitted = []

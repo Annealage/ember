@@ -601,6 +601,44 @@ result: RunResult = await run_prompt(
 
 `ToolSet` is built per call (handlers close over your per-run data) and checked like a product's tool server. A tool marked `asks_the_human` is refused, since there is nobody to ask. Grading decides everything: read and view tools are pre-allowed, and a write-grade tool is refused with a reason the model reads unless its name is in `grant`, which holds for this run only and is never remembered. On Claude the session has no built-in tools (no Bash or Write), loads no settings files, runs no sandbox and passes `--no-session-persistence`, so the conversation is not written under `~/.claude/projects`; on omp every built-in is already off. A product must be installed, as for a tool server.
 
+Headless runs can use the same discovered MCP proxies as interactive sessions.
+Declare `remote.RemoteServer` instances with their normal grading and exclusion
+policy, then discover once before constructing any shared prompt:
+
+```python
+from annealage_ember.remote import discover
+
+snapshot = discover(remotes)  # product.install() must already have been called
+if not snapshot.available("datum", "search_parts"):
+    raise RuntimeError("required remote tool is unavailable")
+
+# Build one ToolSet per attempt; observe_read is that attempt's async callback.
+tool_set = ToolSet(
+    tools=local_tools, grading=local_grading, remote=remotes,
+    remote_snapshot=snapshot, remote_result_observer=observe_read,
+)
+```
+
+`snapshot.servers` contains immutable server definitions in discovery order,
+with their effective `grading`, `instructions` and `tools`. Each tool has
+`name`, `description`, `schema_json` and an `input_schema` property returning
+a fresh dictionary. `snapshot.unreached` contains the names of unavailable
+servers, including servers whose schemas cannot be safely published.
+`available(server, tool)` checks the effective policy as well as discovery;
+inspect the definition's grading if a particular grade is required. The
+metadata is not evidence that a tool was read. Derive any execution identity
+from these definitions rather than maintaining a separate schema copy.
+
+The callback receives `(server_name, tool_name, arguments, result)`, is awaited
+only for a successful read, and cannot replace the result. Give each attempt
+its own callback and state. Each run binds fresh guarded handlers and bus;
+the snapshot holds neither those bindings nor credentials. A supplied snapshot
+must match the original remote declarations and freezes the tool set, including
+unavailable servers, for that run: it does not reconnect. Call `discover` again
+for a new run to pick up changed definitions. Without a snapshot the normal
+interactive discovery and optional reconnect policy remains in effect. Remote
+write grades are not headless grants; `grant` covers local tools only.
+
 `system_mode="replace"` (OMP only, and `system` must be non-empty) sends `system` as omp's `--system-prompt` instead of appending it. The text goes in a 0600 file inside a private 0700 temporary directory and omp is given the path, so a long `system` (frozen reference material, say) stays under the kernel's limit on one argument and out of the process list; the model reads exactly the text, not the path, and the session removes the file when it closes. omp renders that text, plus the note naming any renamed tools, into the leading static block of its system prompt and keeps the working directory and context files in the trailing project block. An appended `system` lands inside that trailing block, after the working directory, so a run with a per-process scratch directory never shares a prefix with another. That makes replace the way to give a provider's prefix cache a stable start. It changes the prompt text only: the tools, approvals and extension loading are as for append. omp's own tool guidance is no longer in the prompt, so `system` has to cover how the run should behave. It never reaches the Claude backend, which refuses it.
 
 Headless `thinking` accepts `low`, `medium` and `high` on either backend, plus
