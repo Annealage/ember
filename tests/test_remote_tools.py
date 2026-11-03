@@ -15,6 +15,7 @@ The toy product's tool server is built with the fake as its remote
 
 import asyncio
 import contextlib
+import copy
 import json
 import socket
 import threading
@@ -103,6 +104,7 @@ class FakeRemote:
             name, arguments = params.name, params.arguments or {}
             self.calls.append(name)
             self.arguments.append((name, arguments))
+            structured = None
             if name == "submit":
                 content = [types.TextContent(type="text", text="job 123")]
             elif name == "begin":
@@ -110,6 +112,7 @@ class FakeRemote:
                 content = [types.TextContent(type="text", text="welcome")]
             elif name == "lookup":
                 content = [types.TextContent(type="text", text="found %s" % arguments["query"])]
+                structured = {"result": {"query": arguments["query"], "frozen": True}}
             elif name == "picture":
                 content = [
                     types.TextContent(type="text", text="a part"),
@@ -131,7 +134,7 @@ class FakeRemote:
                 if arguments["text"] == "uncertain":
                     await anyio.sleep(2)
                 return types.CallToolResult(content=[types.TextContent(type="text", text="stored")])
-            return types.CallToolResult(content=content)
+            return types.CallToolResult(content=content, structured_content=structured)
 
         server = Server(
             "fake", instructions=INSTRUCTIONS, on_list_tools=list_tools, on_call_tool=call_tool
@@ -308,6 +311,182 @@ async def test_remote_observer_skips_errors_and_non_reads(fake, bus, tmp_path):
     fake.stop()
     assert (await table["lookup"].handler({"query": "RP2040"}))["is_error"]
     assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_projector_replaces_a_read_before_the_observer_and_sees_raw_structure(
+    fake, bus, tmp_path
+):
+    seen, observed = [], []
+
+    async def projector(server_name, tool_name, args, raw):
+        seen.append((server_name, tool_name, copy.deepcopy(args), copy.deepcopy(raw)))
+        # Neither the call's arguments nor the raw view can be reached through this.
+        args["query"] = "tampered"
+        raw["content"][0]["text"] = "tampered"
+        return [
+            {"type": "text", "text": "frozen %s" % raw["structured_content"]["result"]["query"]}
+        ]
+
+    async def observer(server_name, tool_name, args, result):
+        observed.append((args, result))
+
+    bus.remote_result_projector = projector
+    bus.remote_result_observer = observer
+    tools = _tools(bus, tmp_path, _fake(fake))
+    result = await tools.remote_tables()["fake"]["lookup"].handler({"query": "RP2040"})
+    assert result == {"content": [{"type": "text", "text": "frozen RP2040"}]}
+    assert seen == [
+        (
+            "fake",
+            "lookup",
+            {"query": "RP2040"},
+            {
+                "content": [{"type": "text", "text": "found RP2040"}],
+                "structured_content": {"result": {"query": "RP2040", "frozen": True}},
+                "is_error": False,
+            },
+        )
+    ]
+    # The receipt describes what the model receives, and the call that went
+    # upstream carried the original arguments.
+    assert observed == [({"query": "RP2040"}, result)]
+    assert fake.arguments[-1] == ("lookup", {"query": "RP2040"})
+
+
+@pytest.mark.asyncio
+async def test_a_projector_returning_none_leaves_delivery_unchanged(fake, bus, tmp_path):
+    plain = (
+        await _tools(bus, tmp_path, _fake(fake))
+        .remote_tables()["fake"]["lookup"]
+        .handler({"query": "RP2040"})
+    )
+
+    async def projector(*values):
+        return None
+
+    bus.remote_result_projector = projector
+    kept = (
+        await _tools(bus, tmp_path, _fake(fake))
+        .remote_tables()["fake"]["lookup"]
+        .handler({"query": "RP2040"})
+    )
+    assert kept == plain == {"content": [{"type": "text", "text": "found RP2040"}]}
+
+
+@pytest.mark.asyncio
+async def test_projector_is_skipped_for_errors_writes_and_unreachable_remotes(fake, bus, tmp_path):
+    asked = []
+
+    async def projector(*values):
+        asked.append(values)
+        return [{"type": "text", "text": "projected"}]
+
+    bus.remote_result_projector = projector
+    tools = _tools(bus, tmp_path, _fake(fake))
+    table = tools.remote_tables()["fake"]
+    assert (await table["broken"].handler({}))["is_error"]
+    assert _text(await table["store"].handler({"text": "note"})) == "stored"
+    fake.stop()
+    assert (await table["lookup"].handler({"query": "RP2040"}))["is_error"]
+    assert asked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned",
+    [
+        "raise",
+        "text",
+        [],
+        [{"type": "text"}],
+        [{"type": "text", "text": 5}],
+        [{"type": "text", "text": "ok", "extra": 1}],
+        [{"type": "image", "data": "x"}],
+        [{"type": "resource", "text": "x"}],
+        ["text"],
+        [{"type": "text", "text": "x"}] * 65,
+        [{"type": "text", "text": "x" * (4 * 1024 * 1024 + 1)}],
+    ],
+)
+async def test_a_failed_or_invalid_projection_delivers_nothing(fake, bus, tmp_path, returned):
+    observed = []
+
+    async def projector(*values):
+        if returned == "raise":
+            raise RuntimeError("projector-secret")
+        return returned
+
+    async def observer(*values):
+        observed.append(values)
+
+    bus.remote_result_projector = projector
+    bus.remote_result_observer = observer
+    result = (
+        await _tools(bus, tmp_path, _fake(fake))
+        .remote_tables()["fake"]["lookup"]
+        .handler({"query": "RP2040"})
+    )
+    assert result["is_error"]
+    assert _text(result) == "remote result projection failed"
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_projection_propagates_and_delivers_nothing(fake, bus, tmp_path):
+    entered, observed = asyncio.Event(), []
+
+    async def projector(*values):
+        entered.set()
+        await asyncio.sleep(30)
+
+    async def observer(*values):
+        observed.append(values)
+
+    bus.remote_result_projector = projector
+    bus.remote_result_observer = observer
+    handler = _tools(bus, tmp_path, _fake(fake)).remote_tables()["fake"]["lookup"].handler
+    pending = asyncio.create_task(handler({"query": "RP2040"}))
+    await asyncio.wait_for(entered.wait(), 5)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_the_projection_reaches_each_backend_path_identically(
+    fake, bus, tmp_path, monkeypatch
+):
+    async def projector(server_name, tool_name, args, raw):
+        return [
+            {"type": "text", "text": "frozen %s" % raw["structured_content"]["result"]["query"]}
+        ]
+
+    bus.remote_result_projector = projector
+    tools = _tools(bus, tmp_path, _fake(fake))
+
+    claude = _session("claude", tools, tmp_path)._build_options().mcp_servers["fake"]["instance"]
+    async with mcp_client(claude) as client:
+        called = await client.call_tool("lookup", {"query": "RP2040"})
+    assert [block.text for block in called.content] == ["frozen RP2040"]
+
+    async def current_broker():
+        return CountingBroker(None)
+
+    app = Microdot()
+    register_mcp_routes(app, tools=tools, current_broker=current_broker, agent_token=TOKEN)
+    res = await make_test_client(app).post(
+        "/mcp/fake?t=%s" % TOKEN,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(
+            {"method": "tools/call", "params": {"name": "lookup", "arguments": {"query": "RP2040"}}}
+        ),
+    )
+    assert json.loads(res.body)["result"]["content"] == [{"type": "text", "text": "frozen RP2040"}]
+
+    omp = await tools.host_tool_table()["fake__lookup"].handler({"query": "RP2040"})
+    assert omp == {"content": [{"type": "text", "text": "frozen RP2040"}]}
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,21 @@ do. Everything a remote returns is untrusted input, like any tool result:
 nothing here reads it as an instruction. A remote's ``initialize``
 instructions are passed to the model (``ToolServer.remote_instructions``),
 because a remote's own advice on using its tools is what they are for.
+
+**Projecting a result before delivery.** A bus may carry an async
+``remote_result_projector(server_name, tool_name, args, raw)`` that replaces the
+content a model receives from a successful read-grade call. ``raw`` is a copy of
+``{"content", "structured_content", "is_error"}`` where ``content`` is what
+would have been delivered and ``structured_content`` is the server's own
+structured result, which ``_result`` otherwise reads only when there is no
+content. It returns replacement text/image blocks, or ``None`` to deliver the
+usual content. The projection runs before ``remote_result_observer``, so the
+observer receives, and a receipt describes, exactly what the model gets. Writes,
+view-grade calls and failed results never reach it. An exception, an invalid
+return (anything but 1 to ``PROJECTION_MAX_BLOCKS`` text or image blocks within
+``PROJECTION_MAX_BYTES``) or a cancelled run delivers nothing: the call fails
+with a fixed message, stage ``projection``, and the projector's own error text
+never reaches the model. Without a projector delivery is unchanged.
 """
 
 import asyncio
@@ -102,6 +117,11 @@ DISCOVERY_TIMEOUT = 10.0
 #: How long one proxied call may take, connecting included. The Codex stdio
 #: bridge sets no read timeout of its own, so this is what bounds it.
 CALL_TIMEOUT = 60.0
+
+#: What a ``remote_result_projector`` may return: at most this many content
+#: blocks, and at most this many UTF-8 bytes of text and image data together.
+PROJECTION_MAX_BLOCKS = 64
+PROJECTION_MAX_BYTES = 4 * 1024 * 1024
 
 # A remote's name is its server namespace on every backend: a TOML bare key
 # in Codex's ``mcp_servers.<name>`` override, a path segment of ``/mcp/<name>``
@@ -560,6 +580,13 @@ def _proxied(server, tool, bus=None):
                     return fail(
                         "remote write refused: its approved source context is unavailable or invalid"
                     )
+        projector = getattr(bus, "remote_result_projector", None)
+        project = None
+        if name in server.grading.read and projector is not None:
+
+            def project(raw):
+                return projector(server.name, name, copy.deepcopy(args), raw)
+
         result = await call(
             server,
             name,
@@ -573,6 +600,7 @@ def _proxied(server, tool, bus=None):
             expected_context=expected_context,
             context_callback=getattr(bus, "remote_action_context", None),
             diagnostic_fields=diagnostic_fields,
+            projector=project,
         )
         observer = getattr(bus, "remote_result_observer", None)
         if name in server.grading.read and not result.get("is_error") and observer is not None:
@@ -603,6 +631,7 @@ async def call(
     allowed_reads=(),
     allowed_writes=(),
     diagnostic_fields=(),
+    projector=None,
     timeout=None,  # noqa: ASYNC109
 ):
     """Call a remote tool, enforcing its read policy and recording writes."""
@@ -677,7 +706,7 @@ async def call(
                 action_store.outcome(
                     invocation, "uncertain" if result.is_error else "reported_result"
                 )
-            return _result(server.name, name, result, diagnostic_fields)
+            return await _delivered(server, name, result, diagnostic_fields, projector)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
             _record_stage("handler", "incomplete")
@@ -728,7 +757,51 @@ async def call(
         return fail("remote write refused because its approved authority context changed")
     if invocation:
         action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
-    return _result(server.name, name, result, diagnostic_fields)
+    return await _delivered(server, name, result, diagnostic_fields, projector)
+
+
+def _projection_blocks(blocks):
+    """The validated, copied content a projector returned, or ``ValueError``."""
+    if not isinstance(blocks, list) or not 1 <= len(blocks) <= PROJECTION_MAX_BLOCKS:
+        raise ValueError("projection must be a bounded non-empty list")
+    content, size = [], 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise ValueError("projection block must be an object")
+        if block.get("type") == "text" and set(block) == {"type", "text"}:
+            fields = ("text",)
+        elif block.get("type") == "image" and set(block) == {"type", "data", "mimeType"}:
+            fields = ("data", "mimeType")
+        else:
+            raise ValueError("projection block must be exact text or image content")
+        for field in fields:
+            if not isinstance(block[field], str):
+                raise ValueError("projection block fields must be strings")
+            size += len(block[field].encode("utf-8"))
+        content.append({key: block[key] for key in block})
+    if size > PROJECTION_MAX_BYTES:
+        raise ValueError("projection is too large")
+    return content
+
+
+async def _delivered(server, name, result, diagnostic_fields, projector):
+    """``_result``, with a successful read's content replaced by ``projector``'s."""
+    delivered = _result(server.name, name, result, diagnostic_fields)
+    if projector is None or result.is_error:
+        return delivered
+    raw = {
+        "content": copy.deepcopy(delivered["content"]),
+        "structured_content": copy.deepcopy(result.structured_content),
+        "is_error": False,
+    }
+    try:
+        blocks = await projector(raw)
+        if blocks is None:
+            return delivered
+        return {"content": _projection_blocks(blocks)}
+    except Exception:
+        _record_stage("projection", "failure")
+        return fail("remote result projection failed")
 
 
 _REMOTE_ISSUES = {

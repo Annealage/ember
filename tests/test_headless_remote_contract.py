@@ -206,6 +206,42 @@ async def test_observer_mutation_cannot_change_delivered_result(upstream, monkey
     assert upstream.calls.count("lookup") == 1
 
 
+async def test_projector_output_is_what_the_model_and_the_observer_get(
+    upstream, monkeypatch, tmp_path
+):
+    server = declaration(upstream)
+    snapshot = remote.discover((server,))
+    args = {"query": {"part": "RP2040"}}
+    projected, receipts, delivered = [], [], []
+
+    async def projector(server_name, tool_name, call_args, raw):
+        projected.append((server_name, tool_name, call_args, raw["structured_content"]))
+        return [{"type": "text", "text": "frozen"}]
+
+    async def observer(*event):
+        receipts.append(event)
+
+    async def script(session):
+        handler = built.kwargs["server"].remote_tables()["fake"]["lookup"].handler
+        delivered.append(await handler(args))
+        await finish(session)
+
+    built = script_session(monkeypatch, script)
+    tools = ToolSet(
+        tools=(),
+        grading=Grading((), (), ()),
+        remote=(server,),
+        remote_snapshot=snapshot,
+        remote_result_observer=observer,
+        remote_result_projector=projector,
+    )
+    result = await run_prompt("go", **make_args(tmp_path, tools=tools))
+    assert result.error is None
+    assert delivered == [{"content": [{"type": "text", "text": "frozen"}]}]
+    assert receipts == [("fake", "lookup", args, delivered[0])]
+    assert [entry[:3] for entry in projected] == [("fake", "lookup", args)]
+
+
 @pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
 async def test_observer_failure_fails_delivery(
     upstream, monkeypatch, tmp_path, caplog, capsys, error_type

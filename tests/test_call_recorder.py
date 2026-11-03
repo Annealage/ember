@@ -147,6 +147,39 @@ async def test_remote_discovery_read_and_observer_denial():
         remote.stop()
 
 
+async def test_remote_projection_failure_is_recorded_and_delivers_nothing():
+    remote = FakeRemote()
+    events, observations = [], []
+
+    async def projector(server, name, args, raw):
+        if args["query"] == "fail-private":
+            raise RuntimeError("projector-private")
+        return [{"type": "text", "text": "projected"}]
+
+    async def observer(*values):
+        observations.append(values)
+
+    async def handler(args):
+        return ok({})
+
+    try:
+        bus = SimpleNamespace(
+            paused=False, remote_result_projector=projector, remote_result_observer=observer
+        )
+        server = local(handler, events.append, bus=bus, remote=(_fake(remote),))
+        invoke = server.remote_tables()["fake"]["lookup"].handler
+        accepted = await invoke({"query": "read-private"})
+        failed = await invoke({"query": "fail-private"})
+        assert accepted == {"content": [{"type": "text", "text": "projected"}]}
+        assert failed["is_error"]
+        assert len(observations) == 1
+        assert_event(events[0], "fake", "lookup", "success", "handler")
+        assert_event(events[1], "fake", "lookup", "failure", "projection")
+        assert_redacted(events, "read-private", "fail-private", "projector-private")
+    finally:
+        remote.stop()
+
+
 async def test_handler_exception_and_cancellation_are_terminal_and_not_success():
     events = []
     entered = asyncio.Event()

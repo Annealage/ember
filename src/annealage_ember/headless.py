@@ -149,6 +149,8 @@ class ToolSet:
     ``remote`` contains the same RemoteServer declarations as ToolServer;
     ``remote_snapshot`` may freeze their discovered definitions across runs.
     ``remote_result_observer`` is the per-run awaited successful-read callback.
+    ``remote_result_projector`` is the per-run awaited callback that replaces a
+    successful read's content before the observer sees it (``remote.py``).
     ``call_recorder`` is the same optional terminal call hook as ToolServer.
     Remote writes are not granted by ``grant``.
 
@@ -166,6 +168,7 @@ class ToolSet:
     remote: Tuple[Any, ...] = ()
     remote_snapshot: Any = None
     remote_result_observer: Any = None
+    remote_result_projector: Any = None
     call_recorder: Any = None
 
     def __post_init__(self):
@@ -1422,6 +1425,14 @@ async def run_prompt(
         if state.durable or work_timeout is not None or on_timeout is not None:
             run.recovery = recovery_info
         run.reserve_turn = state.reserve_turn
+        if tools.remote_result_projector is not None:
+
+            async def project_remote(server_name, tool_name, args, raw):
+                if run.over:
+                    raise RuntimeError("this run has ended")
+                return await tools.remote_result_projector(server_name, tool_name, args, raw)
+
+            bus.remote_result_projector = project_remote
         if tools.remote_result_observer is not None:
 
             async def observe_remote(server_name, tool_name, args, result):
