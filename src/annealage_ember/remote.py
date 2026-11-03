@@ -81,7 +81,7 @@ from mcp import ClientSession, MCPError
 from mcp.client.streamable_http import streamable_http_client
 
 from . import product, remote_actions
-from .tools import Grading, _wrap, fail, namespaced
+from .tools import Grading, _attach_sdk_diagnostics, _compile_schema, _wrap, fail, namespaced
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
 #: may take together for one remote at startup. Remotes are reached
@@ -212,22 +212,30 @@ def connect(servers, *, product_server, bus, paused_message, retry=False):
             tuple(n for n in server.grading.write if n in listed and n not in denied),
         )
         gated = set(grading.pause_gated)
-        tools = tuple(
-            _wrap(
-                _proxied(server._replace(grading=grading), listed[name], bus),
-                bus=bus,
-                gated=name in gated,
-                paused_message=paused_message,
-                hosted_key=namespaced(server.name, name),
+        try:
+            tools = tuple(
+                _wrap(
+                    _proxied(server._replace(grading=grading), listed[name], bus),
+                    bus=bus,
+                    gated=name in gated,
+                    paused_message=paused_message,
+                    hosted_key=namespaced(server.name, name),
+                )
+                for name in grading.read + grading.view + grading.write
             )
-            for name in grading.read + grading.view + grading.write
-        )
+        except Exception as exc:
+            _warn("the %s MCP server has an unsupported or invalid tool schema (%s); "
+                  "its tools are unavailable" % (server.name, type(exc).__name__))
+            unreached.append(server)
+            continue
         connected.append(
             Connected(
                 name=server.name,
                 grading=grading,
                 tools=tools,
-                server=create_sdk_mcp_server(server.name, version=version, tools=list(tools)),
+                server=_attach_sdk_diagnostics(
+                    create_sdk_mcp_server(server.name, version=version, tools=list(tools)), tools
+                ),
                 instructions=(instructions or "").strip() or None,
             )
         )
@@ -358,9 +366,10 @@ def _reason(exc, timeout):
     if isinstance(leaf, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
         return "HTTP %d" % leaf.response.status_code
     if isinstance(leaf, MCPError):
-        return "it answered with an error: %s" % leaf.error.message
+        code = leaf.error.code
+        return "MCP protocol error %s" % (code if type(code) is int else "unknown")
     if isinstance(leaf, (httpx.TransportError, httpx2.TransportError, OSError)):
-        return "%s: %s" % (type(leaf).__name__, leaf) if str(leaf) else type(leaf).__name__
+        return type(leaf).__name__
     return None
 
 
@@ -384,18 +393,18 @@ def _read_context(callback, *args):
 def _proxied(server, tool, bus=None):
     """An unwrapped ``SdkMcpTool`` calling ``tool`` on ``server``.
 
-    Its schema is the remote's own, given an explicit ``properties`` so that
-    both the SDK and ``tools._tool_json_schema`` pass it on unchanged rather
-    than reading it as the ``{param: type}`` shorthand. omp refuses a tool
-    with no description, so one without gets a plain one.
+    The discovered schema is authoritative and is never filled in or weakened.
+    omp requires a description, so a missing description gets a plain one.
     """
-    schema = dict(tool.input_schema or {})
-    schema.setdefault("type", "object")
-    schema.setdefault("properties", {})
+    schema = tool.input_schema
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("remote tool input schema must declare an object")
     description = (tool.description or "").strip() or "%s, on the %s MCP server" % (
         tool.name,
         server.name,
     )
+    # Only schema-declared names can be exposed as upstream error locations.
+    _, diagnostic_fields = _compile_schema(schema)
     name = tool.name
 
     async def handler(args):
@@ -428,6 +437,7 @@ def _proxied(server, tool, bus=None):
             context=context,
             expected_context=expected_context,
             context_callback=getattr(bus, "remote_action_context", None),
+            diagnostic_fields=diagnostic_fields,
         )
         observer = getattr(bus, "remote_result_observer", None)
         if name in server.grading.read and not result.get("is_error") and observer is not None:
@@ -451,6 +461,7 @@ async def call(
     context_callback=None,
     allowed_reads=(),
     allowed_writes=(),
+    diagnostic_fields=(),
     timeout=None,  # noqa: ASYNC109
 ):
     """Call a remote tool, enforcing its read policy and recording writes."""
@@ -519,11 +530,35 @@ async def call(
                 action_store.outcome(
                     invocation, "uncertain" if result.is_error else "reported_result"
                 )
-            return _result(server.name, name, result)
+            return _result(server.name, name, result, diagnostic_fields)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
+            code = leaf.error.code
+            reason = {
+                -32600: "Remote server rejected the request",
+                -32601: "Remote method was not found",
+                -32602: "Remote server rejected the parameters",
+                -32603: "Remote server reported an internal error",
+            }.get(code, "Remote protocol refusal")
+            issues, truncated = (
+                _remote_issues(None, diagnostic_fields, data=leaf.error.data)
+                if code == -32602
+                else ([], 0)
+            )
             return fail(
-                "the %s MCP server refused %s: %s" % (server.name, name, leaf.error.message)
+                "The remote MCP server refused the call; its outcome may be uncertain.",
+                diagnostic={
+                    "code": "remote_refusal",
+                    "truncated": truncated,
+                    "issues": [
+                        {
+                            "location": [],
+                            "code": str(code) if type(code) is int else "mcp_error",
+                            "message": reason,
+                        }
+                    ]
+                    + issues,
+                },
             )
         reason = _reason(leaf, timeout)
         if reason is None:
@@ -543,10 +578,89 @@ async def call(
         return fail("remote write refused because its approved authority context changed")
     if invocation:
         action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
-    return _result(server.name, name, result)
+    return _result(server.name, name, result, diagnostic_fields)
 
 
-def _result(server_name, tool_name, result):
+_REMOTE_ISSUES = {
+    "required": "A required field is missing",
+    "missing": "A required field is missing",
+    "type": "A field has the wrong type",
+    "string_type": "Expected a string",
+    "int_type": "Expected an integer",
+    "int_parsing": "Expected an integer",
+    "float_type": "Expected a number",
+    "float_parsing": "Expected a number",
+    "bool_type": "Expected a boolean",
+    "list_type": "Expected an array",
+    "dict_type": "Expected an object",
+    "enum": "A field is not an allowed value",
+    "additionalProperties": "An undeclared field was supplied",
+    "extra_forbidden": "An undeclared field was supplied",
+}
+
+
+def _remote_issues(result, fields, *, data=None):
+    """Extract safe structural errors, counting input left unexamined."""
+    documents = []
+    truncated = 0
+    if isinstance(data, dict):
+        documents.append(data)
+    if result is not None:
+        if isinstance(result.structured_content, dict):
+            documents.append(result.structured_content)
+        truncated = max(0, len(result.content) - 16)
+        for block in result.content[:16]:
+            if isinstance(block, types.TextContent) and len(block.text) > 65536:
+                truncated += 1
+            elif isinstance(block, types.TextContent):
+                try:
+                    document = json.loads(block.text)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(document, dict):
+                    documents.append(document)
+    issues = []
+    remaining = 16
+    for document in documents:
+        candidates = document.get("issues", document.get("detail", ()))
+        if not isinstance(candidates, list):
+            continue
+        examined = min(len(candidates), remaining)
+        truncated += len(candidates) - examined
+        remaining -= examined
+        for issue in candidates[:examined]:
+            if not isinstance(issue, dict):
+                continue
+            code = issue.get("code", issue.get("type"))
+            if not isinstance(code, str) or code not in _REMOTE_ISSUES:
+                continue
+            path = issue.get("location", issue.get("loc", ()))
+            if not isinstance(path, (list, tuple)):
+                continue
+            if len(path) > 12:
+                truncated += 1
+                continue
+            location = []
+            for part in path:
+                if isinstance(part, str) and part in fields:
+                    location.append(part)
+                elif type(part) is int and 0 <= part <= 1000000:
+                    location.append(part)
+                else:
+                    location.append("<field>")
+            issues.append({"location": location, "code": code, "message": _REMOTE_ISSUES[code]})
+    return issues, truncated
+
+
+def _result(server_name, tool_name, result, diagnostic_fields=()):
+    if result.is_error:
+        issues, truncated = _remote_issues(result, diagnostic_fields)
+        return fail(
+            "The remote MCP tool reported failure; its outcome may be uncertain.",
+            diagnostic={"code": "remote_failure", "truncated": truncated,
+                        "issues": issues or [{"location": [], "code": "remote_error",
+                                              "message": "Remote tool reported an error"}]},
+        )
     content = []
     omitted = []
     for block in result.content:
@@ -556,11 +670,6 @@ def _result(server_name, tool_name, result):
             content.append({"type": "image", "data": block.data, "mimeType": block.mime_type})
         else:
             omitted.append(block.type)
-    if result.is_error:
-        text = "\n".join(item["text"] for item in content if item["type"] == "text")
-        return fail(
-            text or "%s on the %s MCP server failed without saying why" % (tool_name, server_name)
-        )
     if not content and result.structured_content is not None:
         content.append({"type": "text", "text": json.dumps(result.structured_content, indent=2)})
     if omitted:

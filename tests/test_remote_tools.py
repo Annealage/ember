@@ -254,7 +254,8 @@ async def test_graded_remote_tools_are_proxied_with_the_remote_s_schema_and_call
         {"type": "image", "data": PNG, "mimeType": "image/png"},
     ]
     broken = await table["broken"].handler({})
-    assert broken["is_error"] is True and _text(broken) == "no such part"
+    assert broken["is_error"] is True
+    assert "broken" in fake.calls
     # Discovery and each call's own connection carried the headers.
     assert fake.headers and all(h.get("authorization") == "Bearer remote-key" for h in fake.headers)
 

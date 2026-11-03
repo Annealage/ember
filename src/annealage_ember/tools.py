@@ -63,14 +63,24 @@ paths import it; a viewer-only run never does.
 """
 
 import asyncio
+import contextvars
+import copy
 import dataclasses
 import functools
+import itertools
 import json
+import math
+import re
 import sys
 import time
 from collections import namedtuple
+from typing import get_origin
+from urllib.parse import unquote
 
 from claude_agent_sdk import create_sdk_mcp_server
+from jsonschema import Draft7Validator, Draft202012Validator
+from pydantic import TypeAdapter, create_model
+from referencing import Registry
 
 from . import product
 from .viewers import CallError, NoViewerConnected, ViewerGone, ViewerTimeout
@@ -110,14 +120,62 @@ def ok(payload=None, *, text=None, end_turn=False):
     return result
 
 
-def fail(message):
-    """A failed tool result, whose ``message`` the model reads as the reason.
+def _safe_text(value, limit=240):
+    """Bound diagnostic text and remove common credential and URL forms."""
+    text = str(value)
+    text = re.sub(r"https?://\S+", "[redacted URL]", text, flags=re.I)
+    text = re.sub(
+        r"(?i)\b(bearer\s+|(?:token|secret|password|api[_-]?key)\s*[:=]\s*)\S+",
+        r"\1[redacted]",
+        text,
+    )
+    return text[:limit]
 
-    ``is_error`` is what the SDK turns into a tool result the model is told
-    failed; without it a refusal reads as a successful call that happened to
-    return the word "refused", which a model will act on as if it had worked.
+
+def fail(message, *, diagnostic=None):
+    """Return a native failure; optional structured diagnostics travel in text.
+
+    Diagnostic callers supply only safe structural information, never candidate
+    values or arbitrary upstream data. The renderer bounds every field.
     """
-    return {"content": [{"type": "text", "text": message}], "is_error": True}
+    if diagnostic is not None:
+        issues = diagnostic.get("issues", ())
+        rendered = []
+        truncated = max(0, len(issues) - 16) + max(0, int(diagnostic.get("truncated", 0)))
+
+        def bounded(value, limit):
+            nonlocal truncated
+            text = _safe_text(value, limit)
+            if len(_safe_text(value, limit + 1)) > limit:
+                truncated += 1
+            return text
+
+        for issue in issues[:16]:
+            location = issue.get("location", ())
+            truncated += max(0, len(location) - 12)
+            rendered.append(
+                {
+                    "location": [bounded(part, 80) for part in location[:12]],
+                    "code": bounded(issue.get("code", "invalid"), 64),
+                    "message": bounded(issue.get("message", ""), 240),
+                }
+            )
+        code = bounded(diagnostic.get("code", "tool_error"), 64)
+        reason = bounded(message, 240)
+        document = {
+            "code": code,
+            "message": reason,
+            "issues": rendered,
+            "truncated": truncated,
+            "structural_correction": bool(diagnostic.get("structural_correction", False)),
+        }
+        if diagnostic.get("incomplete"):
+            # This is a lower bound on omitted issues or validation work.
+            document["incomplete"] = True
+        text = json.dumps(document, ensure_ascii=True)
+    else:
+        text = message
+    return {"content": [{"type": "text", "text": text}], "is_error": True}
 
 
 class Grading(namedtuple("Grading", "read view write")):
@@ -154,38 +212,360 @@ class Grading(namedtuple("Grading", "read view write")):
 #: module's docstring).
 ToolSpec = namedtuple("ToolSpec", "schema description handler write")
 
-#: JSON Schema type words for the plain ``{param: python_type}`` shorthand a
-#: handful of tools use (Mesh's ``set_visibility``, ``set_up_axis``,
-#: ``select_pin``, ``measure``); every python type any of them actually uses
-#: is a key here, and anything else falls back to ``"string"``, matching
-#: ``claude_agent_sdk``'s own private ``_python_type_to_json_schema``'s final
-#: fallback for a type it does not recognise either.
-_JSON_SCHEMA_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
-
 
 def _tool_json_schema(input_schema):
-    """The JSON Schema ``inputSchema`` a non-Claude MCP transport needs for
-    one tool, from the exact ``input_schema`` its own ``@tool(...)`` call
-    declared.
+    """Derive shorthand from its types, or preserve a full JSON Schema."""
+    if isinstance(input_schema, dict):
+        shorthand = all(
+            isinstance(value, type) or get_origin(value) is not None
+            for value in input_schema.values()
+        )
+        if shorthand:
+            model = create_model(
+                "ToolArguments",
+                **{name: (annotation, ...) for name, annotation in input_schema.items()},
+            )
+            schema = model.model_json_schema()
+            if set(schema.get("properties", {})) != set(input_schema):
+                raise ValueError("tool shorthand contains unsupported field names")
+        else:
+            schema = copy.deepcopy(input_schema)
+    else:
+        schema = TypeAdapter(input_schema).json_schema()
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError("tool input schema must declare an object")
+    # The public Claude SDK recognises a full schema only when this key exists.
+    # An empty properties keyword imposes no additional constraint.
+    schema.setdefault("properties", {})
+    return schema
 
-    Every tool declares one of two shapes: already a full JSON Schema object
-    (has both ``"type"`` and ``"properties"``), or the ``{param: python_type}``
-    shorthand ``claude_agent_sdk``'s own ``@tool`` also accepts and expands
-    itself, only for Claude (``create_sdk_mcp_server``'s private
-    ``_build_schema``, not reused here: that function is unstable,
-    single-underscore SDK-internal API, and this mirrors only the two shapes
-    tools actually declare, never that function's third, TypedDict, branch,
-    which nothing uses). ``{}`` - every no-argument tool's declared schema -
-    falls into the second branch and comes out as an object schema with no
-    properties, the same shape ``create_sdk_mcp_server`` would build for it.
-    """
-    if "type" in input_schema and "properties" in input_schema:
-        return input_schema
-    properties = {
-        name: {"type": _JSON_SCHEMA_TYPES.get(py_type, "string")}
-        for name, py_type in input_schema.items()
+
+def _compile_schema(schema):
+    """Check the supported dialect and every local reference before publication."""
+    dialect = schema.get("$schema", "https://json-schema.org/draft/2020-12/schema")
+    dialects = {
+        "https://json-schema.org/draft/2020-12/schema": Draft202012Validator,
+        "http://json-schema.org/draft-07/schema#": Draft7Validator,
     }
-    return {"type": "object", "properties": properties, "required": list(properties)}
+    if dialect not in dialects:
+        raise ValueError("unsupported JSON Schema dialect")
+    validator_type = dialects[dialect]
+    validator_type.check_schema(schema)
+    annotations = {
+        "$schema",
+        "$comment",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "$defs",
+        "definitions",
+    }
+    mappings = {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    singles = {
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "items",
+        "additionalItems",
+        "contains",
+        "unevaluatedItems",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+    }
+    arrays = {"allOf", "anyOf", "oneOf", "prefixItems"}
+    refs = []
+    names = set()
+    visited = set()
+    discriminators = []
+
+    def inspect(node):
+        if isinstance(node, bool):
+            return
+        if not isinstance(node, dict):
+            raise ValueError("invalid subschema")
+        visited.add(id(node))
+        for key, value in node.items():
+            if key == "$schema" and node is not schema:
+                raise ValueError("nested JSON Schema dialects are unsupported")
+            if key in {
+                "$id",
+                "$anchor",
+                "$dynamicAnchor",
+                "$dynamicRef",
+                "$recursiveRef",
+                "$recursiveAnchor",
+                "format",
+                "contentSchema",
+                "contentEncoding",
+                "contentMediaType",
+            }:
+                raise ValueError("unsupported JSON Schema keyword: " + key)
+            if key == "discriminator":
+                if "oneOf" not in node or not isinstance(value, dict):
+                    raise ValueError("discriminator requires oneOf")
+                mapping = value.get("mapping")
+                if (
+                    set(value) != {"propertyName", "mapping"}
+                    or not isinstance(value["propertyName"], str)
+                    or not isinstance(mapping, dict)
+                    or not mapping
+                ):
+                    raise ValueError("unsupported discriminator")
+                for ref in mapping.values():
+                    if not isinstance(ref, str) or not ref.startswith("#/"):
+                        raise ValueError("only local discriminator references are supported")
+                    refs.append(ref)
+                discriminators.append((node, value))
+                continue
+            if key not in validator_type.VALIDATORS and key not in annotations and key != "$ref":
+                raise ValueError("unsupported JSON Schema keyword: " + key)
+            if key == "$ref":
+                if not isinstance(value, str) or not (value == "#" or value.startswith("#/")):
+                    raise ValueError("only local JSON pointer references are supported")
+                refs.append(value)
+            elif key in mappings:
+                if key == "properties":
+                    names.update(value)
+                for child in value.values():
+                    inspect(child)
+            elif key in singles:
+                if isinstance(value, list):
+                    for child in value:
+                        inspect(child)
+                else:
+                    inspect(value)
+            elif key in arrays:
+                for child in value:
+                    inspect(child)
+            elif key == "dependencies":
+                for child in value.values():
+                    if isinstance(child, (dict, bool)):
+                        inspect(child)
+
+    inspect(schema)
+
+    def resolve(ref):
+        target = schema
+        try:
+            for part in unquote(ref[2:]).split("/") if ref != "#" else ():
+                part = part.replace("~1", "/").replace("~0", "~")
+                target = target[int(part)] if isinstance(target, list) else target[part]
+            if not isinstance(target, bool) and id(target) not in visited:
+                raise ValueError("reference target is not a schema")
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("unresolvable local JSON Schema reference") from exc
+        return target
+
+    for ref in refs:
+        resolve(ref)
+    for node, discriminator in discriminators:
+        mapping = discriminator["mapping"]
+        branches = node["oneOf"]
+        if any(not isinstance(branch, dict) or set(branch) != {"$ref"} for branch in branches):
+            raise ValueError("unsupported discriminator branches")
+        if set(mapping.values()) != {branch["$ref"] for branch in branches}:
+            raise ValueError("discriminator mapping does not match oneOf")
+        field = discriminator["propertyName"]
+        for tag, ref in mapping.items():
+            target = resolve(ref)
+            if not isinstance(tag, str) or not isinstance(target, dict):
+                raise ValueError("unsupported discriminator target")
+            prop = target.get("properties", {}).get(field, {})
+            if (
+                field not in target.get("required", ())
+                or not isinstance(prop, dict)
+                or not (prop.get("const") == tag or prop.get("enum") == [tag])
+            ):
+                raise ValueError("discriminator is not enforced by its branches")
+    return validator_type(schema, registry=Registry()), names
+
+
+def _input_diagnostic(validator, names, args, *, resource_only=False, trusted_schema=True):
+    """Bound the candidate before optionally validating it against its schema."""
+    issues = []
+    omitted = 0
+
+    def safe_entry(value):
+        # Entries are identifiers or values, not prose: never turn an altered
+        # or shortened entry into a purportedly valid correction.
+        return (
+            isinstance(value, str)
+            and len(value) <= 80
+            and value.isprintable()
+            and _safe_text(value, 81) == value
+        )
+
+    def location_part(part):
+        nonlocal omitted
+        if isinstance(part, int):
+            return part
+        if part in names and safe_entry(part):
+            return part
+        if part in names:
+            omitted += 1
+        return "<field>"
+
+    def entries_message(message, label, entries):
+        nonlocal omitted
+        selected = []
+        skipped = max(0, len(entries) - 16)
+        for entry in itertools.islice(entries, 16):
+            if not safe_entry(entry):
+                skipped += 1
+                continue
+            # JSON quoting makes punctuation and whitespace unambiguous.
+            shown = entry if entry.isidentifier() else json.dumps(entry, ensure_ascii=True)
+            candidate = selected + [shown]
+            if len(message) + len(label) + len(", ".join(candidate)) + 16 > 220:
+                skipped += 1
+                continue
+            selected.append(shown)
+        if selected:
+            message += label + ", ".join(selected)
+        if skipped:
+            message += " (some omitted)"
+            omitted += skipped
+        return message
+
+    def append_description(message, description):
+        nonlocal omitted
+        if not isinstance(description, str) or not description:
+            return message
+        text = _safe_text(description, 120)
+        if len(message) + 2 + len(text) > 240:
+            omitted += 1
+            return message
+        return message + "; " + text
+
+    def incomplete(message, *, omitted=1):
+        return {
+            "code": "invalid_input",
+            "issues": issues or [{"location": (), "code": "input_limit", "message": message}],
+            "truncated": omitted,
+            "incomplete": True,
+            "structural_correction": True,
+        }
+
+    # Iterators, rather than a stack of children, keep memory proportional to
+    # depth even for wide objects. Reject cycles and oversized inputs before
+    # handing them to jsonschema, which expects a finite JSON tree.
+    stack = [(iter((((), args),)), None)]
+    active = set()
+    nodes = 0
+    text_size = 0
+    while stack:
+        children, container_id = stack[-1]
+        try:
+            path, value = next(children)
+        except StopIteration:
+            stack.pop()
+            if container_id is not None:
+                active.remove(container_id)
+            continue
+        except ValueError:
+            return incomplete("Input is not a bounded JSON object")
+        nodes += 1
+        if nodes > 10000 or len(path) > 64:
+            return incomplete("Input exceeds validation limits")
+        if type(value) is str:
+            text_size += len(value)
+            if len(value) > 1000000 or text_size > 4000000:
+                return incomplete("Input exceeds validation limits")
+        elif type(value) is int and value.bit_length() > 4096:
+            return incomplete("Input exceeds validation limits")
+        elif not resource_only and type(value) is float and not math.isfinite(value):
+            if len(issues) == 16:
+                return incomplete("Additional input issues omitted", omitted=1)
+            issues.append(
+                {"location": path, "code": "number", "message": "Expected a finite JSON number"}
+            )
+        elif type(value) in (dict, list):
+            identity = id(value)
+            if identity in active:
+                return incomplete("Input is not a finite JSON tree")
+            active.add(identity)
+            if type(value) is dict:
+
+                def object_children(obj, parent):
+                    nonlocal text_size
+                    for key, child in obj.items():
+                        if type(key) is not str:
+                            if resource_only:
+                                yield parent + ("<field>",), child
+                                continue
+                            raise ValueError("non-string JSON object key")
+                        text_size += len(key)
+                        if len(key) > 1000000 or text_size > 4000000:
+                            raise ValueError("input exceeds validation limits")
+                        yield parent + (location_part(key),), child
+
+                iterator = object_children(value, path)
+            else:
+
+                def array_children(array, parent):
+                    for index, child in enumerate(array):
+                        yield parent + (index,), child
+
+                iterator = array_children(value, path)
+            stack.append((iterator, identity))
+        elif not resource_only and type(value) not in (int, float, bool, type(None)):
+            return incomplete("Input is not a JSON value")
+
+    if resource_only:
+        return None
+
+    try:
+        for error in validator.iter_errors(args):
+            if len(issues) == 16:
+                return incomplete("Additional input issues omitted", omitted=1)
+            location = [location_part(part) for part in error.absolute_path]
+            keyword = str(error.validator or "invalid")
+            message = "Input does not satisfy " + keyword
+            if keyword == "type" and isinstance(error.validator_value, (str, list)):
+                message += ": expected " + _safe_text(error.validator_value, 100)
+            if keyword == "enum" and isinstance(error.validator_value, list):
+                if trusted_schema:
+                    message = entries_message(message, ": allowed values ", error.validator_value)
+                else:
+                    message += " (allowed values omitted)"
+                    omitted += len(error.validator_value)
+            if keyword == "required" and isinstance(error.instance, dict):
+                missing = [name for name in error.validator_value if name not in error.instance]
+                message = entries_message(message, ": required fields ", missing)
+                properties = (
+                    error.schema.get("properties", {}) if isinstance(error.schema, dict) else {}
+                )
+                if trusted_schema and isinstance(properties, dict):
+                    for name in missing[:16]:
+                        field = properties.get(name)
+                        if safe_entry(name) and isinstance(field, dict):
+                            description = field.get("description")
+                            if isinstance(description, str):
+                                message = append_description(message, name + ": " + description)
+            if keyword == "additionalProperties" and isinstance(error.schema, dict):
+                allowed = error.schema.get("properties", {})
+                if isinstance(allowed, dict):
+                    message = entries_message(message, ": declared fields ", allowed)
+            if trusted_schema and isinstance(error.schema, dict):
+                message = append_description(message, error.schema.get("description"))
+            issues.append({"location": location, "code": keyword, "message": message})
+    except Exception:
+        return incomplete("Input could not be safely validated")
+    if not issues:
+        return None
+    return {
+        "code": "invalid_input",
+        "issues": issues,
+        "truncated": omitted,
+        "structural_correction": True,
+    }
 
 
 def _verify(tools, grading):
@@ -219,6 +599,9 @@ def _verify(tools, grading):
         )
 
 
+_SDK_CALL = contextvars.ContextVar("ember_sdk_call", default=None)
+
+
 # The attribute ``asks_the_human`` sets on a tool's handler function.
 _ASKS_THE_HUMAN = "_annealage_asks_the_human"
 
@@ -243,7 +626,7 @@ def asks_the_human(tool_def):
     return tool_def
 
 
-def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
+def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None, trusted_schema=True):
     """Apply the pause gate and the failure mapping to one tool.
 
     Both live here rather than in each handler, which is what lets the handler
@@ -267,8 +650,16 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
     MCP servers it reached, say).
     """
     name = product.current().name
+    schema = _tool_json_schema(tool_def.input_schema)
+    validator, names = _compile_schema(schema)
+
+    def input_diagnostic(args):
+        return _input_diagnostic(validator, names, args, trusted_schema=trusted_schema)
 
     async def handler(args):
+        marker = _SDK_CALL.get()
+        if marker is not None:
+            marker["entered"] = True
         if getattr(bus, "hosted_mode", False):
             operation = bus.hosted_tool_ops.get(hosted_key)
             if (
@@ -283,6 +674,9 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
         )
         if (gated or automatically_gated) and bus.paused:
             return fail(paused_message() if callable(paused_message) else paused_message)
+        diagnostic = input_diagnostic(args)
+        if diagnostic is not None:
+            return fail("Tool input does not match its declared schema", diagnostic=diagnostic)
         try:
             result = await tool_def.handler(args)
         except ValueError as exc:
@@ -336,7 +730,64 @@ def _wrap(tool_def, *, bus, gated, paused_message, hosted_key=None):
             bus.request_end_turn()
         return result
 
-    return dataclasses.replace(tool_def, handler=handler)
+    handler._annealage_input_diagnostic = input_diagnostic
+    return dataclasses.replace(tool_def, input_schema=schema, handler=handler)
+
+
+def _attach_sdk_diagnostics(server, tools):
+    """Attach bounded preflight and safe post-validation diagnostics to an SDK server.
+
+    ``tools`` must be the same wrapped tools supplied to the SDK. In-bounds
+    calls still use native SDK validation; the existing compiled validators
+    only describe its pre-handler rejection.
+    """
+    instance = server["instance"]
+    middleware = getattr(instance, "middleware", None)
+    if not isinstance(middleware, list):
+        raise RuntimeError("MCP server middleware is required for safe SDK diagnostics")
+    handlers = {tool.name: tool.handler for tool in tools}
+
+    async def safe_rejection(ctx, call_next):
+        if ctx.method != "tools/call":
+            return await call_next(ctx)
+        params = ctx.params or {}
+        if _input_diagnostic(None, (), params.get("arguments"), resource_only=True) is not None:
+            replacement = fail("Tool input exceeds safe structural limits; no values are echoed.")
+            return {"isError": True, "content": replacement["content"]}
+        marker = {"entered": False}
+        token = _SDK_CALL.set(marker)
+        try:
+            result = await call_next(ctx)
+        finally:
+            _SDK_CALL.reset(token)
+        if marker["entered"]:
+            return result
+        if not isinstance(result, dict):
+            raise RuntimeError("Unexpected MCP middleware result shape")
+        if not result.get("isError"):
+            return result
+        params = ctx.params or {}
+        name = params.get("name")
+        handler = handlers.get(name) if isinstance(name, str) else None
+        if handler is None:
+            replacement = fail("Unknown tool.")
+            return {"isError": True, "content": replacement["content"]}
+        diagnostic = None
+        try:
+            diagnostic = handler._annealage_input_diagnostic(params.get("arguments") or {})
+        except Exception:
+            # Never relay an exception or the SDK's potentially value-bearing text.
+            pass
+        if diagnostic is None:
+            replacement = fail("Tool input was rejected before the tool ran; no values are echoed.")
+        else:
+            replacement = fail(
+                "Tool input does not match its declared schema", diagnostic=diagnostic
+            )
+        return {"isError": True, "content": replacement["content"]}
+
+    middleware.append(safe_rejection)
+    return server
 
 
 #: The most of one remote MCP server's ``initialize`` instructions a session's
@@ -349,7 +800,7 @@ def _table(tool_defs, grading):
     write = set(grading.write)
     return {
         tool_def.name: ToolSpec(
-            schema=_tool_json_schema(tool_def.input_schema),
+            schema=tool_def.input_schema,
             description=tool_def.description,
             handler=tool_def.handler,
             write=tool_def.name in write,
@@ -454,8 +905,9 @@ class ToolServer:
             )
             for tool_def in tools
         )
-        self.server = create_sdk_mcp_server(
-            self.name, version=installed.version, tools=list(self.tools)
+        self.server = _attach_sdk_diagnostics(
+            create_sdk_mcp_server(self.name, version=installed.version, tools=list(self.tools)),
+            self.tools,
         )
         remote = tuple(remote)
         self.remotes = ()

@@ -6,6 +6,8 @@ The skills here are written to a temporary directory, so the expectations are
 written out beside the text they are read from.
 """
 
+import json
+
 import pytest
 
 from annealage_ember import guides
@@ -274,4 +276,10 @@ async def test_the_tool_runs_in_a_tool_server_as_a_read_tool_that_fails_as_text(
     handler = server.tool_table()["read_guide"].handler
     assert _text(await handler({"name": "format"})) == "Just a docstring.\n"
     refused = await handler({"name": "nope"})
-    assert refused["is_error"] and "no guide 'nope'" in _text(refused)
+    assert refused["is_error"] is True
+    diagnostic = json.loads(_text(refused))
+    assert diagnostic["code"] == "invalid_input"
+    assert diagnostic["structural_correction"] is True
+    issue = next(issue for issue in diagnostic["issues"] if issue["location"] == ["name"])
+    assert issue["code"] == "enum"
+    assert all(name in issue["message"] for name in full.names)

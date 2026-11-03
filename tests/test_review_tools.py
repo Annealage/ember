@@ -159,7 +159,7 @@ async def test_a_verbatim_schema_must_declare_what_its_handler_reads(store):
     [
         ({"card": "side", "x": 1, "y": 1, "text": "t"}, "no card 'side'"),
         ({"card": "front", "x": 1, "y": 900, "text": "t"}, "off the card"),
-        ({"card": "front", "y": 1, "text": "t"}, "x must be a number"),
+        ({"card": "front", "y": 1, "text": "t"}, "required fields x"),
         ({"card": "front", "x": 1, "y": 1, "text": "   "}, "text must say what you mean"),
         ({"card": "front", "x": 1, "y": 1, "text": "t", "ref": "box-z"}, "no box 'box-z'"),
         # The anchor is reported before the text: one mistake at a time, in
@@ -171,6 +171,11 @@ async def test_a_bad_callout_is_a_tool_error_and_writes_nothing(store, args, fra
     result = await _handlers(_toy_server(store))["add_callout"](args)
     assert result["is_error"] is True
     assert fragment in _text(result)
+    if "x" not in args:
+        diagnostic = json.loads(_text(result))
+        assert diagnostic["structural_correction"] is True
+        assert any(issue["code"] == "required" for issue in diagnostic["issues"])
+        assert "0 to 100, left to right" in _text(result)
     assert not store.path.exists()
 
 
@@ -222,14 +227,24 @@ async def test_a_file_the_store_refuses_reaches_the_model_as_what_to_do(store):
     [
         ({"id": 1}, "product owner's"),
         ({"id": 9}, "no comment #9"),
-        ({"id": True}, "id must be a callout id, as reported by list_comments"),
+        ({"id": True}, "expected integer"),
     ],
 )
 async def test_delete_callout_removes_only_the_model_s_own(store, args, fragment):
     _human_comment(store)
+    before = store.path.read_bytes()
     result = await _handlers(_toy_server(store))["delete_callout"](args)
     assert result["is_error"] is True
     assert fragment in _text(result)
+    if args["id"] is True:
+        diagnostic = json.loads(_text(result))
+        assert diagnostic["structural_correction"] is True
+        assert any(
+            issue["code"] == "type" and issue["location"] == ["id"]
+            for issue in diagnostic["issues"]
+        )
+        assert "list_comments" in _text(result)
+    assert store.path.read_bytes() == before
     assert [c.id for c in store.list_comments().comments] == [1]
 
 
@@ -504,8 +519,15 @@ async def test_a_product_names_and_presents_its_own_tools(store):
     assert (comment.text, comment.extra) == ("here", {"colour": "red"})
     empty = await handlers["pin_note"]({"card": "back", "x": 5, "y": 5, "body": ""})
     assert "body must say what you mean" in _text(empty)
+    before = store.path.read_bytes()
     bad_id = await handlers["unpin_note"]({"id": "1"})
-    assert "as reported by the list tool" in _text(bad_id)
+    assert bad_id["is_error"] is True
+    diagnostic = json.loads(_text(bad_id))
+    assert diagnostic["structural_correction"] is True
+    issue = next(issue for issue in diagnostic["issues"] if issue["location"] == ["id"])
+    assert issue["code"] == "type"
+    assert "expected integer" in issue["message"]
+    assert store.path.read_bytes() == before
     assert json.loads(_text(await handlers["list_notes_on_cards"]({}))) == {
         "count": 0,
         "comments": [],

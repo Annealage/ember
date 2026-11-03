@@ -60,6 +60,10 @@ dependencies = [
     # MCP 2.3 moved streamable HTTP to httpx2 and now yields only read/write
     # streams from streamable_http_client.
     "mcp>=2.3,<3",
+    # tools.py derives shorthand schemas and validates full schemas offline.
+    "pydantic>=2.11,<3",
+    "jsonschema>=4.23,<5",
+    "referencing>=0.35,<1",
     # remote.py uses httpx2 for MCP transport and its transport errors.
     "httpx2>=2.10,<3",
     # The Codex bridge's /mcp hop and URL construction use httpx directly;
