@@ -49,6 +49,18 @@ of the human's review comments). ``asks_the_human`` marks it, and the server
 treats it as read-grade whatever the product said, so no transport asks a
 vaguer question first; the product must still grade it, like any tool.
 
+Input diagnostics (``_input_diagnostic``) name what a model must change
+without echoing what it sent. A failed ``anyOf``/``oneOf`` would otherwise say
+only that no branch matched, so the diagnostic inspects each branch's own
+errors and rules a branch out by a mismatched root type, a mismatched
+single-valued discriminator property directly under the union, or a key its
+closed object schema does not declare. One survivor is reported through its own
+issues; two to four are listed side by side and never ranked, because choosing
+among them would be a guess; anything else keeps the generic issue. Expansion
+stops at depth three, and every issue or branch it declines to report is added
+to ``truncated`` so a short result is never presented as a complete one.
+Identical issues are reported once.
+
 Every handler returns one of ``ok`` or ``fail`` and nothing else. A tool
 result reaches the model as text, so what a handler returns is prose it will
 read: ``ok`` renders a payload as indented JSON, because coordinates and part
@@ -531,41 +543,125 @@ def _input_diagnostic(validator, names, args, *, resource_only=False, trusted_sc
     if resource_only:
         return None
 
+    def render(error):
+        nonlocal omitted
+        location = [location_part(part) for part in error.absolute_path]
+        keyword = str(error.validator or "invalid")
+        message = "Input does not satisfy " + keyword
+        if keyword == "type" and isinstance(error.validator_value, (str, list)):
+            message += ": expected " + _safe_text(error.validator_value, 100)
+        if keyword == "enum" and isinstance(error.validator_value, list):
+            if trusted_schema:
+                message = entries_message(message, ": allowed values ", error.validator_value)
+            else:
+                message += " (allowed values omitted)"
+                omitted += len(error.validator_value)
+        if keyword == "required" and isinstance(error.instance, dict):
+            missing = [name for name in error.validator_value if name not in error.instance]
+            message = entries_message(message, ": required fields ", missing)
+            properties = (
+                error.schema.get("properties", {}) if isinstance(error.schema, dict) else {}
+            )
+            if trusted_schema and isinstance(properties, dict):
+                for name in missing[:16]:
+                    field = properties.get(name)
+                    if safe_entry(name) and isinstance(field, dict):
+                        description = field.get("description")
+                        if isinstance(description, str):
+                            message = append_description(message, name + ": " + description)
+        if keyword == "additionalProperties" and isinstance(error.schema, dict):
+            allowed = error.schema.get("properties", {})
+            if isinstance(allowed, dict):
+                message = entries_message(message, ": declared fields ", allowed)
+        if trusted_schema and isinstance(error.schema, dict):
+            message = append_description(message, error.schema.get("description"))
+        return {"location": location, "code": keyword, "message": message}
+
+    def expand(error, depth):
+        # A failed anyOf/oneOf reports only that no branch matched. Name the
+        # branch the input was aiming at only when the schema makes that
+        # unambiguous: a branch is ruled out by a mismatched root type, a
+        # mismatched single-valued discriminator property directly under the
+        # union, or a key the branch's closed object schema does not declare.
+        # One survivor is reported through its own errors; a few are listed
+        # side by side, never ranked; otherwise the generic issue stays, and
+        # the omitted detail is counted so the result is not claimed complete.
+        nonlocal omitted
+        if error.validator not in ("anyOf", "oneOf") or not error.context:
+            return [render(error)]
+        if depth >= 3:
+            omitted += 1
+            return [render(error)]
+        base = len(error.absolute_path)
+        branches = {}
+        for sub in error.context:
+            index = sub.schema_path[0] if sub.schema_path else None
+            branches.setdefault(index, []).append(sub)
+        if len(branches) > 16:
+            omitted += 1
+            return [render(error)]
+
+        def ruled_out(subs):
+            for sub in subs:
+                depth_of = len(sub.absolute_path)
+                if depth_of == base and sub.validator in ("type", "additionalProperties"):
+                    return True
+                if depth_of == base + 1 and (
+                    sub.validator == "const"
+                    or (
+                        sub.validator == "enum"
+                        and isinstance(sub.validator_value, list)
+                        and len(sub.validator_value) == 1
+                    )
+                ):
+                    return True
+            return False
+
+        survivors = [subs for subs in branches.values() if not ruled_out(subs)]
+        if len(survivors) == 1:
+            expanded = []
+            chosen = survivors[0]
+            if len(chosen) > 16:
+                omitted += len(chosen) - 16
+            for sub in chosen[:16]:
+                expanded.extend(expand(sub, depth + 1))
+            return expanded or [render(error)]
+        if 1 < len(survivors) <= 4:
+            generic = render(error)
+            message = generic["message"] + ": no alternative matched"
+            for number, subs in enumerate(survivors, 1):
+                if all(s.validator == "required" and len(s.absolute_path) == base for s in subs):
+                    missing = list(
+                        dict.fromkeys(
+                            name
+                            for s in subs
+                            if isinstance(s.instance, dict)
+                            for name in s.validator_value
+                            if name not in s.instance
+                        )
+                    )
+                    message = entries_message(
+                        message + "; alternative %d" % number, " requires ", missing
+                    )
+                else:
+                    message += "; alternative %d has other issues" % number
+            generic["message"] = message
+            return [generic]
+        if survivors:
+            omitted += 1
+        return [render(error)]
+
+    seen = set()
     try:
         for error in validator.iter_errors(args):
-            if len(issues) == 16:
-                return incomplete("Additional input issues omitted", omitted=1)
-            location = [location_part(part) for part in error.absolute_path]
-            keyword = str(error.validator or "invalid")
-            message = "Input does not satisfy " + keyword
-            if keyword == "type" and isinstance(error.validator_value, (str, list)):
-                message += ": expected " + _safe_text(error.validator_value, 100)
-            if keyword == "enum" and isinstance(error.validator_value, list):
-                if trusted_schema:
-                    message = entries_message(message, ": allowed values ", error.validator_value)
-                else:
-                    message += " (allowed values omitted)"
-                    omitted += len(error.validator_value)
-            if keyword == "required" and isinstance(error.instance, dict):
-                missing = [name for name in error.validator_value if name not in error.instance]
-                message = entries_message(message, ": required fields ", missing)
-                properties = (
-                    error.schema.get("properties", {}) if isinstance(error.schema, dict) else {}
-                )
-                if trusted_schema and isinstance(properties, dict):
-                    for name in missing[:16]:
-                        field = properties.get(name)
-                        if safe_entry(name) and isinstance(field, dict):
-                            description = field.get("description")
-                            if isinstance(description, str):
-                                message = append_description(message, name + ": " + description)
-            if keyword == "additionalProperties" and isinstance(error.schema, dict):
-                allowed = error.schema.get("properties", {})
-                if isinstance(allowed, dict):
-                    message = entries_message(message, ": declared fields ", allowed)
-            if trusted_schema and isinstance(error.schema, dict):
-                message = append_description(message, error.schema.get("description"))
-            issues.append({"location": location, "code": keyword, "message": message})
+            for issue in expand(error, 0):
+                key = (tuple(issue["location"]), issue["code"], issue["message"])
+                if key in seen:
+                    continue
+                if len(issues) == 16:
+                    return incomplete("Additional input issues omitted", omitted=1)
+                seen.add(key)
+                issues.append(issue)
     except Exception:
         return incomplete("Input could not be safely validated")
     if not issues:
