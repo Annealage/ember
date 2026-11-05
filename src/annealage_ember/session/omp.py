@@ -129,6 +129,35 @@ class only as correct as one build's private implementation. Instead:
    real handler. This is unaffected by whichever UI-request shape a given
    `omp` build happens to use for its own native gate, because that gate
    never fires.
+   ``deferred_tools=True`` widens "every built-in disabled" by exactly two
+   tools, ``read`` and ``write``, which omp uses as the ``xd://`` transport
+   (``read xd://<tool>`` documents a device, ``write xd://<tool>`` runs it). On
+   their own they also reach files, ``local://`` scratch, URLs and every other
+   internal scheme, so ``-e`` loads ``omp_xd_guard.js``, an extension whose
+   ``tool_call`` handler blocks all of that and passes only the devices this
+   session registered (``ANNEALAGE_XD_DEVICES``). ``--no-extensions`` stays, so
+   project and user extensions and the ``extensions`` setting are still not
+   loaded (checked against a real omp 18.11.3). A device call is dispatched by
+   ``write`` into the same host tool, so the broker gate above still runs. omp
+   starts without an ``-e`` extension that fails to load, so ``start`` asks
+   ``get_available_commands`` for the command the guard registers last and
+   fails the session if it is not there. A guard that loads with no usable
+   device list blocks every call. Three further conditions are fixed or refused at
+   launch. The settings that mount the tools (``tools.xdev`` on, ``tools.xdevDocs``
+   at ``catalog``) are forced by a ``--config`` overlay, which outranks a user's, a
+   profile's and a project's own, and ``start`` then reads ``get_state`` and fails
+   the session unless the only top-level tools are ``read`` and ``write``
+   (``tools.xdevDocs`` is forced to ``catalog`` but not attested: the prompt is
+   text the caller's instructions can imitate, and a replaced prompt has no device
+   text). In ``instructions_mode="replace"`` omp's own account of ``xd://`` is
+   missing, so ``XD_REPLACE_NOTE``, which names no tool and no schema, is appended to
+   the replacement. A tool whose omp name is one omp answers itself
+   (``report_issue``, ``resolve``, ``reject``, ``propose``, checked in 18.4.5 and
+   18.11.3) is refused, as are two tools that share a name once ``_omp_name`` has
+   applied; a device omp answers itself would otherwise be reachable through the
+   guard. The guard holds the device names it was launched with, so
+   ``set_tool_table`` takes no new table on a deferred session, before or after
+   start, and the tools arrive with the next session.
 2. `extension_ui_request{method:"confirm"}` is still handled, exactly as
    the ticket specifies, as a defensive second layer: `omp` may still
    raise a confirm for something unrelated to tool execution (a login
@@ -231,6 +260,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -319,6 +349,36 @@ _CHILD_POLL_INTERVAL = 1.0
 IDLE_COMPACT_TOKENS = 100_000
 IDLE_COMPACT_AFTER = 20 * 60.0
 
+#: The built-in tools ``deferred_tools`` enables: the transport for ``xd://`` devices.
+_XD_TRANSPORT_TOOLS = ("read", "write")
+#: The guard extension ``deferred_tools`` loads (``-e``), shipped beside this module.
+XD_GUARD = Path(__file__).with_name("omp_xd_guard.js")
+#: The command the guard registers last, once its handlers are in place; the proof it loaded.
+XD_GUARD_COMMAND = "annealage-xd-guard"
+#: What a ``deferred_tools`` session with a replaced system prompt is told about ``xd://``.
+#: omp writes its own account of the devices into the prompt it builds, and a replaced prompt
+#: has none, so without this the model would not know the tools exist. It names no tool and no
+#: schema, so it is the same for every run and can sit in a shared prefix.
+XD_REPLACE_NOTE = (
+    "Your tools are not listed individually; they are xd:// devices reached through the read and "
+    "write tools. `read xd://` lists the tools you can call. `read xd://<tool>` returns one "
+    "tool's description and argument schema; read it before you first call that tool. To call a "
+    "tool, use `write` with path `xd://<tool>` and the arguments as one JSON object in `content`. "
+    "A call with invalid arguments returns the schema: correct it and call again. read and write "
+    "do nothing else in this session: any other path or URL is refused."
+)
+#: A device name the guard accepts; ``omp_xd_guard.js`` holds the same pattern.
+_XD_DEVICE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+#: Device names omp answers itself, before it looks at the tools a host registered
+#: (``xd-protocol.ts``: ``report_issue`` and the three staged-action devices, the same
+#: in omp 18.4.5 and 18.11.3). A host tool with one of these names would be shadowed
+#: by omp's device and, past the guard, would reach it.
+_XD_RESERVED_DEVICES = frozenset(("report_issue", "resolve", "reject", "propose"))
+#: What ``deferred_tools`` forces through a ``--config`` overlay, which outranks the
+#: user's, the profile's and the project's settings: the tools mount as devices, and
+#: the prompt lists them instead of inlining their schemas.
+_XD_SETTINGS = {"tools": {"xdev": True, "xdevDocs": "catalog"}}
+
 # How long the ``compact`` request is waited for: it summarises the whole conversation, which
 # outlasts ``RpcClient``'s 30-second default for ordinary requests.
 _COMPACT_REQUEST_TIMEOUT = 600.0
@@ -371,6 +431,19 @@ class OmpSession:
     inside omp: the ``host_tool_call`` broker gate, grading and permission cards
     never see it, and omp runs with ``--auto-approve``.
 
+    ``deferred_tools=True`` presents the host tools as ``xd://`` devices instead of
+    top-level tools: the model reads ``xd://<tool>`` for a schema and writes JSON to
+    ``xd://<tool>`` to run it, so the prompt carries a short device listing rather than
+    every schema. It enables omp's built-in ``read`` and ``write`` (``--tools read,write``),
+    the transport, and loads the packaged guard extension (``omp_xd_guard.js``, ``-e``)
+    that blocks every use of them except discovery of, and calls to, this session's own
+    devices; ``--no-extensions`` still keeps project and user extensions out. The guard
+    is told the device names through ``ANNEALAGE_XD_DEVICES``. A ``--config`` overlay
+    forces ``tools.xdev`` and ``tools.xdevDocs=catalog``, ``start`` verifies both, and
+    ``set_tool_table`` refuses a new table (see the module docstring). It cannot be
+    combined with ``builtin_tools``: the guard has no top-level tool to allow beyond
+    the two.
+
     ``idle_compact_tokens`` and ``idle_compact_after`` are the context size (tokens) and the
     idle time (seconds since a turn ended) past which the session compacts itself
     (``IDLE_COMPACT_TOKENS``, ``IDLE_COMPACT_AFTER``); always on, the parameters only
@@ -412,6 +485,7 @@ class OmpSession:
         request_timeout: Optional[float] = None,
         on_request_usage: Optional[Callable[[dict], None]] = None,
         builtin_tools: Sequence[str] = (),
+        deferred_tools: bool = False,
         provider_session_id: Optional[str] = None,
         cache_retention: Optional[str] = None,
         idle_compact_tokens: int = IDLE_COMPACT_TOKENS,
@@ -420,6 +494,9 @@ class OmpSession:
         # omp's own tools to leave enabled (``--tools``); none by default, which
         # is ``--no-tools``. They run inside omp, outside the broker.
         self._builtin_tools = tuple(builtin_tools)
+        # Host tools as ``xd://`` devices behind the packaged guard (class docstring).
+        self._deferred_tools = bool(deferred_tools)
+        self._xd_dir: Optional[Path] = None
         # Called on the session's loop with one ``hosted_state.usage_event`` per
         # provider request; ``None`` (the default) registers nothing extra.
         self._on_request_usage = on_request_usage
@@ -586,13 +663,15 @@ class OmpSession:
         self._emit(AgentStatus(status=status))
 
     def sandbox_status(self) -> SandboxStatus:
-        """`omp` runs with every built-in tool disabled (``--no-tools``): the
-        model's only capabilities are the product's own host tools, which never
-        expose a shell or an unrestricted filesystem writer. There is
-        therefore no sandbox to request in the bwrap/landlock/Seatbelt sense
-        ``SdkSession``/``CodexSession`` report -- the "session with no shell
-        to contain reports requested false" case ``base.py``'s own
-        ``SandboxStatus`` docstring names.
+        """`omp` runs with every built-in tool disabled (``--no-tools``), except
+        that ``deferred_tools`` enables ``read`` and ``write`` behind the guard
+        extension: the model's only capabilities are the product's own host
+        tools, which never expose a shell or an unrestricted filesystem writer.
+        There is therefore no sandbox to request in the bwrap/landlock/Seatbelt
+        sense ``SdkSession``/``CodexSession`` report -- the "session with no
+        shell to contain reports requested false" case ``base.py``'s own
+        ``SandboxStatus`` docstring names. The guard is a software check inside
+        omp, not an operating-system boundary.
         """
         return SandboxStatus(requested=False, active=False, missing=())
 
@@ -867,7 +946,13 @@ class OmpSession:
         """Register ``tool_table`` (``ToolServer.host_tool_table()``'s shape)
         as this session's host tools in place of the old set, through omp's
         ``set_host_tools``, which applies before the next model call. False
-        when `omp` is not running to take them."""
+        when `omp` is not running to take them. A ``deferred_tools`` session never
+        takes them: its guard holds the device names it was launched with, so a device
+        added later would be refused and one removed would stay allowed. The table is
+        left as launched, before or after the session starts, and the tools arrive with
+        the next session."""
+        if self._deferred_tools:
+            return False
         self._tool_table = dict(tool_table)
         if self._client is None:
             return False
@@ -1206,13 +1291,25 @@ class OmpSession:
                 env["PI_CONFIG_DIR"] = self._config_rel
             if self._cache_retention is not None:
                 env["PI_CACHE_RETENTION"] = self._cache_retention
+            if self._deferred_tools:
+                env["ANNEALAGE_XD_DEVICES"] = json.dumps(
+                    sorted(_omp_name(name) for name in self._tool_table)
+                )
             # omp's logs directory is decided by what it is launched with.
             self._omp_logs_dir = logfiles.omp_logs_dir(
                 self._config_rel, env.get("PI_CODING_AGENT_DIR")
             )
             client_kwargs = {}
             instructions = "\n\n".join(
-                p for p in (self._instructions, _renamed_tools_note(self._tool_table)) if p
+                p
+                for p in (
+                    self._instructions,
+                    _renamed_tools_note(self._tool_table),
+                    XD_REPLACE_NOTE
+                    if self._deferred_tools and self._instructions_mode == "replace"
+                    else None,
+                )
+                if p
             )
             system_args = ()
             if instructions and self._instructions_mode == "replace":
@@ -1227,6 +1324,14 @@ class OmpSession:
                 system_args = ("--system-prompt", str(prompt_file))
             elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
+            xd_args = ()
+            if self._deferred_tools:
+                self._xd_dir = Path(tempfile.mkdtemp(prefix="annealage-xd-"))
+                overlay = self._xd_dir / "settings.yml"
+                fd = os.open(overlay, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(_XD_SETTINGS, handle)
+                xd_args = ("--config", str(overlay), "-e", str(XD_GUARD))
             if self._session_dir is not None:
                 self._session_dir.mkdir(parents=True, exist_ok=True)
                 client_kwargs["session_dir"] = str(self._session_dir)
@@ -1250,11 +1355,12 @@ class OmpSession:
                 # register its own native tools, entirely outside this
                 # file's own host_tool_call broker gate. See this module's
                 # docstring on the permission design this makes possible.
-                tools=self._builtin_tools,
+                tools=_XD_TRANSPORT_TOOLS if self._deferred_tools else self._builtin_tools,
                 custom_tools=self._build_host_tools(),
                 extra_args=(
                     "--auto-approve",
                     "--no-extensions",
+                    *xd_args,
                     *system_args,
                     *(("--thinking", self._thinking) if self._thinking else ()),
                 ),
@@ -1263,6 +1369,8 @@ class OmpSession:
             self._register_listeners()
             await self._run_blocking(self._client.start)
             self._omp_pid = _process_id(self._client)
+            if self._deferred_tools:
+                await self._run_blocking(self._confirm_xd_launch)
         except Exception as exc:
             # Before the stop below: omp itself has already gone, and its log
             # was last written before this (backend_logs's window).
@@ -1414,8 +1522,90 @@ class OmpSession:
         if models:
             self._emit(AgentModelsAvailable(models=models))
 
+    def _confirm_xd_launch(self) -> None:
+        """Refuse to go on unless omp started the way ``deferred_tools`` needs.
+
+        Two things can leave ``read`` and ``write`` open or the tools top-level without
+        a word, and both are checked here, before any prompt reaches the model.
+
+        omp skips an ``-e`` extension that is missing, does not parse or throws while
+        loading, and starts without it, which here would leave ``read`` and ``write``
+        open to the filesystem and the network. The guard's factory ends by registering
+        the ``annealage-xd-guard`` command, so its absence from
+        ``get_available_commands`` means the handlers never ran either. The name alone
+        proves nothing: a ``.omp/commands/annealage-xd-guard.md`` in the working
+        directory is listed under the same name even with ``--no-extensions``, so the
+        entry must also say it comes from an extension (``source``), which a command
+        file reports as ``file``. Only ``-e`` loads an extension here.
+
+        The ``--config`` overlay outranks every settings file, but a setting is only
+        read, never confirmed, by omp. ``get_state`` reports the tools the model is
+        offered: with ``tools.xdev`` on the only top-level tools are ``read`` and
+        ``write``, and with it off every host tool is a top-level tool as well. That
+        structured list is the one thing checked. ``tools.xdevDocs`` is forced to
+        ``catalog`` by the overlay but not attested: it only chooses whether omp's own
+        prompt inlines device schemas (a cost, not a reach), a replaced prompt carries
+        no device text at all, and the prompt is text the caller's own instructions can
+        imitate, so reading it back would prove nothing.
+        """
+        reply = self._client.request_raw("get_available_commands")
+        commands = reply.get("commands") if isinstance(reply, dict) else None
+        loaded = any(
+            isinstance(c, dict)
+            and c.get("name") == XD_GUARD_COMMAND
+            and c.get("source") == "extension"
+            for c in (commands or ())
+        )
+        if not loaded:
+            raise RuntimeError(
+                "omp did not load the xd:// guard extension (%s), so read and write "
+                "would be unrestricted; refusing to run" % (XD_GUARD,)
+            )
+        state = self._client.request_raw("get_state")
+        offered = state.get("dumpTools") if isinstance(state, dict) else None
+        offered_names = (
+            {t.get("name") for t in offered if isinstance(t, dict)}
+            if isinstance(offered, list)
+            else None
+        )
+        if offered_names != set(_XD_TRANSPORT_TOOLS):
+            raise RuntimeError(
+                "omp offers %s as top-level tools, not just read and write, so the tools are "
+                "not mounted as xd:// devices (tools.xdev); refusing to run"
+                % (
+                    sorted(offered_names, key=str)
+                    if offered_names is not None
+                    else "an unreadable set",
+                )
+            )
+
     def _configuration_refusal(self) -> Optional[str]:
         """Why this session's configuration cannot start, or None."""
+        if self._deferred_tools:
+            if self._builtin_tools:
+                return (
+                    "deferred_tools cannot be combined with builtin_tools: the guard "
+                    "allows no top-level tool beyond read and write"
+                )
+            seen = {}
+            for name in self._tool_table:
+                device = _omp_name(name)
+                if not _XD_DEVICE_NAME.fullmatch(device):
+                    return (
+                        "tool %r cannot be an xd:// device: its name has characters the guard refuses"
+                        % (name,)
+                    )
+                if device.lower() in _XD_RESERVED_DEVICES:
+                    return (
+                        "tool %r cannot be an xd:// device: omp answers xd://%s itself, ahead "
+                        "of any tool the host registered" % (name, device)
+                    )
+                if seen.setdefault(device.lower(), name) != name:
+                    return "tools %r and %r are both xd://%s once omp names them" % (
+                        seen[device.lower()],
+                        name,
+                        device,
+                    )
         if self._api_key and not self._base_url:
             return (
                 "omp_api_key is set without omp_base_url; omp_api_key only "
@@ -1575,6 +1765,9 @@ class OmpSession:
         if self._system_prompt_dir is not None:
             shutil.rmtree(self._system_prompt_dir, ignore_errors=True)
             self._system_prompt_dir = None
+        if self._xd_dir is not None:
+            shutil.rmtree(self._xd_dir, ignore_errors=True)
+            self._xd_dir = None
 
     # -- host tools -------------------------------------------------------------
 

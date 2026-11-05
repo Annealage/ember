@@ -40,7 +40,7 @@ no settings file is loaded (``setting_sources`` empty), so nothing under
 shell sandbox is off since there is no shell. ``HeadlessBroker`` is the backstop
 should anything still ask. omp already runs with every built-in disabled
 (``--no-tools --no-extensions``), so its only tools are the ``ToolSet``'s,
-unless the caller opts in with ``builtin_tools`` (see ``run_prompt``).
+unless the caller opts in with ``builtin_tools`` or ``deferred_tools`` (see ``run_prompt``).
 Codex is refused: it reaches tools through the app's ``/mcp`` endpoint, which
 a headless run has no listener for.
 
@@ -590,6 +590,7 @@ def _check_arguments(
     cache_retention=None,
     usage_sink=None,
     builtin_tools=(),
+    deferred_tools=False,
     on_runtime=None,
     max_budget_usd=None,
     native_max_turns=None,
@@ -694,6 +695,13 @@ def _check_arguments(
                 )
         if len(set(builtin_tools)) != len(builtin_tools):
             raise ValueError("builtin_tools names a tool twice")
+    if not isinstance(deferred_tools, bool):
+        raise ValueError("deferred_tools must be True or False")
+    if deferred_tools:
+        if backend != "omp":
+            raise ValueError("deferred_tools is only supported with backend='omp'")
+        if builtin_tools:
+            raise ValueError("deferred_tools cannot be combined with builtin_tools")
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
@@ -752,6 +760,7 @@ def _build_session(
     on_request_usage,
     system_mode="append",
     builtin_tools=(),
+    deferred_tools,
     max_budget_usd,
     native_max_turns,
     on_owner,
@@ -796,6 +805,7 @@ def _build_session(
             cache_retention=cache_retention,
             on_request_usage=on_request_usage,
             builtin_tools=builtin_tools,
+            deferred_tools=deferred_tools,
         )
 
     from .session.sdk import SdkSession
@@ -1174,6 +1184,7 @@ async def run_prompt(
     cache_retention=None,
     usage_sink=None,
     builtin_tools=(),
+    deferred_tools=False,
     on_runtime=None,
     on_activity=None,
     max_budget_usd=None,
@@ -1293,6 +1304,27 @@ async def run_prompt(
     They appear in ``RunResult.calls`` by omp's name. There is no hosted or
     interactive equivalent: ``create_app`` never enables them.
 
+    ``deferred_tools`` (omp only, default ``False``) presents the ``ToolSet`` as
+    ``xd://`` devices rather than top-level tools: the model reads ``xd://<tool>`` for
+    a schema and writes JSON to ``xd://<tool>`` to run it, and the prompt carries a
+    device listing instead of every schema. It turns on omp's ``read`` and ``write``
+    as that transport and loads a packaged guard extension that refuses every other
+    use of them: a read or write of a file, a ``local://`` path, a URL or any other
+    internal scheme, and any device that is not one of this run's tools, so no
+    filesystem or network reach is added. A device call still runs the ``ToolSet``
+    handler, so grading, ``grant`` and the permission broker apply to it exactly as to
+    a top-level call. ``RunResult.calls`` lists what omp reports, which is the
+    transport (``read``, ``write``) and not the device behind it.
+    ``--no-extensions`` still keeps project and user extensions out, and a ``--config``
+    overlay forces the settings that mount the tools over any profile or project
+    setting (the run fails before the prompt if omp does not report them in force).
+    With ``system_mode='replace'`` a short generic note on using ``xd://`` (no tool names or
+    schemas) is appended to the replacement, since omp's own account of it is not in a
+    replaced prompt.
+    A tool named ``report_issue``, ``resolve``, ``reject`` or ``propose``, which omp
+    answers itself, fails the run, as do two tools that share a name once omp names
+    them. It cannot be combined with ``builtin_tools``, and the Claude backend refuses it.
+
     ``usage_sink(event: dict) -> None`` (omp only) receives one event per
     provider request the run makes, with that request's own token counts
     (``hosted_state.usage_event``'s shape: ``event_id``, ``session_id``,
@@ -1350,6 +1382,7 @@ async def run_prompt(
         cache_retention,
         usage_sink,
         builtin_tools,
+        deferred_tools,
         on_runtime,
         max_budget_usd,
         native_max_turns,
@@ -1500,6 +1533,7 @@ async def run_prompt(
                     session_id=session_id,
                     on_request_usage=bus.request_usage,
                     builtin_tools=tuple(builtin_tools),
+                    deferred_tools=deferred_tools,
                     max_budget_usd=max_budget_usd,
                     native_max_turns=native_max_turns,
                     on_owner=on_owner,

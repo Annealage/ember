@@ -1314,7 +1314,9 @@ async def test_live_profile_waits_for_terminal_and_supersedes_before_queued_turn
         assert session.queue_model_profile("new/model/variant", "high") == {"status": "pending"}
         await session.submit_turn(_text("second"))
         with pytest.raises(RuntimeError, match="not idle"):
-            await session.submit_automated_turn(_text("auto"), attempt_id="a", on_admitted=lambda: None)
+            await session.submit_automated_turn(
+                _text("auto"), attempt_id="a", on_admitted=lambda: None
+            )
         assert fake.set_model_calls == []
         assert [call.message for call in fake.prompt_calls] == ["first"]
         fake.push_agent_end(is_terminal=False)
@@ -2900,9 +2902,14 @@ async def test_profile_queued_while_connecting_applies_after_resume_before_promp
     conversation.touch()
     recorder = EventRecorder()
     session = OmpSession(
-        recorder, cwd="/proj/root", session_id="resume-profile",
-        client_factory=ResumingModelClient, resume=str(conversation),
-        strict_resume=True, model="openai-codex/gpt-6.1-sol", thinking="low",
+        recorder,
+        cwd="/proj/root",
+        session_id="resume-profile",
+        client_factory=ResumingModelClient,
+        resume=str(conversation),
+        strict_resume=True,
+        model="openai-codex/gpt-6.1-sol",
+        thinking="low",
     )
     try:
         assert session.queue_model_profile("anthropic/new", "high") == {"status": "pending"}
@@ -3294,3 +3301,224 @@ def test_instructions_mode_is_checked_at_construction():
         OmpSession(
             lambda e: None, cwd=".", session_id="s", broker=None, instructions_mode="replace"
         )
+
+
+# -- deferred_tools: the launch refusals and the verified start ------------------------------
+
+
+class XdFakeRpcClient(FakeRpcClient):
+    """A ``FakeRpcClient`` that answers the two raw requests ``deferred_tools`` makes at
+    start. ``commands`` and ``state`` are what the fake omp reports."""
+
+    commands = (
+        {"name": "fast", "source": "builtin"},
+        {"name": "annealage-xd-guard", "source": "extension"},
+    )
+    top_level = ("read", "write")
+
+    def request_raw(self, command_type, **payload):
+        if command_type == "get_available_commands":
+            return {"commands": list(type(self).commands)}
+        if command_type == "get_state":
+            return {
+                "dumpTools": [{"name": name} for name in type(self).top_level],
+            }
+        raise AssertionError(command_type)
+
+
+def _xd_spec():
+    return ToolSpec(
+        schema={"type": "object", "properties": {}, "required": []},
+        description="a tool",
+        handler=_read_handler,
+        write=False,
+    )
+
+
+async def _deferred_session(table, client_class=XdFakeRpcClient):
+    built = []
+
+    def factory(**kwargs):
+        client = client_class(**kwargs)
+        built.append(client)
+        return client
+
+    recorder = EventRecorder()
+    session = OmpSession(
+        recorder,
+        cwd="/proj/root",
+        session_id="xd-sess",
+        broker=None,
+        tool_table=table,
+        client_factory=factory,
+        base_url="http://127.0.0.1:11434/v1",
+        deferred_tools=True,
+    )
+    await session.start()
+    return session, built, recorder
+
+
+def _error_text(recorder):
+    return " ".join(e.stderr for e in recorder.all if isinstance(e, AgentError))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ("report_issue", "resolve", "reject", "propose", "Resolve"))
+async def test_a_tool_named_like_an_omp_device_cannot_be_deferred(name):
+    session, built, recorder = await _deferred_session({name: _xd_spec(), "lookup": _xd_spec()})
+    try:
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        assert built == []
+        assert "omp answers xd://%s itself" % name in _error_text(recorder)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_two_tools_that_become_one_device_name_cannot_be_deferred():
+    from annealage_ember import product
+
+    renamed = omp_module.host_tool_name(product.current().mcp_server_name, "todo")
+    session, built, recorder = await _deferred_session({"todo": _xd_spec(), renamed: _xd_spec()})
+    try:
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        assert built == []
+        assert "are both xd://%s once omp names them" % renamed in _error_text(recorder)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_session_with_the_tools_mounted_starts():
+    session, built, _ = await _deferred_session({"lookup": _xd_spec()})
+    try:
+        assert session.agent_status() == AGENT_READY
+        (client,) = built
+        assert client.kwargs["tools"] == ("read", "write")
+        assert json.loads(client.kwargs["env"]["ANNEALAGE_XD_DEVICES"]) == ["lookup"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    (
+        ({"commands": ({"name": "fast", "source": "builtin"},)}, "did not load the xd:// guard"),
+        (
+            # A .omp/commands/annealage-xd-guard.md in the working directory: the same name.
+            {"commands": ({"name": "annealage-xd-guard", "source": "file"},)},
+            "did not load the xd:// guard",
+        ),
+        ({"top_level": ("read", "write", "lookup")}, "tools.xdev"),
+        ({"top_level": ()}, "tools.xdev"),
+    ),
+)
+async def test_a_deferred_session_that_omp_did_not_set_up_as_asked_does_not_start(
+    override, expected
+):
+    client_class = type("Misconfigured", (XdFakeRpcClient,), override)
+    session, built, recorder = await _deferred_session({"lookup": _xd_spec()}, client_class)
+    try:
+        assert session.agent_status() == AGENT_UNAVAILABLE
+        (client,) = built
+        assert client.stopped
+        assert expected in _error_text(recorder)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_session_launches_omp_with_the_settings_it_needs_outranking_the_users():
+    session, built, _ = await _deferred_session({"lookup": _xd_spec()})
+    try:
+        (client,) = built
+        args = client.kwargs["extra_args"]
+        overlay = Path(args[args.index("--config") + 1])
+        assert json.loads(overlay.read_text()) == {"tools": {"xdev": True, "xdevDocs": "catalog"}}
+        assert "--no-extensions" in args and "-e" in args
+    finally:
+        await session.close()
+    assert not overlay.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_session_does_not_take_a_new_tool_table():
+    session, built, _ = await _deferred_session({"lookup": _xd_spec()})
+    try:
+        (client,) = built
+        assert await session.set_tool_table({"lookup": _xd_spec(), "extra": _xd_spec()}) is False
+        assert client.set_custom_tools_calls == []
+        assert session._tool_table.keys() == {"lookup"}
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_table_offered_before_a_deferred_session_starts_is_not_taken():
+    recorder = EventRecorder()
+    built = []
+
+    def factory(**kwargs):
+        client = XdFakeRpcClient(**kwargs)
+        built.append(client)
+        return client
+
+    session = OmpSession(
+        recorder,
+        cwd="/proj/root",
+        session_id="xd-sess",
+        broker=None,
+        tool_table={"lookup": _xd_spec()},
+        client_factory=factory,
+        base_url="http://127.0.0.1:11434/v1",
+        deferred_tools=True,
+    )
+    try:
+        assert await session.set_tool_table({"lookup": _xd_spec(), "extra": _xd_spec()}) is False
+        await session.start()
+        (client,) = built
+        assert [t.name for t in client.custom_tools] == ["lookup"]
+        assert json.loads(client.kwargs["env"]["ANNEALAGE_XD_DEVICES"]) == ["lookup"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "has_note"), (("replace", True), ("append", False)))
+async def test_a_replaced_prompt_is_given_the_generic_xd_guidance_and_an_appended_one_is_not(
+    mode, has_note
+):
+    """omp writes its own account of xd:// into a prompt it builds; a replacement has none."""
+    built = []
+
+    def factory(**kwargs):
+        client = XdFakeRpcClient(**kwargs)
+        built.append(client)
+        return client
+
+    session = OmpSession(
+        EventRecorder(),
+        cwd="/proj/root",
+        session_id="xd-sess",
+        broker=None,
+        tool_table={"lookup": _xd_spec()},
+        client_factory=factory,
+        base_url="http://127.0.0.1:11434/v1",
+        deferred_tools=True,
+        instructions="Be a reviewer.",
+        instructions_mode=mode,
+    )
+    await session.start()
+    try:
+        (client,) = built
+        if has_note:
+            args = client.kwargs["extra_args"]
+            text = Path(args[args.index("--system-prompt") + 1]).read_text()
+            assert text == "Be a reviewer.\n\n" + omp_module.XD_REPLACE_NOTE
+            # Generic: no tool name, so it is the same for every run.
+            assert "lookup" not in omp_module.XD_REPLACE_NOTE
+        else:
+            assert client.kwargs["append_system_prompt"] == "Be a reviewer."
+    finally:
+        await session.close()

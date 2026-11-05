@@ -503,6 +503,24 @@ async def test_builtin_tools_are_refused_for_claude(tmp_path):
         )
 
 
+async def test_deferred_tools_are_refused_for_claude(tmp_path):
+    with pytest.raises(ValueError, match="deferred_tools is only supported with backend='omp'"):
+        await run_prompt("go", **make_args(tmp_path, backend="claude", deferred_tools=True))
+
+
+async def test_deferred_tools_are_refused_beside_builtin_tools(tmp_path):
+    with pytest.raises(ValueError, match="cannot be combined with builtin_tools"):
+        await run_prompt(
+            "go", **make_args(tmp_path, deferred_tools=True, builtin_tools=("web_search",))
+        )
+
+
+@pytest.mark.parametrize("value", ("yes", 1, None))
+async def test_deferred_tools_must_be_a_bool(tmp_path, value):
+    with pytest.raises(ValueError, match="deferred_tools must be True or False"):
+        await run_prompt("go", **make_args(tmp_path, deferred_tools=value))
+
+
 async def test_omp_request_timeout_is_rejected_for_claude(tmp_path):
     with pytest.raises(ValueError, match="only supported with backend='omp'"):
         await run_prompt("go", **make_args(tmp_path, backend="claude", omp_request_timeout=180))
