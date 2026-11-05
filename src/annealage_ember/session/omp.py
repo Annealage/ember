@@ -225,6 +225,10 @@ login ("No models available") is reported as that, with the command that
 logs the profile in: ``login_command`` when the product names one (a
 service's own seed script), else `omp`'s own ``auth-broker login`` under the
 environment this session launches it with (``_login_command``).
+A message `omp` refuses with "No API key found for <provider>" (at once, or later as
+an unanswered ``prompt`` error) reaches the page as a short owner-facing sentence with
+``AgentError.fault_code="agent_login_missing"`` (``_refusal_view``); omp's own text
+names a server path and is written only to the server's stderr.
 
 **Input delivery.** The inspected RPC API exposes a ``streamingBehavior`` prompt
 option but no negotiated steering capability. OMP therefore reports
@@ -872,7 +876,9 @@ class OmpSession:
             else:
                 self._running = False
                 self._active_input_id = None
-                self._emit(InputState(input_id, turn, "rejected", str(exc)))
+                self._emit(
+                    InputState(input_id, turn, "rejected", _refusal_view(str(exc))[0] or str(exc))
+                )
                 self._refused(str(exc) or type(exc).__name__, turn, ends_turn=True)
 
     async def _tear_down_after_uncertain_send(self, exc: BaseException, viewer) -> None:
@@ -915,17 +921,16 @@ class OmpSession:
         Reported in the chat; the session stays ready. ``ends_turn`` closes
         the turn the message would have started, so the pane does not wait on
         it."""
-        self._emit(
-            AgentError(
-                stderr=reason,
-                remediation="omp did not accept that message, so the agent never saw it; "
-                "the session is still ready, so send it again",
-            )
-        )
+        shown, remediation, code = _refusal_view(reason)
+        if code is not None:
+            # The raw text names the server's profile path and advice for a person at
+            # that machine; the page gets the short sentence, the operator the log.
+            sys.stderr.write("warning: omp refused a message (%s): %s\n" % (code, reason))
+        self._emit(AgentError(stderr=shown or reason, remediation=remediation, fault_code=code))
         if ends_turn:
             self._running = False
             if self._active_input_id is not None:
-                self._emit(InputState(self._active_input_id, turn, "rejected", reason))
+                self._emit(InputState(self._active_input_id, turn, "rejected", shown or reason))
             self._active_input_id = None
             self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
             asyncio.ensure_future(self._send_next_queued())
@@ -2785,6 +2790,30 @@ def _login_command(env: dict, binary: Optional[str]) -> str:
             words.append("%s=%s" % (name, shlex.quote(value)))
     words += [shlex.quote(binary or "omp"), "auth-broker", "login"]
     return " ".join(words)
+
+
+_NO_KEY = re.compile(r"no api key found for ([A-Za-z0-9_.-]{1,64})", re.IGNORECASE)
+_RETRY_REMEDIATION = (
+    "omp did not accept that message, so the agent never saw it; "
+    "the session is still ready, so send it again"
+)
+
+
+def _refusal_view(reason: str):
+    """What the page is told about an omp refusal: ``(text, remediation, fault_code)``.
+    omp's "No API key found for <provider>. Use /login, set an API key environment
+    variable, or create <profile>/agent.db" is not shown: it names a path on the
+    server and advice for someone at that machine, and sending again cannot work
+    until the login is fixed. ``text`` is None for any other refusal (shown as omp
+    said it, retry advice)."""
+    found = _NO_KEY.search(reason)
+    if found is None:
+        return None, _RETRY_REMEDIATION, None
+    return (
+        "The agent's %s login has expired or is missing." % found.group(1).rstrip(".").lower(),
+        "Ask the operator to sign in again, then send your message again.",
+        "agent_login_missing",
+    )
 
 
 def _no_login_remediation(profile: str, command: str) -> str:

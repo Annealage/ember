@@ -586,6 +586,11 @@ class AgentError(AgentEvent):
     message belonging to the active host timeout interrupt, not a successful
     interrupt acknowledgement. Consumers must still require that acknowledgement
     and a terminal boundary before treating it as an expected interruption.
+
+    ``fault_code`` is a stable machine-readable class for the failures a host
+    reports differently from the raw text; ``"agent_login_missing"`` is a model
+    provider login omp does not have (``stderr`` is then a short owner-facing
+    sentence, never omp's own text, which names a server path).
     """
 
     kind: ClassVar[str] = "agent_error"
@@ -594,6 +599,7 @@ class AgentError(AgentEvent):
     viewer: Optional[str] = None
     role_resolution_error: Optional[bool] = None
     interruption_reason: Optional[str] = None
+    fault_code: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)

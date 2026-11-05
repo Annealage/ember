@@ -24,6 +24,7 @@ docstring). ``tests/test_codex_session.py``'s identical pattern for
 """
 
 import asyncio
+import dataclasses
 import json
 import os
 import shutil
@@ -1597,6 +1598,53 @@ async def test_a_message_refused_after_omp_acknowledged_it_is_reported_the_same_
         assert session.agent_status() == AGENT_READY
         await _next_input_state(recorder, 2, "provider_ack")
         assert [call.message for call in fake.prompt_calls] == ["hello", "queued"]
+    finally:
+        await session.close()
+
+
+NO_KEY = (
+    "No API key found for anthropic. Use /login, set an API key environment variable, "
+    "or create /home/corona/.local/share/annealage-loom/omp/agent.db"
+)
+
+
+def _login_missing_is_owner_facing(recorder, error):
+    assert error.fault_code == "agent_login_missing"
+    assert error.stderr == "The agent's anthropic login has expired or is missing."
+    assert error.remediation == ("Ask the operator to sign in again, then send your message again.")
+    # Nothing the page can receive carries omp's text: no server path, no env-var advice.
+    for event in recorder.all:
+        wire = repr(dataclasses.asdict(event)) if dataclasses.is_dataclass(event) else repr(event)
+        assert "agent.db" not in wire and "/home/corona" not in wire
+        assert "environment variable" not in wire
+
+
+@pytest.mark.asyncio
+async def test_a_missing_model_login_is_reported_without_omps_path_when_omp_refuses_at_once(capsys):
+    session, fake, recorder, broker = await _started_session()
+    try:
+        fake.prompt_error = RpcCommandError(NO_KEY)
+        await session.submit_turn(_text("hello"))
+        error = await _next_of(recorder, AgentError)
+        await _next_of(recorder, TurnEnd)
+        _login_missing_is_owner_facing(recorder, error)
+        # The operator keeps the raw text.
+        assert "agent.db" in capsys.readouterr().err
+        assert session.agent_status() == AGENT_READY
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_missing_model_login_is_reported_without_omps_path_when_omp_refuses_later():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("hello"))
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, fake.push_protocol_error, "prompt", NO_KEY)
+        error = await _next_of(recorder, AgentError)
+        await _next_of(recorder, TurnEnd)
+        _login_missing_is_owner_facing(recorder, error)
     finally:
         await session.close()
 
