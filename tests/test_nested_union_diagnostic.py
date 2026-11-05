@@ -199,3 +199,28 @@ def test_a_union_nested_beyond_the_expansion_depth_admits_the_omission():
     diagnostic = _diagnose(schema, args)
     assert diagnostic["issues"]
     assert diagnostic["truncated"] >= 1
+
+
+def test_format_is_an_annotation_that_is_not_enforced():
+    """Datum publishes ``format: uuid`` on job ids; the server checks them, Ember passes them on."""
+    schema = {
+        "type": "object",
+        "properties": {"job_id": {"type": "string", "format": "uuid"}},
+        "required": ["job_id"],
+    }
+    validator, _ = _compile_schema(schema)
+    assert validator.is_valid({"job_id": "not-a-uuid"})
+    assert not validator.is_valid({"job_id": 3})
+
+
+def test_other_content_keywords_are_still_refused():
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "string", "contentEncoding": "base64"}},
+    }
+    try:
+        _compile_schema(schema)
+    except ValueError as exc:
+        assert "contentEncoding" in str(exc)
+    else:
+        raise AssertionError("contentEncoding was accepted")

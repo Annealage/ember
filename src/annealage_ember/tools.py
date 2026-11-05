@@ -283,6 +283,9 @@ def _compile_schema(schema):
         "deprecated",
         "readOnly",
         "writeOnly",
+        # Never enforced here (no format checker is installed), so it only annotates;
+        # the server validates its own formats.
+        "format",
         "$defs",
         "definitions",
     }
@@ -323,7 +326,6 @@ def _compile_schema(schema):
                 "$dynamicRef",
                 "$recursiveRef",
                 "$recursiveAnchor",
-                "format",
                 "contentSchema",
                 "contentEncoding",
                 "contentMediaType",

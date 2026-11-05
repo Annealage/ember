@@ -318,7 +318,13 @@ def discover(servers, *, product_server=None, _retry=False):
         except Exception as exc:
             _warn(
                 "the %s MCP server has an unsupported or invalid tool schema (%s); "
-                "its tools are unavailable" % (server.name, type(exc).__name__)
+                "its tools are unavailable"
+                % (
+                    server.name,
+                    "%s: %s" % (type(exc).__name__, exc)
+                    if type(exc) is ValueError
+                    else type(exc).__name__,
+                )
             )
             unreached.append(server.name)
             continue
