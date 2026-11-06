@@ -990,21 +990,18 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
     # abort outcomes, not startup timeout behavior.
     submitted = asyncio.Event()
     native_submit = omp_module.OmpSession.submit_turn
-    native_wait = asyncio.wait
     work_timeout = 41.0
 
     async def submit(session, *args, **kwargs):
         await native_submit(session, *args, **kwargs)
         submitted.set()
 
-    async def wait_after_submission(fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
-        if timeout == work_timeout:
-            await submitted.wait()
-            timeout = 0
-        return await native_wait(fs, timeout=timeout, return_when=return_when)
+    async def expire_after_submission(settled, run, window):
+        assert window == work_timeout
+        await submitted.wait()
 
     monkeypatch.setattr(omp_module.OmpSession, "submit_turn", submit)
-    monkeypatch.setattr(asyncio, "wait", wait_after_submission)
+    monkeypatch.setattr(headless, "_wait_while_active", expire_after_submission)
 
     def abort(client):
         client.aborts += 1

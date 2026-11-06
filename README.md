@@ -669,7 +669,7 @@ Timeout recovery is separately opt-in:
 result = await run_prompt(
     prompt, tools=tools, backend="omp", model=None, cwd=scratch_dir,
     timeout=1800,                  # hard total: startup, all turns and callbacks
-    work_timeout=600,              # optional active-turn interval; default None
+    work_timeout=600,              # inactivity window: no event and no tool in flight for 600 s; default None
     interrupt_timeout=10,          # bounded tool/result drain + native abort
     on_timeout=diagnose_timeout,   # TimeoutContext -> diagnostic str | None; async allowed
     max_timeout_recoveries=2,      # default 0: no diagnostic submissions

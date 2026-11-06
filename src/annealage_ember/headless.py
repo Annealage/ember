@@ -85,6 +85,7 @@ import secrets
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -307,6 +308,9 @@ class _Run:
         # after that refuses (``guard``), and ``end`` cancels those running.
         self.over = False
         self._inflight: set = set()
+        # When anything last happened in this run (an event, a host tool starting or
+        # finishing); ``_drive``'s ``work_timeout`` is the quiet time since then.
+        self.last_active = time.monotonic()
         self.role_resolution_error = False
         self.timeout_kind = None
         self.paused = False
@@ -339,10 +343,12 @@ class _Run:
                 return fail("this run is interrupted, so %s did not run" % tool_def.name)
             task = asyncio.current_task()
             self._inflight.add(task)
+            self.last_active = time.monotonic()
             try:
                 return await inner(args)
             finally:
                 self._inflight.discard(task)
+                self.last_active = time.monotonic()
 
         return dataclasses.replace(tool_def, handler=handler)
 
@@ -406,6 +412,7 @@ class _Run:
         return tuple((name, ok) for name, ok in self._calls)
 
     def on_event(self, event) -> None:
+        self.last_active = time.monotonic()
         if self.over:
             return
         if self.finished and not isinstance(
@@ -845,6 +852,27 @@ async def _timeout_callback(callback, context):
     return text
 
 
+async def _wait_while_active(settled, run: _Run, work_timeout) -> None:
+    """Wait for ``settled``, or until the run has been quiet for ``work_timeout``
+    seconds: no session event, and no host tool or native tool call in flight (a
+    long call is work, not silence). Returns with ``settled`` not done only then.
+    ``None`` waits for ``settled`` alone."""
+    if work_timeout is None:
+        await asyncio.wait({settled})
+        return
+    run.last_active = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if run._inflight or run._pending_calls:
+            run.last_active = now
+        remaining = work_timeout - (now - run.last_active)
+        if remaining <= 0:
+            return
+        await asyncio.wait({settled}, timeout=max(remaining, 0.005))
+        if settled.done():
+            return
+
+
 async def _drive(
     session,
     run: _Run,
@@ -917,7 +945,7 @@ async def _drive(
     try:
         while True:
             settled = asyncio.ensure_future(boundary())
-            await asyncio.wait({settled}, timeout=work_timeout)
+            await _wait_while_active(settled, run, work_timeout)
             if not settled.done():
                 # Refuse new host calls while allowing successful writes already
                 # running to finish. Never cancel/replay them to recover time.
@@ -1219,8 +1247,10 @@ async def run_prompt(
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
 
-    ``work_timeout`` optionally bounds each active turn (startup, prompt
-    acknowledgement and tool settlement included). It never extends ``timeout``,
+    ``work_timeout`` is an inactivity window for each active turn (startup, prompt
+    acknowledgement and tool settlement included): it expires only after that many
+    seconds with no session event and no host or native tool call in flight, so a
+    turn that keeps producing is never interrupted by it. It never extends ``timeout``,
     the hard total deadline. OMP alone currently supports safe live recovery:
     abort must acknowledge, a real terminal boundary must arrive, the original
     submission must settle and all host tools/results must finish, within

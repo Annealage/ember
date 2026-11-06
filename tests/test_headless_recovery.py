@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import tool
 from test_headless import finish, make_args, make_toolset, script_session
 
 from annealage_ember import RecoveryInfo, TimeoutContext, headless
-from annealage_ember.headless import run_prompt
-from annealage_ember.session.base import AgentError, ToolResult, ToolUse
+from annealage_ember.headless import ToolSet, run_prompt
+from annealage_ember.session.base import AgentError, TextDelta, ToolResult, ToolUse
+from annealage_ember.tools import Grading, ok
 
 pytestmark = pytest.mark.asyncio
 
@@ -114,11 +116,10 @@ async def test_recovery_count_is_a_hard_bound(monkeypatch, tmp_path):
     assert built.session.started == 1
 
 
-@pytest.mark.parametrize("mode", ("negative_ack", "no_boundary", "hung_abort", "missing_result"))
+@pytest.mark.parametrize("mode", ("negative_ack", "no_boundary", "hung_abort"))
 async def test_uncertain_interruption_never_submits_next_turn(monkeypatch, tmp_path, mode):
     async def script(session):
-        if mode == "missing_result":
-            session.emit(ToolUse(turn=1, tool_use_id="uncertain", name="save", input={}))
+        pass
 
     async def interrupt(session):
         if mode == "hung_abort":
@@ -145,8 +146,6 @@ async def test_uncertain_interruption_never_submits_next_turn(monkeypatch, tmp_p
     assert contexts[0].interruption == "unsafe"
     assert len(built.session.submitted_turns) == 1
     assert (tmp_path / "conversation" / "headless.json").is_file()
-    if mode == "missing_result":
-        assert built.session.interrupted == 0  # Never abort an unrecorded write.
 
 
 async def test_unsupported_backend_reports_capability_without_retry(monkeypatch, tmp_path):
@@ -341,83 +340,6 @@ async def test_invalid_recovery_configuration_fails_before_start(tmp_path, extra
         await run_prompt("original", **make_args(tmp_path, **extra))
 
 
-async def test_write_result_is_in_native_history_before_abort(monkeypatch, tmp_path):
-    release = asyncio.Event()
-    wrote = asyncio.Event()
-    result_recorded = asyncio.Event()
-    workers, saved = [], []
-
-    from claude_agent_sdk import tool
-
-    from annealage_ember.headless import ToolSet
-    from annealage_ember.tools import Grading, ok
-
-    @tool("commit_value", "Write once", {})
-    async def commit_value(args):
-        await release.wait()
-        saved.append("committed")
-        wrote.set()
-        return ok(text="committed")
-
-    async def script(session):
-        if len(session.submitted_turns) != 1:
-            await finish(session, turn=2)
-            return
-        session.emit(ToolUse(turn=1, tool_use_id="write", name="commit_value", input={}))
-
-        async def work():
-            await built.kwargs["server"].host_tool_table()["commit_value"].handler({})
-            session.emit(ToolResult(tool_use_id="write", is_error=False, text="committed"))
-            result_recorded.set()
-
-        workers.append(asyncio.create_task(work()))
-
-    async def interrupt(session):
-        assert wrote.is_set() and result_recorded.is_set()
-        await finish(session)
-        return True
-
-    built = recoverable(monkeypatch, script, interrupt=interrupt)
-    contexts = []
-    # Release only once the SDK has actually paused tools for interval recovery,
-    # not according to a racing sleep relative to the deadline.
-    paused = asyncio.Event()
-    original_settle = headless._Run.settle_tool_results
-
-    async def settle(run):
-        paused.set()
-        await original_settle(run)
-
-    monkeypatch.setattr(headless._Run, "settle_tool_results", settle)
-    task = asyncio.create_task(
-        run_prompt(
-            "original",
-            **make_args(
-                tmp_path,
-                tools=ToolSet(
-                    tools=[commit_value],
-                    grading=Grading(read=(), view=(), write=("commit_value",)),
-                    grant=("commit_value",),
-                ),
-                work_timeout=0.01,
-                interrupt_timeout=1,
-                max_timeout_recoveries=1,
-                on_timeout=lambda context: contexts.append(context) or "diagnose",
-            ),
-        )
-    )
-    await paused.wait()
-    assert saved == [] and built.session.interrupted == 0
-    refused = await built.kwargs["server"].host_tool_table()["commit_value"].handler({})
-    assert refused["is_error"] is True
-    release.set()
-    result = await task
-    await asyncio.gather(*workers)
-    assert saved == ["committed"] and result.error is None
-    assert result.calls == (("commit_value", True),)
-    assert contexts[0].interruption == "safe"
-
-
 async def test_cancel_during_diagnostic_policy_never_authorizes_next_input(monkeypatch, tmp_path):
     entered = asyncio.Event()
 
@@ -511,3 +433,89 @@ async def test_repeated_end_does_not_interrupt_awaited_handler_cleanup():
     with pytest.raises(asyncio.CancelledError):
         await worker
     assert cleaned == ["once"]
+
+
+async def test_work_timeout_is_not_hit_by_a_turn_that_keeps_producing(monkeypatch, tmp_path):
+    async def script(session):
+        for _ in range(5):
+            await asyncio.sleep(0.2)
+            session.emit(TextDelta(turn=1, text="."))
+        await finish(session, text=("done",))
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "original",
+        **make_args(tmp_path, work_timeout=0.5, on_timeout=contexts.append),
+    )
+    assert result.error is None and result.text.endswith("done")
+    assert contexts == [] and built.session.interrupted == 0
+
+
+async def test_work_timeout_fires_after_the_run_goes_quiet(monkeypatch, tmp_path):
+    async def script(session):
+        session.emit(TextDelta(turn=1, text="started"))
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "original",
+        **make_args(tmp_path, work_timeout=0.5, on_timeout=contexts.append),
+    )
+    assert result.timeout_kind == "work_interval" and result.error == "timeout"
+    assert [c.kind for c in contexts] == ["work_interval"]
+    assert built.session.interrupted == 1
+
+
+async def test_work_timeout_does_not_count_a_long_host_tool_call_as_silence(monkeypatch, tmp_path):
+    saved = []
+
+    @tool("save", "save a value, slowly", {"v": str})
+    async def save(args):
+        await asyncio.sleep(0.8)
+        saved.append(args["v"])
+        return ok(text="saved")
+
+    slow = ToolSet(
+        tools=[save], grading=Grading(read=(), view=(), write=("save",)), grant=("save",)
+    )
+
+    async def script(session):
+        session.emit(ToolUse(turn=1, tool_use_id="t", name="save", input={"v": "x"}))
+        await built.kwargs["server"].host_tool_table()["save"].handler({"v": "x"})
+        session.emit(ToolResult(tool_use_id="t", is_error=False, text="saved"))
+        await finish(session, text=("done",))
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "original",
+        **make_args(
+            tmp_path,
+            tools=slow,
+            work_timeout=0.3,
+            on_timeout=contexts.append,
+        ),
+    )
+    assert result.error is None and result.text.endswith("done")
+    assert saved == ["x"] and contexts == []
+
+
+async def test_a_tool_call_that_never_answers_is_ended_only_by_the_hard_deadline(
+    monkeypatch, tmp_path
+):
+    """An unanswered call is in flight, not silence, so ``work_timeout`` never aborts it
+    (it could be an unrecorded write); ``timeout`` is the backstop."""
+
+    async def script(session):
+        session.emit(ToolUse(turn=1, tool_use_id="uncertain", name="save", input={}))
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "original",
+        **make_args(tmp_path, timeout=0.6, work_timeout=0.1, on_timeout=contexts.append),
+    )
+    assert result.error == "timeout" and result.timeout_kind == "hard_deadline"
+    assert [c.kind for c in contexts] == ["hard_deadline"]
+    assert built.session.interrupted == 0
