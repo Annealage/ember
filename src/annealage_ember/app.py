@@ -724,12 +724,9 @@ def create_app(
     bus.hosted_mode = hosted_mode
     bus.hosted_tool_ops = dict(hosted_tool_ops or {})
     bus.hosted_turn_ops = ()
-    bus.hosted_turn_exp = 0
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
     bus.hosted_turn_principal = None
-    bus.hosted_expiry_handle = None
-    bus.hosted_turn_owner = None
     bus.hosted_turn_generation = 0
     bus.hosted_lock = threading.Lock()
     bus.hosted_cancel_generation = 0
@@ -837,6 +834,7 @@ def create_app(
                 publish,
                 permissions_path=sessions.state_dir(state_project_dir) / "permissions.toml",
                 timeout=float(settings["approval_timeout"]),
+                hold_until_answered=hosted_mode,
                 never_remembered=tools.never_remembered,
                 request_guard=tools.request_guard,
                 automatic_tools=(
@@ -1208,8 +1206,8 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
         if bus is not None and getattr(bus, "hosted_mode", False):
             # Only a real end of the turn ends its grant. An AgentError does not: a
             # stream error leaves the session ready and the turn possibly still
-            # running, and clearing the grant then would leave nothing for a
-            # disconnect or the expiry to stop (the turn's own TurnEnd, or a
+            # running, and clearing the grant then would leave nothing for an
+            # explicit interrupt to stop (the turn's own TurnEnd, or a
             # SessionReset, clears it).
             ended = isinstance(event, SessionReset) or (
                 isinstance(event, TurnEnd) and event.stop_reason != "steered"
@@ -1217,7 +1215,6 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
             if ended:
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
-                bus.hosted_turn_exp = 0
                 bus.hosted_turn_secret = None
         if isinstance(event, AgentError):
             _journal_agent_error(event, journaled)
@@ -1902,7 +1899,6 @@ class AgentHolder:
                 # The grant of the turn that was running ends with it.
                 bus.hosted_turn_live = False
                 bus.hosted_turn_ops = ()
-                bus.hosted_turn_exp = 0
                 bus.hosted_turn_secret = None
         self._note_change()
         return interrupted

@@ -1117,3 +1117,15 @@ async def test_write_without_durable_ledger_is_refused_before_network(fake):
     assert result["is_error"] is True
     assert "durable action ledger is unavailable" in _text(result)
     assert fake.stored == []
+
+
+@pytest.mark.parametrize(("hosted", "held"), ((True, True), (False, False)))
+def test_a_hosted_session_holds_its_permission_cards_until_answered(
+    hosted, held, fake, bus, tmp_path
+):
+    """Only a hosted worker's cards outlive the browser; every other app keeps the
+    shared approval defaults."""
+    tools = _tools(bus, tmp_path, _fake(fake))
+    broker = _session("omp", tools, tmp_path, hosted_mode=hosted)._broker
+    assert broker._hold is held
+    assert (broker.timeout >= 7 * 24 * 3600) is held

@@ -82,21 +82,19 @@ def test_the_check_runs_under_the_write_lock_so_an_abort_cannot_overtake_a_check
     assert order == ["locked"]
 
 
-def test_release_does_not_wait_for_a_blocked_prompt_write_and_the_abort_follows_it_on_the_wire():
+def test_interrupt_does_not_wait_for_a_blocked_prompt_write_and_the_abort_follows_it_on_the_wire():
     client, stdin = _client()
     stdin.pause = threading.Event()  # the pipe is full: the prompt's write blocks
     bus = SimpleNamespace(
         hosted_turn_live=True,
         hosted_turn_ops=(),
-        hosted_turn_exp=time.time() + 60,
         hosted_turn_secret="s",
         hosted_turn_principal="alice",
-        hosted_turn_owner="conn",
         hosted_turn_generation=1,
+        hosted_cancel_generation=0,
         hosted_stopping=0,
         hosted_fenced=False,
         hosted_lock=threading.Lock(),
-        hosted_expiry_handle=None,
     )
     hosted_authority.GENERATION.set(1)
     check = hosted_authority.checker(bus)
@@ -113,7 +111,7 @@ def test_release_does_not_wait_for_a_blocked_prompt_write_and_the_abort_follows_
     sender.start()
     time.sleep(0.2)  # checked, and now stuck writing
     started = time.monotonic()
-    hosted_authority.release(bus, "conn", None)  # what the event loop does on revocation
+    hosted_authority.interrupt(bus, None)  # what the event loop does on revocation
     assert time.monotonic() - started < 0.1  # never waits for the write
     aborter = threading.Thread(target=lambda: _swallow(client.abort))
     aborter.start()

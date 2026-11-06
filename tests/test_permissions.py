@@ -694,3 +694,41 @@ async def test_a_new_broker_never_reissues_a_request_id_a_page_may_still_show():
         await broker.decide(request.request_id, "deny")
         await asked
     assert ids[0] != ids[1]
+
+
+async def test_a_held_card_survives_every_viewer_leaving_and_is_answered_by_the_next_one():
+    """A hosted turn outlives its browser: the card waits, whoever attaches next
+    sees it among ``pending_requests`` and answers it."""
+    broker, events = _broker(no_viewer_grace=0.01, hold_until_answered=True)
+    broker.viewer_connected()
+    task, request = await _pending_request(broker, events)
+
+    broker.viewer_disconnected()  # nobody is attached, past the grace a plain broker uses
+    await asyncio.sleep(0.2)
+    assert not task.done()
+    assert [r.request_id for r in broker.pending_requests()] == [request.request_id]
+
+    broker.viewer_connected()  # a different browser, later
+    assert [r.request_id for r in broker.pending_requests()] == [request.request_id]
+    await broker.decide(request.request_id, "allow")
+    _assert_allow(await task)
+    assert _resolutions(events)[0].outcome == "allow"
+
+
+async def test_a_held_broker_raises_the_card_for_a_request_with_no_viewer_attached():
+    broker, events = _broker(hold_until_answered=True)
+    task, request = await _pending_request(broker, events)
+    assert [r.request_id for r in broker.pending_requests()] == [request.request_id]
+    broker.shutdown()  # the job ending still denies it
+    _assert_deny(await task)
+    assert _resolutions(events)[0].outcome == "shutdown"
+
+
+async def test_a_held_card_does_not_expire_on_the_ordinary_approval_timeout():
+    broker, events = _broker(timeout=0.05, hold_until_answered=True)
+    broker.viewer_connected()
+    task, request = await _pending_request(broker, events)
+    await asyncio.sleep(0.2)
+    assert not task.done() and broker.timeout >= 7 * 24 * 3600
+    await broker.decide(request.request_id, "deny")
+    _assert_deny(await task)

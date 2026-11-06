@@ -13,6 +13,7 @@ from test_hosted_session import OTHER, PRINCIPAL, _build
 from test_identity import HELLO, UPGRADE, _RawSock, _turn
 
 from annealage_ember import protocol
+from annealage_ember.session.base import TurnEnd
 
 pytestmark = pytest.mark.asyncio
 
@@ -20,8 +21,9 @@ pytestmark = pytest.mark.asyncio
 class _Verifier:
     """Two principals, and a delegation that outlives the test or does not."""
 
-    def __init__(self, expiry=None):
+    def __init__(self, expiry=None, ops=("project.read", "project.exec")):
         self.expiry = expiry
+        self.ops = ops
 
     def verify(self, token, operation):
         subs = {"alice": PRINCIPAL, "bob": OTHER}
@@ -31,7 +33,7 @@ class _Verifier:
             sub=subs[token],
             wsp="wsp_test",
             prj="prj_test",
-            ops=("project.read", "project.exec"),
+            ops=self.ops,
             job="job_test",
             rev="a" * 40,
             exp=self.expiry if self.expiry is not None else time.time() + 60,
@@ -42,6 +44,22 @@ def _as(who):
     return {"Authorization": "Bearer " + who, "X-Annealage-Principal-Display": who}
 
 
+def _decode(data):
+    """The JSON frames in a server's (unmasked) websocket text frames."""
+    frames, i = [], 0
+    while i < len(data):
+        opcode, length = data[i] & 0x0F, data[i + 1] & 0x7F
+        i += 2
+        if length == 126:
+            length, i = int.from_bytes(data[i : i + 2], "big"), i + 2
+        elif length == 127:
+            length, i = int.from_bytes(data[i : i + 8], "big"), i + 8
+        payload, i = data[i : i + length], i + length
+        if opcode == 1:
+            frames.append(json.loads(payload))
+    return frames
+
+
 class _Held:
     """One open ``/ws`` connection that stays open until ``close()``: the
     server only sees the peer go away then, as it does when the front closes it."""
@@ -50,6 +68,12 @@ class _Held:
         self.app, self.who = app, who
         self.gone = asyncio.Event()
         self.task = None
+        self.sock = None
+
+    def frames(self):
+        """Every frame the server has written on this connection so far."""
+        data = b"".join(self.sock.written)
+        return _decode(data[data.index(b"\r\n\r\n") + 4 :])
 
     async def open(self, frames):
         client = make_test_client(self.app)
@@ -71,7 +95,7 @@ class _Held:
                     raise ConnectionError("peer closed")
                 return await super().read(n)
 
-        sock = Sock(request + inbound)
+        sock = self.sock = Sock(request + inbound)
         req = await Request.create(self.app, sock, sock, ("127.0.0.1", 1234), scheme=None)
         self.task = asyncio.ensure_future(self.app.dispatch_request(req))
         await asyncio.sleep(0.2)
@@ -80,6 +104,13 @@ class _Held:
     async def close(self):
         self.gone.set()
         await asyncio.wait_for(self.task, 5)
+
+
+def _hold_the_start(app):
+    """The holder's start is still running: an input is deferred until it settles."""
+    starting = asyncio.get_running_loop().create_future()
+    app.agent_holder._start_task = starting
+    return starting
 
 
 async def _send(app, who, text, client_id="c-1"):
@@ -126,9 +157,10 @@ async def test_the_owner_cannot_queue_or_steer_behind_their_own_running_turn(
         await app.agent_stop()
 
 
-async def test_a_turn_still_running_when_its_delegation_expires_is_interrupted(
+async def test_a_turn_still_running_when_its_delegation_expires_keeps_running(
     served_dir, tmp_path_factory
 ):
+    """``exp`` gates admission and the socket, not the turn that got in."""
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier(expiry=time.time() + 0.5))
     app = hosted.app
     await app.agent_start()
@@ -138,20 +170,20 @@ async def test_a_turn_still_running_when_its_delegation_expires_is_interrupted(
         bus = app.agent_bus
         assert session.interrupted == 0 and bus.hosted_turn_live
         await asyncio.sleep(0.8)
-        assert session.interrupted == 1
-        assert not bus.hosted_turn_live and bus.hosted_turn_ops == ()
-        # Expired authority cannot start another turn either.
-        await _send(app, "alice", "later", client_id="c-2")
-        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first"]
+        assert session.interrupted == 0 and bus.hosted_turn_live
+        assert bus.hosted_turn_ops and bus.hosted_turn_secret is not None
+        # Only its own end ends the grant.
+        session.emit(TurnEnd(turn=1, stop_reason="end_turn", cost_usd=None))
+        assert not bus.hosted_turn_live
     finally:
         await app.agent_stop()
 
 
-async def test_losing_the_connection_that_holds_the_grant_ends_it_and_interrupts(
+async def test_losing_the_connection_that_started_a_turn_changes_nothing_about_it(
     served_dir, tmp_path_factory
 ):
-    """The front closes the socket when access is revoked: that is all this
-    process is told, so the grant ends with it and the turn stops."""
+    """A browser is a view that comes and goes: the front closing the socket (a
+    closed tab, a dropped network, an expired delegation) does not stop the turn."""
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
     app = hosted.app
     await app.agent_start()
@@ -159,17 +191,17 @@ async def test_losing_the_connection_that_holds_the_grant_ends_it_and_interrupts
         held = await _send(app, "alice", "first")
         (session,) = hosted.sessions
         bus = app.agent_bus
+        secret = bus.hosted_turn_secret
         assert bus.hosted_turn_live and session.interrupted == 0
         await held.close()
-        await asyncio.sleep(0.1)
-        assert not bus.hosted_turn_live and bus.hosted_turn_ops == ()
-        assert bus.hosted_turn_secret is None
-        assert session.interrupted == 1
+        await asyncio.sleep(0.2)
+        assert bus.hosted_turn_live and bus.hosted_turn_secret == secret
+        assert session.interrupted == 0 and bus.hosted_stopping == 0
     finally:
         await app.agent_stop()
 
 
-async def test_a_prompt_waiting_for_the_agent_to_start_is_not_dispatched_after_revocation(
+async def test_a_prompt_waiting_for_the_agent_to_start_is_still_dispatched_when_its_tab_closes(
     served_dir, tmp_path_factory
 ):
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
@@ -178,49 +210,77 @@ async def test_a_prompt_waiting_for_the_agent_to_start_is_not_dispatched_after_r
     try:
         (session,) = hosted.sessions
         session.set_status("connecting")
+        starting = _hold_the_start(app)
         held = await _send(app, "alice", "wait for me")
         assert session.submitted_turns == []
         assert any(w["state"] == "queued" for w in _logged(app, "input_state"))
-        await held.close()  # revoked while the agent is still starting
+        await held.close()  # the tab goes while the agent is still starting
         await asyncio.sleep(0.1)
         session.set_status("ready")
+        starting.set_result(None)
         await asyncio.sleep(0.5)
-        assert session.submitted_turns == []
-        assert [w["stop_reason"] for w in _logged(app, "turn_end")] == ["rejected"]
+        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["wait for me"]
     finally:
         await app.agent_stop()
 
 
-async def test_a_disconnect_is_seen_while_the_turn_is_still_being_prepared(
+async def test_a_prompt_waiting_for_the_agent_to_start_is_not_dispatched_after_an_interrupt(
     served_dir, tmp_path_factory
 ):
-    """Recording and image expansion await inside the turn's dispatch; the
-    grant must end when the peer goes, not when that dispatch finishes."""
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        session.set_status("connecting")
+        starting = _hold_the_start(app)
+        held = await _send(app, "alice", "wait for me")
+        assert session.submitted_turns == []
+        interrupter = await _Held(app, "alice").open([HELLO, {"type": "interrupt"}])
+        await asyncio.sleep(0.1)
+        session.set_status("ready")
+        starting.set_result(None)
+        await asyncio.sleep(0.5)
+        assert session.submitted_turns == []
+        assert [w["stop_reason"] for w in _logged(app, "turn_end")] == ["rejected"]
+        await interrupter.close()
+        await held.close()
+    finally:
+        await app.agent_stop()
+
+
+async def test_a_disconnect_while_the_turn_is_being_prepared_does_not_stop_it(
+    served_dir, tmp_path_factory
+):
+    """Recording and image expansion await inside the turn's dispatch; the peer
+    going away in that time changes nothing: the turn is still sent."""
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
     app = hosted.app
     await app.agent_start()
     try:
         (session,) = hosted.sessions
         slow = asyncio.Event()
-        reached = []
+        reached, sent = [], []
 
         async def delayed_submit(blocks, viewer=None):
             reached.append(blocks)
             await slow.wait()  # the backend preparing the prompt
+            sent.append(blocks)
 
         session.submit_turn = delayed_submit
         held = await _send(app, "alice", "first")
         assert reached and app.agent_bus.hosted_turn_live
         await held.close()
         await asyncio.sleep(0.1)
-        assert not app.agent_bus.hosted_turn_live  # ended with the dispatch still pending
-        assert not slow.is_set()
+        assert app.agent_bus.hosted_turn_live and not sent
         slow.set()
+        await asyncio.sleep(0.1)
+        assert sent and app.agent_bus.hosted_turn_live
     finally:
         await app.agent_stop()
 
 
-async def test_a_turn_waiting_for_the_lock_when_its_connection_closes_takes_no_grant(
+async def test_a_turn_waiting_for_the_lock_when_its_tab_closes_still_runs(
     served_dir, tmp_path_factory
 ):
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
@@ -230,14 +290,14 @@ async def test_a_turn_waiting_for_the_lock_when_its_connection_closes_takes_no_g
         (session,) = hosted.sessions
         bus = app.agent_bus
         async with bus.turn_submission_lock:
-            held = await _send(app, "bob", "never")  # its dispatch now waits on the lock
+            held = await _send(app, "bob", "still sent")  # its dispatch now waits on the lock
             assert not bus.hosted_turn_live
-            await held.close()  # revoked before it ever held a grant: release has nothing to end
+            await held.close()
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.3)
-        assert not bus.hosted_turn_live and bus.hosted_turn_principal is None
-        assert _logged(app, "user_turn") == []
-        assert session.submitted_turns == []
+        assert bus.hosted_turn_live and bus.hosted_turn_principal == OTHER
+        assert [w["client_id"] for w in _logged(app, "user_turn")] == ["c-1"]
+        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["still sent"]
     finally:
         await app.agent_stop()
 
@@ -355,35 +415,32 @@ async def test_a_manual_interrupt_goes_through_the_bounded_stop_and_the_grant_en
         await app.agent_stop()
 
 
-async def test_an_agent_error_without_a_turn_end_leaves_the_grant_for_disconnect_and_expiry(
+async def test_an_agent_error_without_a_turn_end_leaves_the_grant_in_place(
     served_dir, tmp_path_factory
 ):
     """A stream error can leave the session ready and the turn still running:
-    the grant must survive it so a revocation or the expiry still stops the turn."""
+    the grant must survive it, so an explicit interrupt still stops the turn."""
     from annealage_ember.session.base import AgentError
 
-    for how in ("disconnect", "expiry"):
-        verifier = _Verifier(expiry=time.time() + 1.0 if how == "expiry" else None)
-        hosted = _build(served_dir, tmp_path_factory, verifier=verifier)
-        app = hosted.app
-        await app.agent_start()
-        try:
-            (session,) = hosted.sessions
-            bus = app.agent_bus
-            held = await _send(app, "alice", "first")
-            session.emit(AgentError(stderr="stream failed", remediation="retry"))
-            assert bus.hosted_turn_live, how  # not cleared by the error
-            if how == "disconnect":
-                await held.close()
-            else:
-                await asyncio.sleep(1.4)
-            await asyncio.sleep(0.2)
-            assert session.interrupted == 1, how  # the stop lifecycle still owns the turn
-            assert not bus.hosted_turn_live
-            if how == "expiry":
-                await held.close()
-        finally:
-            await app.agent_stop()
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        held = await _send(app, "alice", "first")
+        session.emit(AgentError(stderr="stream failed", remediation="retry"))
+        assert bus.hosted_turn_live  # not cleared by the error
+        await held.close()
+        await asyncio.sleep(0.2)
+        assert session.interrupted == 0 and bus.hosted_turn_live
+        interrupter = await _Held(app, "alice").open([HELLO, {"type": "interrupt"}])
+        await asyncio.sleep(0.2)
+        assert session.interrupted == 1  # the stop lifecycle still owns the turn
+        assert not bus.hosted_turn_live
+        await interrupter.close()
+    finally:
+        await app.agent_stop()
 
 
 async def test_no_successor_while_a_stop_is_pending_even_if_the_old_session_already_looks_down(
@@ -409,8 +466,8 @@ async def test_no_successor_while_a_stop_is_pending_even_if_the_old_session_alre
 
         session.stop_for_revocation = slow_failing_stop
         held = await _send(app, "alice", "first")
-        await held.close()  # revocation: the stop starts and is pending
-        await asyncio.sleep(0.1)
+        interrupter = await _Held(app, "alice").open([HELLO, {"type": "interrupt"}])
+        await asyncio.sleep(0.1)  # the stop starts and is pending
         assert bus.hosted_stopping == 1 and app.agent_holder._down
         # Concurrent human interactions while the stop is pending.
         again = await _send(app, "bob", "again")
@@ -423,6 +480,75 @@ async def test_no_successor_while_a_stop_is_pending_even_if_the_old_session_alre
         await _send(app, "bob", "and again")
         assert len(hosted.sessions) == 1  # fenced for good
         await again.close()
+        await interrupter.close()
+        await held.close()
     finally:
         gate.set()
+        await app.agent_stop()
+
+
+async def test_a_viewer_attaching_mid_turn_after_another_left_gets_the_replay_and_can_act(
+    served_dir, tmp_path_factory
+):
+    """The browser is a view that comes and goes: a second one, under its own
+    claims, is caught up from its cursor (events since, the open card) and can
+    answer the card and interrupt the turn the first one started."""
+    from annealage_ember.session.base import PermissionRequest, TextDelta
+
+    verifier = _Verifier(ops=("project.read", "project.exec", "project.write"))
+    hosted = _build(served_dir, tmp_path_factory, verifier=verifier)
+    app = hosted.app
+    await app.agent_start()
+    try:
+        (session,) = hosted.sessions
+        bus = app.agent_bus
+        first = await _send(app, "alice", "review this")
+        hello = [f for f in first.frames() if f["type"] == "hello"][0]
+        cursor = hello["seq"]
+        session.emit(TextDelta(turn=1, text="reading"))
+        session.emit(PermissionRequest(request_id="pr_held", tool="edit", input={}))
+        await asyncio.sleep(0.1)
+        seen = [f for f in first.frames() if f["type"] == "event"]
+        assert [f["event"]["kind"] for f in seen if f["seq"] > cursor][-2:] == [
+            "text_delta",
+            "permission_request",
+        ]
+        await first.close()
+        await asyncio.sleep(0.1)
+        assert app.agent_holder.status()["viewers"] == 0
+        assert bus.hosted_turn_live and session.interrupted == 0
+
+        # More happens with nobody attached.
+        session.emit(TextDelta(turn=1, text=" more"))
+
+        second = await _Held(app, "bob").open([{**HELLO, "last_seq": cursor}])
+        replay = [
+            f
+            for f in second.frames()
+            if f["type"] == "event" and f["event"]["kind"] != "viewer_primary"
+        ]
+        assert [f["event"]["kind"] for f in replay] == [
+            "user_turn",
+            "text_delta",
+            "permission_request",
+            "text_delta",
+        ]
+        assert [f["seq"] for f in replay] == sorted(f["seq"] for f in replay)
+        assert replay[-1]["event"]["text"] == " more"
+        assert app.agent_holder.status()["viewers"] == 1
+        await second.close()
+
+        # Under its own claims: bob answers the card and interrupts.
+        third = await _Held(app, "bob").open(
+            [
+                HELLO,
+                {"type": "permission", "request_id": "pr_held", "decision": "allow"},
+                {"type": "interrupt"},
+            ]
+        )
+        await asyncio.sleep(0.3)
+        assert session.permission_decisions == [("pr_held", "allow", "")]
+        assert session.interrupted == 1 and not bus.hosted_turn_live
+        await third.close()
+    finally:
         await app.agent_stop()

@@ -18,20 +18,17 @@ from annealage_ember.session.base import InputState  # noqa: E402
 pytestmark = pytest.mark.asyncio
 
 
-def _bus(exp):
+def _bus():
     return SimpleNamespace(
         hosted_turn_live=True,
         hosted_turn_ops=("project.exec",),
-        hosted_turn_exp=exp,
         hosted_turn_secret="s",
         hosted_turn_principal="alice",
-        hosted_turn_owner="conn",
         hosted_turn_generation=1,
         hosted_stopping=0,
         hosted_cancel_generation=0,
         hosted_fenced=False,
         hosted_lock=threading.Lock(),
-        hosted_expiry_handle=None,
     )
 
 
@@ -65,33 +62,36 @@ async def _submit_during_slow_expansion(monkeypatch, bus, *, while_expanding):
 
 async def test_a_prompt_is_sent_while_the_grant_still_holds(monkeypatch):
     fake, _ = await _submit_during_slow_expansion(
-        monkeypatch, _bus(time.time() + 60), while_expanding=lambda s: None
+        monkeypatch, _bus(), while_expanding=lambda s: None
     )
     assert [c.message for c in fake.prompt_calls] == ["go"]
 
 
 async def test_a_grant_released_during_image_expansion_is_not_sent(monkeypatch):
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     fake, recorder = await _submit_during_slow_expansion(
         monkeypatch,
         bus,
-        while_expanding=lambda s: hosted_authority.release(bus, "conn", None),
+        while_expanding=lambda s: hosted_authority.interrupt(bus, None),
     )
     assert fake.prompt_calls == []
     rejected = [e for e in recorder.all if isinstance(e, InputState) and e.state == "rejected"]
     assert rejected and "access" in rejected[0].detail
 
 
-async def test_a_grant_that_expires_during_image_expansion_is_not_sent(monkeypatch):
-    bus = _bus(time.time() + 0.3)
+async def test_a_delegation_that_expires_during_image_expansion_does_not_stop_the_send(
+    monkeypatch,
+):
+    """``exp`` gates admission only: the turn already admitted is still sent."""
+    bus = _bus()
     fake, _ = await _submit_during_slow_expansion(
         monkeypatch, bus, while_expanding=lambda s: time.sleep(0.4)
     )
-    assert fake.prompt_calls == []
+    assert [c.message for c in fake.prompt_calls] == ["go"]
 
 
 async def test_a_prompt_queued_behind_a_busy_executor_is_not_sent_after_revocation(monkeypatch):
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     session, fake, recorder, _broker = await _started_session()
     session.send_guard = lambda: hosted_authority.checker(bus)
     hosted_authority.GENERATION.set(bus.hosted_turn_generation)
@@ -101,7 +101,7 @@ async def test_a_prompt_queued_behind_a_busy_executor_is_not_sent_after_revocati
         task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
         await asyncio.sleep(0.2)  # past the early check, queued behind the busy call
         assert fake.prompt_calls == []
-        hosted_authority.release(bus, "conn", None)
+        hosted_authority.interrupt(bus, None)
         unblock.set()
         await asyncio.wait_for(task, 5)
         await asyncio.sleep(0.05)
@@ -114,12 +114,12 @@ async def test_a_prompt_queued_behind_a_busy_executor_is_not_sent_after_revocati
 async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_admitted_under(
     monkeypatch,
 ):
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     session, fake, _recorder, _broker = await _started_session()
     session.send_guard = lambda: hosted_authority.checker(bus)
     hosted_authority.GENERATION.set(bus.hosted_turn_generation)
     try:
-        hosted_authority.release(bus, "conn", None)
+        hosted_authority.interrupt(bus, None)
         # Someone else is admitted meanwhile: a live grant, but not this turn's.
         assert (
             hosted_authority.admit(
@@ -138,7 +138,7 @@ async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_ad
 async def test_the_send_check_never_sees_a_half_written_grant():
     """The check takes the lock admit/release take, so it cannot interleave
     with them (it does not, and cannot, order the provider call after it)."""
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     hosted_authority.GENERATION.set(bus.hosted_turn_generation)
     check = hosted_authority.checker(bus)
     done = threading.Event()
@@ -223,26 +223,32 @@ async def test_a_hosted_prompt_accepted_while_omp_starts_is_delivered_with_its_o
         await app.agent_stop()
 
 
-async def test_a_hosted_prompt_waiting_for_omp_to_start_is_refused_once_revoked_or_expired(
+async def test_a_hosted_prompt_waiting_for_omp_to_start_is_refused_once_interrupted_only(
     served_dir, tmp_path_factory
 ):
-    from test_hosted_authority_ws import _send, _Verifier
+    from test_hosted_authority_ws import HELLO, _Held, _send, _Verifier
 
-    for how in ("revoked", "expired"):
+    for how in ("interrupted", "tab_closed", "expired"):
         gate, built = threading.Event(), []
         verifier = _Verifier(expiry=time.time() + 1.5 if how == "expired" else None)
         app = _delayed_start_app(served_dir, tmp_path_factory, verifier, gate, built)
         await app.agent_start()
         try:
-            held = await _send(app, "alice", "too late")
-            if how == "revoked":
+            held = await _send(app, "alice", "wait")
+            if how == "interrupted":
+                interrupter = await _Held(app, "alice").open([HELLO, {"type": "interrupt"}])
+            elif how == "tab_closed":
                 await held.close()
             else:
                 await asyncio.sleep(1.8)
             gate.set()
             await asyncio.sleep(1.0)
-            assert not built or built[0].prompt_calls == [], how
-            if how == "expired":
+            if how == "interrupted":
+                assert not built or built[0].prompt_calls == [], how
+                await interrupter.close()
+            else:
+                assert built and [c.message for c in built[0].prompt_calls] == ["wait"], how
+            if how != "tab_closed":
                 await held.close()
         finally:
             gate.set()
@@ -342,7 +348,7 @@ async def test_a_stop_for_a_turn_that_already_ended_does_nothing():
 
 async def test_no_successor_is_admitted_until_the_revocation_stop_has_settled():
     """A late stop must never land on a turn that began after it was scheduled."""
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     gate = asyncio.Event()
     calls = []
 
@@ -351,7 +357,7 @@ async def test_no_successor_is_admitted_until_the_revocation_stop_has_settled():
             calls.append("stop")
             await gate.wait()  # the old turn's abort is slow
 
-    hosted_authority.release(bus, "conn", Session())
+    hosted_authority.interrupt(bus, Session())
     await asyncio.sleep(0.05)
     successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
     assert hosted_authority.admit(bus, None, successor) is not None  # refused while stopping
@@ -378,7 +384,7 @@ async def test_a_kill_that_is_not_verified_fences_the_worker_so_no_successor_run
     from annealage_ember.session.base import AgentError  # noqa: F401
 
     for how in ("false", "raises", "stalls", "missing"):
-        bus = _bus(time.time() + 60)
+        bus = _bus()
         session, fake = await _in_flight_turn()
         stall = threading.Event()
         try:
@@ -393,7 +399,7 @@ async def test_a_kill_that_is_not_verified_fences_the_worker_so_no_successor_run
             assert stopped is False, how
             assert session.agent_status() == "unavailable", how
 
-            hosted_authority.release(bus, "conn", _Stopping(stopped))
+            hosted_authority.interrupt(bus, _Stopping(stopped))
             await asyncio.sleep(0.1)
             assert bus.hosted_fenced is True, how
             successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
@@ -404,7 +410,7 @@ async def test_a_kill_that_is_not_verified_fences_the_worker_so_no_successor_run
 
 
 async def test_a_verified_kill_lets_the_worker_go_on_after_the_stop():
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     bus.hosted_fenced = False
     session, fake = await _in_flight_turn()
     fake.kill = lambda: True
@@ -412,7 +418,7 @@ async def test_a_verified_kill_lets_the_worker_go_on_after_the_stop():
         stopped = await session.stop_for_revocation(deadline=1.0, settle=0.2)
         assert stopped is True
 
-        hosted_authority.release(bus, "conn", _Stopping(stopped))
+        hosted_authority.interrupt(bus, _Stopping(stopped))
         await asyncio.sleep(0.1)
         assert bus.hosted_fenced is False
     finally:
@@ -421,7 +427,7 @@ async def test_a_verified_kill_lets_the_worker_go_on_after_the_stop():
 
 async def _hosted_send_failing_with(exc, monkeypatch=None):
     session, fake, recorder, _broker = await _started_session()
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     bus.hosted_fenced = False
     session.send_guard = lambda: hosted_authority.checker(bus)
     session.fence_hook = lambda: setattr(bus, "hosted_fenced", True)
@@ -462,7 +468,7 @@ async def test_a_prompt_omp_answered_with_an_error_is_a_plain_refusal():
 
 async def test_a_manual_interrupt_with_a_failed_abort_ends_in_a_verified_kill_or_a_fence():
     for verified in (True, False):
-        bus = _bus(time.time() + 60)
+        bus = _bus()
         session, fake = await _in_flight_turn()
 
         def broken_abort():
@@ -480,15 +486,12 @@ async def test_a_manual_interrupt_with_a_failed_abort_ends_in_a_verified_kill_or
             assert bus.hosted_stopping == 0
             assert session.agent_status() == "unavailable"
             assert bus.hosted_fenced is (not verified), verified
-            # the disconnect that follows has nothing left to disarm or retry
-            hosted_authority.release(bus, "conn", session)
-            assert bus.hosted_stopping == 0
         finally:
             await session.close()
 
 
 async def test_a_manual_interrupt_that_stalls_past_the_deadline_is_still_torn_down():
-    bus = _bus(time.time() + 60)
+    bus = _bus()
     session, fake = await _in_flight_turn()
     stuck = threading.Event()
     fake.abort = lambda: stuck.wait(10)  # the abort never answers

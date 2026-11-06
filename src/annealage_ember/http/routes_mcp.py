@@ -67,7 +67,6 @@ exactly as ``session/sdk.py`` does for its own.
 
 import asyncio
 import hmac
-import time
 
 import mcp.types as types
 
@@ -234,7 +233,6 @@ def register_mcp_routes(
             if (
                 expected is None
                 or not hosted_bus.hosted_turn_live
-                or time.time() >= hosted_bus.hosted_turn_exp
                 or not hmac.compare_digest(
                     req.headers.get("Authorization", ""), "Bearer " + expected
                 )

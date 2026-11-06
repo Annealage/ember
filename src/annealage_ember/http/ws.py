@@ -263,12 +263,6 @@ def register_ws(
             connections.dec()
             if conn is not None:
                 conn.closed = True
-                if auth.hosted_mode:
-                    # Before any await: the grant must not stay live across the
-                    # cleanup below, nor across a dispatch still in progress.
-                    hosted_authority.release(
-                        getattr(holder, "bus", None), conn, getattr(holder, "session", None)
-                    )
                 await registry.remove(conn)
         return Response.already_handled
 
@@ -580,12 +574,11 @@ async def _serve_connection(
         if hosted and kind == "turn":
             # Not awaited here: recording the turn and the backend's own
             # preparation (image expansion) await, and a read loop stuck in
-            # them would not see the peer go away until they finished, leaving
-            # the grant live meanwhile. The loop keeps reading, so the end of
-            # the connection is seen at once and the grant released
-            # (``hosted_authority.release``) while the send is still pending;
-            # the backend's send guard then refuses it.
-            hosted_authority.FENCE.set((conn, bus, bus.hosted_cancel_generation))
+            # them would not see an ``interrupt`` frame until they finished. The
+            # loop keeps reading, so an interrupt cancels a turn still waiting
+            # for the lock (``hosted_authority.FENCE``). The connection going
+            # away does not: a turn frame that arrived still runs.
+            hosted_authority.FENCE.set((bus, bus.hosted_cancel_generation))
             task = asyncio.ensure_future(dispatching)
             dispatches.add(task)
             task.add_done_callback(dispatches.discard)
@@ -876,18 +869,16 @@ async def _submit_turn_locked(
         return
     if bus is not None and getattr(bus, "hosted_mode", False):
         if hosted_authority.fenced_out():
-            # This frame waited for the lock while its connection went away (the
-            # grant it would take was never released: it had none yet).
+            # This frame waited for the lock while an interrupt cancelled it.
             return
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
-        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims, owner=conn)
+        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
         hosted_principal = bus.hosted_turn_principal
         hosted_generation = bus.hosted_turn_generation
-        hosted_authority.arm_expiry(bus, session)
         events = getattr(bus, "session_events", None)
         if events is not None:
             # The principal this session now runs for: the one a session event

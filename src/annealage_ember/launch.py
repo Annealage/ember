@@ -96,6 +96,8 @@ def build_session(
         permissions_path=sessions.state_dir(state_project_dir) / "permissions.toml",
         viewer_url=bus.url,
         timeout=float(settings["approval_timeout"]),
+        # A hosted turn outlives the browser: its cards wait for a viewer.
+        hold_until_answered=bool(getattr(bus, "hosted_mode", False)),
         # The tools that ask the human themselves (tools.asks_the_human):
         # their requests are never remembered, and a grant for one of their
         # names already in permissions.toml is ignored. A bus with no tool

@@ -12,10 +12,10 @@ def _bus():
     return SimpleNamespace(
         hosted_turn_live=False,
         hosted_turn_ops=(),
-        hosted_turn_exp=0,
         hosted_turn_secret=None,
         hosted_turn_principal=None,
         hosted_turn_generation=0,
+        hosted_cancel_generation=0,
         hosted_stopping=0,
         hosted_fenced=False,
         hosted_lock=threading.Lock(),
@@ -39,13 +39,13 @@ def test_another_principal_cannot_take_the_authority_while_a_turn_is_in_flight()
         is None
     )
     running[0] = True
-    before = (bus.hosted_turn_ops, bus.hosted_turn_exp, bus.hosted_turn_secret)
+    before = (bus.hosted_turn_ops, bus.hosted_turn_generation, bus.hosted_turn_secret)
     reason = hosted_authority.admit(
         bus, _holder(running), _claims("bob", ("project.read",), exp=5_000_000_000)
     )
     assert "another person's turn" in reason
     assert bus.hosted_turn_principal == "alice"
-    assert (bus.hosted_turn_ops, bus.hosted_turn_exp, bus.hosted_turn_secret) == before
+    assert (bus.hosted_turn_ops, bus.hosted_turn_generation, bus.hosted_turn_secret) == before
 
 
 def test_a_queued_or_deferred_turn_still_blocks_another_principal_after_the_grant_ended():
@@ -91,19 +91,32 @@ def test_an_expired_or_missing_delegation_is_refused_and_changes_nothing():
     assert bus.hosted_turn_live is False and bus.hosted_turn_principal is None
 
 
-def test_a_waiting_turn_is_delivered_only_under_its_own_live_unexpired_authority():
+def test_a_waiting_turn_is_delivered_only_under_its_own_live_authority():
     bus = _bus()
-    hosted_authority.admit(bus, None, _claims("alice", exp=4_000_000_000))
-    assert hosted_authority.holds(bus, "alice", now=1_000)
-    assert not hosted_authority.holds(bus, "alice", now=4_000_000_000)  # expired
-    assert not hosted_authority.holds(bus, "bob", now=1_000)
-    assert not hosted_authority.holds(bus, None, now=1_000)
+    hosted_authority.admit(bus, None, _claims("alice"))
+    assert hosted_authority.holds(bus, "alice")
+    assert not hosted_authority.holds(bus, "bob")
+    assert not hosted_authority.holds(bus, None)
     bus.hosted_turn_live = False
-    assert not hosted_authority.holds(bus, "alice", now=1_000)
+    assert not hosted_authority.holds(bus, "alice")
+
+
+def test_the_delegation_expiring_after_admission_changes_nothing_about_the_turn(monkeypatch):
+    """``exp`` gates admission only: the turn that got in lives until it ends."""
+    import time
+
+    bus = _bus()
+    assert hosted_authority.admit(bus, None, _claims("alice", exp=time.time() + 60)) is None
+    generation = bus.hosted_turn_generation
+    check = hosted_authority.checker(bus)
+    monkeypatch.setattr(time, "time", lambda: time.monotonic() + 4_000_000_000)
+    assert check() is None
+    assert hosted_authority.holds(bus, "alice")
+    assert bus.hosted_turn_live and bus.hosted_turn_generation == generation
 
 
 @pytest.mark.asyncio
-async def test_release_stops_a_backend_with_the_bounded_fail_closed_stop():
+async def test_interrupt_stops_a_backend_with_the_bounded_fail_closed_stop():
     import asyncio
 
     calls = []
@@ -116,7 +129,7 @@ async def test_release_stops_a_backend_with_the_bounded_fail_closed_stop():
             calls.append("stop_for_revocation")
 
     bus = _bus()
-    hosted_authority.admit(bus, None, _claims("alice"), owner="conn")
-    hosted_authority.release(bus, "conn", Session())
+    hosted_authority.admit(bus, None, _claims("alice"))
+    hosted_authority.interrupt(bus, Session())
     await asyncio.sleep(0.05)
     assert calls == ["stop_for_revocation"]

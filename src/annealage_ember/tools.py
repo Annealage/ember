@@ -94,7 +94,6 @@ import math
 import re
 import secrets
 import sys
-import time
 from collections import namedtuple
 from typing import get_origin
 from urllib.parse import unquote
@@ -847,7 +846,6 @@ def _wrap(
             if (
                 operation is None
                 or not bus.hosted_turn_live
-                or time.time() >= bus.hosted_turn_exp
                 or operation not in bus.hosted_turn_ops
             ):
                 _record_stage("hosted", "rejected")

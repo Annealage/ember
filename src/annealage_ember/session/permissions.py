@@ -119,6 +119,14 @@ DEFAULT_TIMEOUT = 300.0
 # with nobody at it.
 DEFAULT_NO_VIEWER_GRACE = 8.0
 
+# What a card waits for when the broker holds requests until they are answered
+# (``hold_until_answered``): a hosted agent's turn outlives the browser that
+# started it, so a card is answered by whichever viewer attaches next, not
+# denied because the last one went. A week, not forever, so a request nobody
+# ever answers still ends; ``Codex``'s per-tool wait reads it through ``timeout``
+# and needs a number.
+HOLD_TIMEOUT = 7 * 24 * 3600.0
+
 # Never persisted and never covered by an allow-always grant (plan section
 # 5): a broad standing grant for the one tool with unrestricted shell
 # access would turn one careless click into a permanent bypass. Enforced
@@ -187,12 +195,17 @@ class PermissionBroker:
         never_remembered=(),
         request_guard=None,
         automatic_tools=None,
+        hold_until_answered: bool = False,
     ):
         # Beside the module-wide NEVER_REMEMBERED; see the comment there.
         self._never_remembered: FrozenSet[str] = frozenset(never_remembered)
         self._on_event = on_event
         self._permissions_path = Path(permissions_path) if permissions_path is not None else None
-        self._timeout = timeout
+        # A hosted agent's turn does not depend on a browser being attached: its
+        # cards wait for a viewer to answer (an interrupt or the end of the turn
+        # still denies them), with no no-viewer denial and the long timeout.
+        self._hold = hold_until_answered
+        self._timeout = max(timeout, HOLD_TIMEOUT) if hold_until_answered else timeout
         self._viewer_url = viewer_url
         self._no_viewer_grace = no_viewer_grace
         self._viewer_count = 0
@@ -308,10 +321,14 @@ class PermissionBroker:
                 "warning: automatic tool policy failed for %r: %r\n" % (tool_name, exc)
             )
             return Decision(allow=False, message="the included tool policy could not be verified")
-        if self._viewer_count == 0 and not (
-            action is None
-            and tool_name in self._granted_tools
-            and tool_name not in self._never_remembered
+        if (
+            self._viewer_count == 0
+            and not self._hold
+            and not (
+                action is None
+                and tool_name in self._granted_tools
+                and tool_name not in self._never_remembered
+            )
         ):
             return Decision(allow=False, message=self._no_viewer_message())
         guard_token = None
@@ -543,7 +560,7 @@ class PermissionBroker:
         the safe direction besides.
         """
         self._viewer_count = max(0, self._viewer_count - 1)
-        if self._viewer_count > 0:
+        if self._viewer_count > 0 or self._hold:
             return
         self._cancel_no_viewer_timer()
         if self._no_viewer_grace <= 0:
