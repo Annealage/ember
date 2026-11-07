@@ -114,6 +114,11 @@ from .tools import (
 #: concurrently, so this is also the longest a startup waits for them all.
 DISCOVERY_TIMEOUT = 10.0
 
+#: The largest single response event a remote may send, in bytes. The MCP
+#: SDK's own default is 1 MiB, which a bulk read (a few hundred parts' page
+#: text) exceeds; the bound stays finite so one event cannot exhaust memory.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
 #: How long one proxied call may take, connecting included. The Codex stdio
 #: bridge sets no read timeout of its own, so this is what bounds it.
 CALL_TIMEOUT = 60.0
@@ -449,7 +454,9 @@ async def _session(server):
     async with httpx2.AsyncClient(
         headers=dict(server.headers or {}), timeout=httpx2.Timeout(CALL_TIMEOUT)
     ) as client:
-        async with streamable_http_client(server.url, http_client=client) as (read, write):
+        async with streamable_http_client(
+            server.url, http_client=client, max_sse_event_size=MAX_RESPONSE_BYTES
+        ) as (read, write):
             async with ClientSession(read, write) as session:
                 initialized = await session.initialize()
                 yield session, initialized
@@ -725,6 +732,15 @@ async def call(
                 -32602: "Remote server rejected the parameters",
                 -32603: "Remote server reported an internal error",
             }.get(code, "Remote protocol refusal")
+            if code == -32000:
+                # CONNECTION_CLOSED: the SDK's own words for a stream that ended with
+                # no response ("SSE stream ended without a response", ...), not data
+                # the server chose; a server using the code itself is bounded and
+                # redacted by ``fail`` like any message.
+                detail = " ".join(str(leaf.error.message or "").split())[:160]
+                reason = "Remote connection ended before a response%s" % (
+                    ": " + detail if detail else ""
+                )
             issues, truncated = (
                 _remote_issues(None, diagnostic_fields, data=leaf.error.data)
                 if code == -32602
@@ -736,8 +752,17 @@ async def call(
                 else "its outcome may be uncertain; check before retrying"
             )
             return fail(
-                "The remote MCP server refused %s on %s (%s); %s."
-                % (name, server.name, reason, effect),
+                "The remote MCP server %s %s on %s (%s); %s.%s"
+                % (
+                    "dropped the connection during" if code == -32000 else "refused",
+                    name,
+                    server.name,
+                    reason,
+                    effect,
+                    " A large or slow request is a common cause; retry with a smaller batch."
+                    if code == -32000
+                    else "",
+                ),
                 diagnostic={
                     "code": "remote_refusal",
                     "truncated": truncated,

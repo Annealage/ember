@@ -1154,3 +1154,22 @@ def test_a_structured_or_secret_bearing_error_is_not_passed_through():
         remote_module._result("datum", "t", _error_result("failed, token: abc123 at http://h/x"))
     )
     assert "abc123" not in out and "http://h" not in out
+
+
+@pytest.mark.asyncio
+async def test_a_remote_session_allows_a_response_larger_than_the_sdk_default(monkeypatch):
+    seen = {}
+
+    @contextlib.asynccontextmanager
+    async def transport(url, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop")
+        yield
+
+    monkeypatch.setattr(remote_module, "streamable_http_client", transport)
+    with pytest.raises(RuntimeError, match="stop"):
+        async with remote_module._session(
+            RemoteServer("x", "http://x.invalid/", Grading((), (), ()))
+        ):
+            pass
+    assert 1024 * 1024 < seen["max_sse_event_size"] <= 64 * 1024 * 1024

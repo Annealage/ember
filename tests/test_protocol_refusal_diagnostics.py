@@ -79,3 +79,32 @@ async def test_invalid_params_refusal_sanitizes_and_bounds_remote_diagnostics(mo
         issue["location"] == ["<field>"] and issue["code"] == "required"
         for issue in diagnostic["issues"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grading", (Grading(("batch",), (), ()), Grading((), (), ())))
+async def test_a_connection_ended_before_a_response_says_so_and_what_to_do(monkeypatch, grading):
+    @asynccontextmanager
+    async def session(_server):
+        yield object(), None
+
+    async def call_remote(_session, name, arguments):
+        raise MCPError(code=-32000, message="SSE stream ended without a response")
+
+    monkeypatch.setattr(remote, "_session", session)
+    monkeypatch.setattr(remote, "_call", call_remote)
+    server = remote.RemoteServer("datum", "https://example.invalid", grading)
+    result = await remote.call(
+        server,
+        "batch",
+        {},
+        read_only=True,
+        allowed_reads=("batch",),
+    )
+    document = json.loads(result["content"][0]["text"])
+    assert document["code"] == "remote_refusal"
+    assert "dropped the connection" in document["message"]
+    assert "smaller batch" in document["message"]
+    assert "had no effect" in document["message"]
+    assert document["issues"][0]["code"] == "-32000"
+    assert "SSE stream ended without a response" in document["issues"][0]["message"]
