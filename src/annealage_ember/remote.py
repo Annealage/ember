@@ -658,6 +658,8 @@ async def call(
             "or allowed_writes to permit it" % name
         )
     invocation = None
+    # A read-grade tool, or a call the caller declared read-only: no effect to report.
+    is_read = read_only or name in server.grading.read
     if not read_only:
         if action_store is None:
             _record_stage("policy", "rejected")
@@ -712,7 +714,7 @@ async def call(
                 action_store.outcome(
                     invocation, "uncertain" if result.is_error else "reported_result"
                 )
-            return await _delivered(server, name, result, diagnostic_fields, projector)
+            return await _delivered(server, name, result, diagnostic_fields, projector, is_read)
         leaf = _leaf(exc)
         if sent and isinstance(leaf, MCPError):
             _record_stage("handler", "incomplete")
@@ -728,8 +730,14 @@ async def call(
                 if code == -32602
                 else ([], 0)
             )
+            effect = (
+                "it had no effect"
+                if is_read
+                else "its outcome may be uncertain; check before retrying"
+            )
             return fail(
-                "The remote MCP server refused the call; its outcome may be uncertain.",
+                "The remote MCP server refused %s on %s (%s); %s."
+                % (name, server.name, reason, effect),
                 diagnostic={
                     "code": "remote_refusal",
                     "truncated": truncated,
@@ -748,10 +756,15 @@ async def call(
             raise
         if sent:
             _record_stage("handler", "incomplete")
+            if is_read:
+                return fail(
+                    "%s was sent to the %s MCP server but no answer came back (%s). It is a read, "
+                    "so the call had no effect; try again shortly." % (name, server.name, reason)
+                )
             return fail(
                 "%s was sent to the %s MCP server but no answer came back (%s), so it "
                 "may or may not have happened; check before retrying. Invocation %s is blocked."
-                % (name, server.name, reason, invocation["id"] if invocation else "unrecorded")
+                % (name, server.name, reason, invocation["id"])
             )
         return fail(
             "%s did not run: the %s MCP server could not be reached (%s). Try again shortly."
@@ -763,7 +776,7 @@ async def call(
         return fail("remote write refused because its approved authority context changed")
     if invocation:
         action_store.outcome(invocation, "uncertain" if result.is_error else "reported_result")
-    return await _delivered(server, name, result, diagnostic_fields, projector)
+    return await _delivered(server, name, result, diagnostic_fields, projector, is_read)
 
 
 def _projection_blocks(blocks):
@@ -790,9 +803,9 @@ def _projection_blocks(blocks):
     return content
 
 
-async def _delivered(server, name, result, diagnostic_fields, projector):
+async def _delivered(server, name, result, diagnostic_fields, projector, read_only=False):
     """``_result``, with a successful read's content replaced by ``projector``'s."""
-    delivered = _result(server.name, name, result, diagnostic_fields)
+    delivered = _result(server.name, name, result, diagnostic_fields, read_only)
     if projector is None or result.is_error:
         return delivered
     raw = {
@@ -881,23 +894,42 @@ def _remote_issues(result, fields, *, data=None):
     return issues, truncated
 
 
-def _result(server_name, tool_name, result, diagnostic_fields=()):
+def _error_text(result):
+    """The server's own error text from a tool result, whitespace collapsed."""
+    parts = [b.text for b in result.content if isinstance(b, types.TextContent) and b.text]
+    return " ".join(" ".join(parts).split())
+
+
+def _result(server_name, tool_name, result, diagnostic_fields=(), read_only=False):
     if result.is_error:
         issues, truncated = _remote_issues(result, diagnostic_fields)
+        # Recognised structural issues already say what is wrong, and a document
+        # of fields can carry candidate values; only plain prose passes through.
+        text = "" if issues else _error_text(result)
+        if text[:1] in "{[":
+            text = ""
+        outcome = (
+            "The call had no effect."
+            if read_only
+            else "Its outcome may be uncertain; check before retrying."
+        )
+        if text:
+            # The server's own words are what the caller can act on; they are
+            # bounded and stripped of URLs and credential forms by ``fail``.
+            message = "%s on %s reported an error: %s %s" % (tool_name, server_name, text, outcome)
+            issues = [{"location": [], "code": "remote_error", "message": text}] + issues
+        else:
+            message = "%s on %s reported an error with no message. %s" % (
+                tool_name,
+                server_name,
+                outcome,
+            )
+            issues = issues or [
+                {"location": [], "code": "remote_error", "message": "Remote tool reported an error"}
+            ]
         return fail(
-            "The remote MCP tool reported failure; its outcome may be uncertain.",
-            diagnostic={
-                "code": "remote_failure",
-                "truncated": truncated,
-                "issues": issues
-                or [
-                    {
-                        "location": [],
-                        "code": "remote_error",
-                        "message": "Remote tool reported an error",
-                    }
-                ],
-            },
+            message,
+            diagnostic={"code": "remote_failure", "truncated": truncated, "issues": issues},
         )
     content = []
     omitted = []

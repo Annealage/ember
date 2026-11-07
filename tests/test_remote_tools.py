@@ -598,7 +598,7 @@ async def test_a_call_sent_but_never_answered_does_not_claim_it_did_not_run(
     monkeypatch.setattr(remote_module, "CALL_TIMEOUT", 0.5)
     failed = await table["slow"].handler({})
     assert failed["is_error"] is True
-    assert "may or may not have happened" in _text(failed)
+    assert "had no effect" in _text(failed)
     assert "did not run" not in _text(failed)
 
 
@@ -1129,3 +1129,28 @@ def test_a_hosted_session_holds_its_permission_cards_until_answered(
     broker = _session("omp", tools, tmp_path, hosted_mode=hosted)._broker
     assert broker._hold is held
     assert (broker.timeout >= 7 * 24 * 3600) is held
+
+
+def _error_result(text):
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=True)
+
+
+@pytest.mark.parametrize(("read_only", "effect"), ((True, "had no effect"), (False, "uncertain")))
+def test_a_tool_reported_error_keeps_the_servers_own_words(read_only, effect):
+    text = 'No part found for MPN "X". Use search_parts to find the correct MPN.'
+    out = json.loads(
+        _text(remote_module._result("datum", "get_part_by_mpn", _error_result(text), (), read_only))
+    )
+    assert out["code"] == "remote_failure"
+    assert text in out["message"] and effect in out["message"]
+    assert out["issues"][0] == {"location": [], "code": "remote_error", "message": text}
+
+
+def test_a_structured_or_secret_bearing_error_is_not_passed_through():
+    doc = '{"issues": [{"code": "type", "loc": ["a"], "input": "sk-live-1234"}]}'
+    out = _text(remote_module._result("datum", "t", _error_result(doc)))
+    assert "sk-live-1234" not in out
+    out = _text(
+        remote_module._result("datum", "t", _error_result("failed, token: abc123 at http://h/x"))
+    )
+    assert "abc123" not in out and "http://h" not in out
