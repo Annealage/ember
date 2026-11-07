@@ -159,6 +159,23 @@ parentheses are Annealage Mesh's, as an example:
     rule. The
     ``initialize`` instructions of each remote MCP server the tool server
     reached follow it, each under a heading naming the server.
+``resolve_context``
+    ``resolve_context(bus, serve_dir, data) -> ResolvedContext``: what one
+    context attachment means to the agent. A product page attaches context to
+    a message through the chat pane (``static/chat.js``'s ``setContext`` and
+    ``sendMessage``): a chip with a ``label`` the person reads and ``data``,
+    the product's own JSON (Annealage Loom: the sheet and the parts selected
+    on it). The message's turn frame carries it as a ``context`` block, the
+    event log keeps the block as sent (so the conversation shows the chip
+    live and after a reload), and before the turn reaches the backend each
+    one is resolved through this hook (``turn_context.py``): the agent
+    receives the text the product wrote, and any images it returned, in the
+    same user turn as the message, under every backend. Called on an executor
+    thread, so it may block (read files, crop a render). It raises
+    ``ContextError`` with a sentence for the person when ``data`` cannot be
+    resolved, and the message is then refused back to the page with that
+    sentence rather than sent without its context. ``None`` (the default)
+    refuses every message carrying a context attachment, never dropping it.
 ``codex_bridge_module``
     The module Codex launches as the stdio MCP bridge. Defaults to the agent
     layer's own bridge, which is the only one that speaks its ``/mcp``
@@ -181,6 +198,22 @@ OWNER_WORDING_RULE = (
     'Never call the person you work with "the human"; say "you" when talking to '
     'them and "the product owner" when talking about them.'
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedContext:
+    """What ``Product.resolve_context`` makes of one context attachment:
+    ``text`` the agent reads, and ``images``, each the bytes of a PNG or JPEG
+    the agent sees beside it (written under ``images/`` like an upload, so a
+    transcript can name it)."""
+
+    text: str
+    images: Tuple[bytes, ...] = ()
+
+
+class ContextError(Exception):
+    """``Product.resolve_context`` could not resolve a context attachment.
+    Its message is the sentence the person who sent it is shown."""
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -210,6 +243,7 @@ class Product:
     doctor_command: Optional[str] = None
     codex_install_hint: Optional[str] = None
     session_context: Optional[Callable[..., Any]] = None
+    resolve_context: Optional[Callable[..., Any]] = None
 
     # Whether a browser may change the run's backend/model/effort through
     # settings or the live model picker. Products that configure runtime only

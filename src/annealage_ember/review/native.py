@@ -114,9 +114,13 @@ class JsonReviewStore(ReviewStore):
     ``anchor_space``. Comments carry a status: the model resolves them, the
     page adds the human's comments through ``POST /review`` and resolves or
     reopens any comment through ``POST /review/<id>``. The product configures
-    the rest: ``max_open_model_callouts`` (``None``: no limit) and
+    the rest: ``max_open_model_callouts`` (``None``: no limit),
     ``can_delete_own``, whether the model may delete its own callouts (off
-    for a product that keeps answered callouts as a record, resolved)."""
+    for a product that keeps answered callouts as a record, resolved), and
+    ``human_adds_via_api``, off for a product whose page never adds a
+    comment (Annealage Loom sends what the product owner says on a sheet as a
+    chat message instead): ``POST /review`` then refuses, ``/review/notify``
+    is not registered, and the app keeps no notification outbox."""
 
     def __init__(
         self,
@@ -125,6 +129,7 @@ class JsonReviewStore(ReviewStore):
         *,
         max_open_model_callouts=DEFAULT_MAX_OPEN_CALLOUTS,
         can_delete_own=True,
+        human_adds_via_api=True,
     ):
         super().__init__()
         self.path = Path(path)
@@ -132,7 +137,7 @@ class JsonReviewStore(ReviewStore):
         self.capabilities = Capabilities(
             can_resolve=True,
             can_delete_own=can_delete_own,
-            human_adds_via_api=True,
+            human_adds_via_api=human_adds_via_api,
             human_sets_status=True,
             max_open_model_callouts=max_open_model_callouts,
             can_update_anchors=True,

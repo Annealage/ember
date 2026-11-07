@@ -275,6 +275,25 @@ function renderUserAttachments(container, blocks) {
     });
 }
 
+// Builds a sent turn's context chips from its blocks, once, as
+// renderUserAttachments builds its thumbnails: each `context` block (what the
+// product page attached, `setContext`/`sendMessage`) as a button naming it,
+// which hands the block's `data` back to the page (`onPick`).
+function renderUserContexts(container, blocks, onPick) {
+  if (container.childElementCount || !blocks) return;
+  blocks
+    .filter((b) => b.type === "context")
+    .forEach((b) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "contextchip";
+      chip.textContent = b.label;
+      chip.title = "Show " + b.label + " on the page";
+      chip.addEventListener("click", () => onPick(b));
+      container.appendChild(chip);
+    });
+}
+
 const AGENT_LABEL = {
   connecting: "Connecting…", ready: "Ready", idle: "Idle", unavailable: "Unavailable", closed: "Closed",
 };
@@ -415,9 +434,25 @@ function usageChip(agentStatusEl) {
  * `modelControl` defaults to true; false lets a product omit the model picker
  * entirely. A required element that is missing is an error here, at mount,
  * rather than a null dereference on the first event.
+ *
+ * Context attachments, the product page's side of `Product.resolve_context`:
+ * the returned `setContext(key, {label, data})` puts a chip naming `label` in
+ * the composer (replacing the one under the same `key`), `removeContext(key)`
+ * takes it out, and `sendMessage(text, contexts)` sends a message with
+ * `contexts` (`[{label, data}]`) through the same path as Send, from a
+ * product's own composer. Each goes out as a `context` block and the server
+ * resolves it for the agent. A context chip in a sent message, and in the
+ * composer, is a button: clicking one calls `onContextClick(data, {label,
+ * turn})` (`turn` null in the composer) and dispatches an `ember:context`
+ * CustomEvent on `document` with the same three in its `detail`.
+ * `onContexts(list)` is told every context the loaded conversation carries,
+ * `[{turn, label, data}]` in turn order, whenever that list changes, so a
+ * page can mark where earlier messages pointed; `showTurn(turn)` scrolls the
+ * conversation to that turn's message and flashes it.
  */
 export function initChat({
   send, root = document, ids = {}, agentTitles = {}, modelControl = true,
+  onContextClick = () => {}, onContexts = () => {},
 }) {
   const idMap = { ...DEFAULT_IDS, ...ids };
   const els = {};
@@ -566,19 +601,55 @@ export function initChat({
     rec.removeBtn.onclick = () => store.dropChatAttachment(att.id);
   }
 
+  // A context attachment in the composer: its label, which shows it on the
+  // page like a sent message's chip, and a remove button.
+  function buildContextChip() {
+    const chip = document.createElement("div");
+    chip.className = "attachchip contextattach";
+    const labelBtn = document.createElement("button");
+    labelBtn.type = "button";
+    labelBtn.className = "contextchip";
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "attachremove";
+    removeBtn.textContent = "×";
+    removeBtn.setAttribute("aria-label", "Remove attached context");
+    chip.append(labelBtn, removeBtn);
+    return { chip, labelBtn, removeBtn };
+  }
+
+  function updateContextChip(rec, att) {
+    rec.labelBtn.textContent = att.label;
+    rec.labelBtn.title = "Attached to the next message: " + att.label;
+    rec.labelBtn.onclick = () => pickContext(att, null);
+    rec.removeBtn.onclick = () => store.dropChatContext(att.key);
+  }
+
+  // A context chip clicked, in a sent message (`turn`) or in the composer
+  // (null): the product's callback and a DOM event, both with its data.
+  function pickContext(block, turn) {
+    const detail = { data: block.data, label: block.label, turn };
+    onContextClick(block.data, { label: block.label, turn });
+    if (typeof CustomEvent === "function" && typeof document.dispatchEvent === "function") {
+      document.dispatchEvent(new CustomEvent("ember:context", { detail }));
+    }
+  }
+
   function renderAttachStrip(chat) {
-    const keys = chat.attachments.map((a) => "att:" + a.id)
+    const keys = chat.attachments.map((a) => (a.kind === "context" ? "ctx:" : "att:") + a.id)
       .concat(chat.documents.map((d) => "doc:" + d.id));
     chatAttachStripEl.hidden = keys.length === 0;
     chat.attachments.forEach((att) => {
-      const key = "att:" + att.id;
+      const context = att.kind === "context";
+      const key = (context ? "ctx:" : "att:") + att.id;
       let rec = attachEls.get(key);
       if (!rec) {
-        rec = buildAttachChip();
+        rec = context ? buildContextChip() : buildAttachChip();
         attachEls.set(key, rec);
         chatAttachStripEl.appendChild(rec.chip);
       }
-      updateAttachChip(rec, att);
+      if (context) updateContextChip(rec, att);
+      else updateAttachChip(rec, att);
     });
     chat.documents.forEach((doc) => {
       const key = "doc:" + doc.id;
@@ -841,9 +912,12 @@ export function initChat({
     userText.className = "text";
     const userAttachmentsEl = document.createElement("div");
     userAttachmentsEl.className = "attachthumbs";
+    const userContextsEl = document.createElement("div");
+    userContextsEl.className = "contextchips";
     userEl.appendChild(userAuthor);
     userEl.appendChild(userText);
     userEl.appendChild(userAttachmentsEl);
+    userEl.appendChild(userContextsEl);
 
     const assistantEl = document.createElement("div");
     assistantEl.className = "msg assistant";
@@ -858,7 +932,7 @@ export function initChat({
     row.appendChild(assistantEl);
 
     return {
-      row, userEl, userAuthor, userText, userAttachmentsEl, segmentsEl,
+      row, userEl, userAuthor, userText, userAttachmentsEl, userContextsEl, segmentsEl,
       errorsEl, segments: [],
     };
   }
@@ -875,6 +949,7 @@ export function initChat({
           : resent ? "Sent again after a restart (turn " + t.redeliveryOf + ")" : "";
       rec.userText.textContent = blocksToText(t.user);
       renderUserAttachments(rec.userAttachmentsEl, t.user);
+      renderUserContexts(rec.userContextsEl, t.user, (block) => pickContext(block, t.turn));
     }
     // Segment slots never move: adjacent text extends its text node, adjacent
     // calls extend their inline run, and late results update the original card.
@@ -1362,9 +1437,29 @@ export function initChat({
     } else draw();
   }
 
+  // Tells the page every context the loaded conversation carries
+  // (`onContexts`), when that list changes: turns change on every streamed
+  // delta, so the list is compared by its contents, not by identity.
+  let reportedTurns = null;
+  let reportedContexts = "";
+  function reportContexts(chat) {
+    if (chat.turns === reportedTurns) return;
+    reportedTurns = chat.turns;
+    const list = [];
+    chat.turns.forEach((t) => {
+      (t.user || []).filter((b) => b.type === "context")
+        .forEach((b) => list.push({ turn: t.turn, label: b.label, data: b.data }));
+    });
+    const signature = JSON.stringify(list);
+    if (signature === reportedContexts) return;
+    reportedContexts = signature;
+    onContexts(list);
+  }
+
   function render() {
     const chat = store.getState().chat;
     scheduleTurns(chat);
+    reportContexts(chat);
     renderPending(chat);
     renderAgentStatus(chat);
     renderActionResults(chat);
@@ -1381,6 +1476,22 @@ export function initChat({
   store.subscribe("chat", render);
   render();
 
+  // One message out through the turn frame: `blocks` as the composer or a
+  // product built them. False, and nothing queued, when the socket is down.
+  function sendBlocks(blocks) {
+    const clientId = makeClientId();
+    if (!send({ type: "turn", blocks, client_id: clientId })) return false;
+    // Held as pending, not drawn: the server's `user_turn` for it, which
+    // every tab receives, is what shows the message.
+    store.queueChatUserTurn(clientId, blocks);
+    return true;
+  }
+
+  // A context attachment as its turn block.
+  function contextBlock({ label, data }) {
+    return { type: "context", label: String(label), data };
+  }
+
   function doSend() {
     const text = chatInputEl.value.trim();
     const chat = store.getState().chat;
@@ -1393,23 +1504,54 @@ export function initChat({
     if (attachments.some((a) => a.state === "uploading")) return;
     const ready = attachments.filter((a) => a.state === "done");
     if (!text && !ready.length) return; // an attachment with no text is allowed; neither is not
-    const blocks = ready.map((a) => ({ type: "image_path", path: a.path }));
+    const blocks = ready.filter((a) => a.kind !== "context")
+      .map((a) => ({ type: "image_path", path: a.path }));
     // Only when there is something in it. An empty text block is refused by
     // the API outright, failing the whole turn including the image, and an
     // attachment with no typed message is a case this composer allows.
     if (text) blocks.push({ type: "text", text });
-    const clientId = makeClientId();
-    if (!send({ type: "turn", blocks, client_id: clientId })) {
+    ready.filter((a) => a.kind === "context").forEach((a) => blocks.push(contextBlock(a)));
+    if (!sendBlocks(blocks)) {
       // Nothing went out, so nothing will answer it: the message stays in
       // the composer to be sent again once the socket is back.
       toast("Not connected, so the message was not sent", false);
       return;
     }
-    // Held as pending, not drawn: the server's `user_turn` for it, which
-    // every tab receives, is what shows the message.
-    store.queueChatUserTurn(clientId, blocks);
     chatInputEl.value = "";
     store.clearChatAttachments();
+  }
+
+  // A message from the product's own composer (Loom's prompt on a sheet):
+  // `text` and `contexts` (`[{label, data}]`), through the same frame and the
+  // same refusal handling as Send, leaving this composer as it is. Returns
+  // false, with a toast, when the socket is down and nothing was sent.
+  function sendMessage(text, contexts = []) {
+    const trimmed = String(text || "").trim();
+    const blocks = trimmed ? [{ type: "text", text: trimmed }] : [];
+    contexts.forEach((c) => blocks.push(contextBlock(c)));
+    if (!blocks.length) return false;
+    if (!sendBlocks(blocks)) {
+      toast("Not connected, so the message was not sent", false);
+      return false;
+    }
+    return true;
+  }
+
+  // Scrolls the conversation to `turn`'s message and flashes it; false when
+  // that turn is not loaded.
+  function showTurn(turn) {
+    const rec = turnEls.get(turn);
+    if (!rec) return false;
+    stickToBottom = false;
+    const target = rec.userEl.hidden ? rec.row : rec.userEl;
+    if (typeof target.scrollIntoView === "function") {
+      target.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    target.classList.remove("flash");
+    // Restarted on every call, so a second click flashes again.
+    void target.offsetWidth;
+    target.classList.add("flash");
+    return true;
   }
 
   chatSendBtn.addEventListener("click", doSend);
@@ -1811,9 +1953,10 @@ export function initChat({
   // A message that will not appear (refused, or lost in a dropped
   // connection) goes back into the composer rather than being lost: it was
   // cleared on Send. Its text goes in front of anything typed since, a blank
-  // line between, and its images come back as finished attachments, since
-  // their files are already on the server. Returns false when some images
-  // did not fit beside those already attached (MAX_CHAT_ATTACHMENTS).
+  // line between, its images come back as finished attachments, since
+  // their files are already on the server, and its context chips come back
+  // as they were sent. Returns false when some images did not fit beside
+  // those already attached (MAX_CHAT_ATTACHMENTS).
   function restoreToComposer(blocks) {
     const text = blocksToText(blocks);
     const typed = chatInputEl.value.trim();
@@ -1834,6 +1977,9 @@ export function initChat({
           mediaType: null,
         });
       });
+    blocks
+      .filter((b) => b.type === "context")
+      .forEach((b) => store.setChatContext("restored:" + b.label, b.label, b.data));
     return complete;
   }
 
@@ -1876,5 +2022,16 @@ export function initChat({
     }
   }
 
-  return { handleHello, handleEvent, handleRefused, adoptSent };
+  function setContext(key, { label, data }) {
+    store.setChatContext(String(key), String(label), data);
+  }
+
+  function removeContext(key) {
+    store.dropChatContext(String(key));
+  }
+
+  return {
+    handleHello, handleEvent, handleRefused, adoptSent,
+    setContext, removeContext, sendMessage, showTurn,
+  };
 }

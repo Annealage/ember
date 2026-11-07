@@ -46,6 +46,7 @@ from . import (
     protocol,
     remote_actions,
     sessions,
+    turn_context,
     uploads,
 )
 from . import settings as settings_module
@@ -718,6 +719,8 @@ def create_app(
     # notify the watcher directly rather than wait for its next sample.
     bus.review_store = review_store
     bus.settings = settings
+    # Where a message's resolved context writes its images (turn_context.py).
+    bus.serve_dir = str(serve_dir)
     bus.builtin_tools = builtin_tools
     bus.auto_approve_included_tools = auto_approve_included_tools
     bus.upload_actions = upload_actions
@@ -896,7 +899,14 @@ def create_app(
         if session is None:
             holder._release_lock()
     app.agent_review_notifications = None
-    if review_store is not None and session_id is not None:
+    # Only a review whose page adds the product owner's comments has any to
+    # deliver: a product whose comments arrive some other way, or never (Loom
+    # sends its page's prompts as chat messages), keeps no outbox.
+    if (
+        review_store is not None
+        and session_id is not None
+        and review_store.capabilities.human_adds_via_api
+    ):
         from .review.notifications import ReviewNotifications
 
         scope = str(Path(getattr(review_store, "path", serve_dir)).resolve())
@@ -1816,8 +1826,14 @@ class AgentHolder:
                     return
                 source = fields.get("automation_source")
                 blocks = fields.get("blocks") or []
+                # Resolved again: the log keeps a context block as sent, and
+                # nobody is left to refuse it to, so one that no longer
+                # resolves goes as a note saying so (turn_context.py).
+                agent_blocks = await turn_context.agent_blocks(
+                    blocks, bus=bus, serve_dir=getattr(bus, "serve_dir", None), refusal_notes=True
+                )
                 sent = bus.begin_turn(
-                    blocks,
+                    agent_blocks,
                     by=fields.get("by"),
                     automation_source=source if source == "loom_root_continuation" else None,
                 )

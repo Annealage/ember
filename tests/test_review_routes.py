@@ -192,6 +192,31 @@ async def test_post_is_refused_where_the_page_adds_comments_its_own_way(served_d
     assert not (served_dir / TOY_REVIEW_FILE).exists()
 
 
+async def test_a_review_that_takes_no_page_comments_has_no_notify_route_or_outbox(served_dir):
+    """A product whose page sends what the product owner says as chat
+    messages (Annealage Loom) keeps the agent's callouts in the store and
+    nothing to deliver: adding is refused and notify does not exist."""
+    store = toy_review_store(served_dir, human_adds_via_api=False)
+    sid = sessions.create_session(served_dir)
+    app = _app(
+        served_dir,
+        store=store,
+        session_id=sid,
+        build_session=lambda on_event, *, bus: FakeSession(on_event, session_id=sid),
+    )
+    client = make_test_client(app)
+    assert app.agent_review_notifications is None
+    assert (await _post(client, {"anchor": FRONT, "text": "t"})).status_code == 405
+    res = await client.post(
+        "/review/notify?t=%s" % TOKEN,
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({"comment_ids": [1]}),
+    )
+    assert res.status_code in (404, 405)
+    assert not (served_dir / TOY_REVIEW_FILE).exists()
+    await app.agent_stop()
+
+
 def _set_status(client, comment_id, body, *, token=TOKEN):
     return client.post(
         "/review/%s?t=%s" % (comment_id, token),

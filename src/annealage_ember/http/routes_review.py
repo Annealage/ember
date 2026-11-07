@@ -13,7 +13,9 @@ Registers, whether or not the product keeps a review:
                          resolve it, when the capabilities say the page does
                          (``human_sets_status``)
     POST /review/notify  explicitly send saved human comment ids to the coordinator;
-                         ``{"comment_ids": [1, 2]}``, idempotent per saved comment
+                         ``{"comment_ids": [1, 2]}``, idempotent per saved comment;
+                         not registered over a store whose page adds no comments
+                         (``human_adds_via_api`` off)
 
 All four go through the app's ``identity.BrowserAuth`` (a permitted
 ``Origin``, then a tailnet login or the browser token) and refuse with the same
@@ -112,7 +114,6 @@ def register_review_routes(app, *, store, auth, recorder=None):
             ],
         }, 200
 
-    @app.post("/review/notify")
     async def notify_review_comments(req):
         human = auth.authenticate(req, "project.comment")
         if human is None or not auth.permits(human, "project.exec"):
@@ -148,6 +149,11 @@ def register_review_routes(app, *, store, auth, recorder=None):
             return await notifications.notify(sorted(ids), human), 200
         except (ReviewError, OSError) as exc:
             return {"ok": False, "error": str(exc)}, 409
+
+    # A review whose page adds no comments (``human_adds_via_api`` off) has
+    # none to deliver, so the route does not exist for it.
+    if store is None or store.capabilities.human_adds_via_api:
+        app.post("/review/notify")(notify_review_comments)
 
     @app.post("/review")
     async def add_review_comment(req):

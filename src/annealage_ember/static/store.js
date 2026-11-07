@@ -129,8 +129,14 @@
  *                 An upload in flight is therefore visible as a state on the
  *                 entry itself rather than as a separate count, which is what
  *                 keeps the cap, the strip and Send reading one record of one
- *                 fact. `uploads.js` is the only module that writes any of
- *                 it, since it is the only module that performs an upload.
+ *                 fact. `uploads.js` is the only module that writes an image
+ *                 entry, since it is the only module that performs an upload.
+ *                 A `kind: 'context'` entry is the other sort: `{id, key,
+ *                 kind, state: 'done', label, data}`, something the product
+ *                 page attached (`setChatContext`/`dropChatContext`, through
+ *                 chat.js's `setContext`), keyed by the product's own `key`
+ *                 so it can be replaced in place; it is sent as a `context`
+ *                 block and does not count towards MAX_CHAT_ATTACHMENTS.
  *
  *   toolCardsCollapsed
  *                 whether a tool card is created closed. A saved preference
@@ -786,7 +792,7 @@ function reserveChatAttachment(kind) {
   let id = null;
   commit(() => {
     const chat = state.chat;
-    if (chat.attachments.length >= MAX_CHAT_ATTACHMENTS) return;
+    if (imageCount(chat.attachments) >= MAX_CHAT_ATTACHMENTS) return;
     id = nextAttachmentId++;
     const entry = Object.freeze({
       id,
@@ -842,6 +848,45 @@ function clearChatAttachments() {
   }, ["chat"]);
 }
 
+// How many of `attachments` are images, which MAX_CHAT_ATTACHMENTS caps: a
+// context entry is a few hundred bytes of JSON, not a picture the model is sent.
+function imageCount(attachments) {
+  return attachments.filter((a) => a.kind !== "context").length;
+}
+
+// Adds a context attachment under the product's own `key`, or replaces the
+// one already under it in place (its position and id kept), so a page can
+// keep one chip in step with what is selected. `label` is the chip's text and
+// `data` the product's JSON, sent as the message's `context` block.
+function setChatContext(key, label, data) {
+  commit(() => {
+    const chat = state.chat;
+    const existing = chat.attachments.find((a) => a.kind === "context" && a.key === key);
+    const entry = Object.freeze({
+      id: existing ? existing.id : nextAttachmentId++,
+      key,
+      kind: "context",
+      state: "done",
+      label,
+      data,
+    });
+    const attachments = existing
+      ? chat.attachments.map((a) => (a === existing ? entry : a))
+      : [...chat.attachments, entry];
+    state = { ...state, chat: Object.freeze({ ...chat, attachments: Object.freeze(attachments) }) };
+  }, ["chat"]);
+}
+
+function dropChatContext(key) {
+  commit(() => {
+    const chat = state.chat;
+    if (!chat.attachments.some((a) => a.kind === "context" && a.key === key)) return;
+    const attachments = Object.freeze(
+      chat.attachments.filter((a) => !(a.kind === "context" && a.key === key)));
+    state = { ...state, chat: Object.freeze({ ...chat, attachments }) };
+  }, ["chat"]);
+}
+
 export const store = Object.freeze({
   getState,
   subscribe,
@@ -885,4 +930,6 @@ export const store = Object.freeze({
   failChatAttachment,
   dropChatAttachment,
   clearChatAttachments,
+  setChatContext,
+  dropChatContext,
 });

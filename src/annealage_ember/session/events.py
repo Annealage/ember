@@ -736,6 +736,8 @@ def _human_lines(blocks, automation_source=None) -> List[str]:
             body.extend(str(block.get("text", "")).splitlines() or [""])
         elif block.get("type") == "image_path":
             body.append("[image: %s]" % block.get("path", ""))
+        elif block.get("type") == "context":
+            body.append("[context: %s]" % block.get("label", ""))
     author = (
         "Automatic workflow continuation"
         if automation_source == "loom_root_continuation"

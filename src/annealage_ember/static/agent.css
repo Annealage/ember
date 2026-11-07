@@ -233,6 +233,21 @@ pre.toolresult.error { color: #e8a0a0; }
 .msg.user .attachthumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .msg.user .attachthumbs img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid #4a3520; display: block; }
 
+/* Context a product page attached (chat.js's setContext and sendMessage): a
+   pill naming it, in the composer strip and in the sent message, that shows
+   it on the page when clicked. */
+.contextchip {
+  max-width: 100%; padding: 3px 9px; border-radius: 999px; border: 1px solid #2d6470;
+  background: #14262b; color: #bfeef6; font: inherit; font-size: 11px; font-weight: 600;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.contextchip:hover { background: #1b343b; border-color: #35c7e0; }
+.attachchip.contextattach { width: auto; height: auto; min-height: 28px; padding: 0 2px; border: 0; background: none; }
+.msg.user .contextchips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.msg.user .contextchips:empty { display: none; }
+.msg.user.flash { animation: context-flash 1.4s ease-out; }
+@keyframes context-flash { from { box-shadow: 0 0 0 3px #35c7e0; } to { box-shadow: 0 0 0 3px transparent; } }
+
 /* --- settings window, and the chat header's Export button ------------------ */
 
 /* Sits in the chat header beside the agent status pill. Smaller than a topbar

@@ -51,6 +51,7 @@ clients omitting it still receive the original full replay, so adding
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 import struct
 from typing import Any, Callable, Optional, Set, Tuple, Union
@@ -367,7 +368,28 @@ def _check_history(frame: dict) -> Optional[str]:
 _BLOCK_SPECS = {
     "text": ({"type", "text"}, {"type", "text"}),
     "image_path": ({"type", "path"}, {"type", "path"}),
+    "context": ({"type", "label", "data"}, {"type", "label", "data"}),
 }
+
+# A ``context`` block: something the product page attached to the message
+# (``Product.resolve_context``). ``label`` is the chip's text, ``data`` the
+# product's own JSON object; both go into the event log with the message, so
+# both are bounded here.
+MAX_CONTEXT_BLOCKS = 8
+MAX_CONTEXT_LABEL = 200
+MAX_CONTEXT_DATA_BYTES = 16 * 1024
+
+
+def _context_error(block: dict, where: str) -> Optional[str]:
+    label = block["label"]
+    if not isinstance(label, str) or not 0 < len(label.strip()) <= MAX_CONTEXT_LABEL:
+        return "%s.label must be a string of 1 to %d characters" % (where, MAX_CONTEXT_LABEL)
+    data = block["data"]
+    if not isinstance(data, dict):
+        return "%s.data must be an object" % where
+    if len(json.dumps(data, separators=(",", ":")).encode("utf-8")) > MAX_CONTEXT_DATA_BYTES:
+        return "%s.data must be at most %d bytes of JSON" % (where, MAX_CONTEXT_DATA_BYTES)
+    return None
 
 
 # A turn frame's ``client_id``: the page's own name for one message it sent,
@@ -392,6 +414,12 @@ def _check_turn(frame: dict) -> Optional[str]:
         error = object_error(block, spec[0], spec[1], "turn.blocks[%d]" % i)
         if error:
             return error
+        if block_type == "context":
+            error = _context_error(block, "turn.blocks[%d]" % i)
+            if error:
+                return error
+    if sum(1 for block in blocks if block["type"] == "context") > MAX_CONTEXT_BLOCKS:
+        return "turn.blocks may carry at most %d context blocks" % MAX_CONTEXT_BLOCKS
     if "client_id" in frame and not (
         isinstance(frame["client_id"], str) and _CLIENT_ID_RE.fullmatch(frame["client_id"])
     ):

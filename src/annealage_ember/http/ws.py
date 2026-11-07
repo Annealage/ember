@@ -33,7 +33,7 @@ import time
 from microdot import Response
 from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
-from .. import hosted_authority, observability, protocol
+from .. import hosted_authority, observability, protocol, turn_context
 from ..hosted_state import attribution
 from ..session.base import (
     AGENT_CONNECTING,
@@ -788,11 +788,52 @@ async def _dispatch(
 
 
 async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, records=None):
+    # Resolved before the lock: a product's resolver may take seconds (Loom
+    # reads the sketch and crops a render), and other tabs' turns queue on
+    # the lock. A context that will not resolve refuses the message, with the
+    # product's reason, before anything is logged.
+    agent_blocks = None
+    if turn_context.has_context(frame["blocks"]):
+        try:
+            agent_blocks = await turn_context.agent_blocks(
+                frame["blocks"], bus=bus, serve_dir=_serve_dir(session, bus)
+            )
+        except turn_context.ContextRefused as exc:
+            await ws.send(json.dumps(protocol.build_refused(str(exc), frame.get("client_id"))))
+            return
     if bus is not None:
         async with bus.turn_submission_lock:
-            await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
+            await _submit_turn_locked(
+                ws,
+                conn,
+                registry,
+                event_log,
+                frame,
+                session,
+                bus,
+                records,
+                agent_blocks=agent_blocks,
+            )
     else:
-        await _submit_turn_locked(ws, conn, registry, event_log, frame, session, bus, records)
+        await _submit_turn_locked(
+            ws,
+            conn,
+            registry,
+            event_log,
+            frame,
+            session,
+            bus,
+            records,
+            agent_blocks=agent_blocks,
+        )
+
+
+def _serve_dir(session, bus):
+    """Where a resolved context's images are written: the app's served
+    directory (``bus.serve_dir``, set by ``create_app``), else the session's
+    working directory, which is the same directory."""
+    serve_dir = getattr(bus, "serve_dir", None)
+    return serve_dir if serve_dir is not None else getattr(session, "cwd", None)
 
 
 def turn_refusal(session, bus=None, *, starting_ok=False):
@@ -822,7 +863,17 @@ def turn_refusal(session, bus=None, *, starting_ok=False):
 
 
 async def _submit_turn_locked(
-    ws, conn, registry, event_log, frame, session, bus, records=None, *, on_admitted=None
+    ws,
+    conn,
+    registry,
+    event_log,
+    frame,
+    session,
+    bus,
+    records=None,
+    *,
+    on_admitted=None,
+    agent_blocks=None,
 ):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
@@ -850,8 +901,13 @@ async def _submit_turn_locked(
     broadcast is scheduled behind any a streaming session has already
     scheduled, so the page receives events in seq order even when a steer
     lands mid-stream.
+
+    ``agent_blocks``, when given, is what the agent receives in place of the
+    frame's blocks: the same message with its ``context`` blocks resolved
+    (``turn_context.agent_blocks``). The log keeps the frame's own blocks.
     """
     blocks = frame["blocks"]
+    sent_blocks = blocks if agent_blocks is None else agent_blocks
     client_id = frame.get("client_id")
     holder = getattr(bus, "agent_holder", None)
     hosted_principal = None
@@ -888,7 +944,7 @@ async def _submit_turn_locked(
         on_admitted()
     turn = None
     if bus is not None:
-        blocks_to_send = bus.begin_turn(blocks, by=conn.human)
+        blocks_to_send = bus.begin_turn(sent_blocks, by=conn.human)
         turn = bus.turn
         who = attribution(conn.human)
         _publish(
@@ -913,7 +969,7 @@ async def _submit_turn_locked(
                 conn.human, getattr(session, "session_id", None), turn, blocks, client_id
             )
     else:
-        blocks_to_send = blocks
+        blocks_to_send = sent_blocks
     try:
         if defer:
             # The agent is still starting (a closed one an interaction just
