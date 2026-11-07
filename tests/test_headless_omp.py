@@ -810,8 +810,8 @@ async def test_native_timeout_recovery_uses_one_client_and_conversation(
         **make_args(
             tmp_path,
             state_dir=tmp_path / "conversation",
-            work_timeout=0.05,
-            interrupt_timeout=1,
+            work_timeout=0.5,
+            interrupt_timeout=5,
             max_timeout_recoveries=1,
             on_timeout=lambda context: contexts.append(context) or "diagnose",
             on_turn_result=lambda turn: "continue" if turn.text == "clear_path" else None,

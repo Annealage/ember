@@ -15,11 +15,15 @@ import threading
 from pathlib import Path
 
 import pytest
-from omp_loopback import MODEL, LoopbackModel, loopback_env, write_agent_dir
-from test_headless import make_args, make_toolset
 
-from annealage_ember.headless import run_prompt
-from annealage_ember.session import omp as omp_module
+# omp-rpc needs Python 3.11 or later; the 3.10 CI job does not install it.
+pytest.importorskip("omp_rpc")
+
+from omp_loopback import MODEL, LoopbackModel, loopback_env, write_agent_dir  # noqa: E402
+from test_headless import make_args, make_toolset  # noqa: E402
+
+from annealage_ember.headless import run_prompt  # noqa: E402
+from annealage_ember.session import omp as omp_module  # noqa: E402
 
 pytestmark = [
     pytest.mark.asyncio,
