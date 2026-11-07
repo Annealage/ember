@@ -1125,6 +1125,7 @@ def test_a_hosted_session_holds_its_permission_cards_until_answered(
 ):
     """Only a hosted worker's cards outlive the browser; every other app keeps the
     shared approval defaults."""
+    pytest.importorskip("omp_rpc")  # the omp backend; absent on Python 3.10
     tools = _tools(bus, tmp_path, _fake(fake))
     broker = _session("omp", tools, tmp_path, hosted_mode=hosted)._broker
     assert broker._hold is held

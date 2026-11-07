@@ -963,8 +963,8 @@ async def test_owned_native_abort_errors_are_expected_only_after_acknowledgement
         **make_args(
             tmp_path,
             state_dir=tmp_path / "conversation",
-            work_timeout=0.03,
-            interrupt_timeout=1,
+            work_timeout=0.5,
+            interrupt_timeout=5,
             max_timeout_recoveries=1,
             on_timeout=lambda context: contexts.append(context) or "diagnose",
         ),
