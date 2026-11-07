@@ -505,11 +505,21 @@ def model_controls(swap_product):
         dataclasses.replace(
             TOY,
             browser_runtime_controls=False,
-            settings_keys=(*TOY.settings_keys, *shared, settings.Key(
-                name="admin_profile", type_name="str", default="oauth",
-                layers=(settings.USER,), effect="restart", description="Profile",
-                py_type=str, section="Models", choices=("oauth", "api"),
-            )),
+            settings_keys=(
+                *TOY.settings_keys,
+                *shared,
+                settings.Key(
+                    name="admin_profile",
+                    type_name="str",
+                    default="oauth",
+                    layers=(settings.USER,),
+                    effect="restart",
+                    description="Profile",
+                    py_type=str,
+                    section="Models",
+                    choices=("oauth", "api"),
+                ),
+            ),
         )
     )
     return {
@@ -525,12 +535,23 @@ def model_controls(swap_product):
         "agents": [
             {"title": "Coordinator", "model": "model", "effort": "effort", "inherits": "high"},
         ],
-        "profile": {"key": "admin_profile", "profiles": [
-            {"id": "oauth", "title": "OAuth", "billing": "Subscription",
-             "tiers": {"high": {"model": "anthropic/opus", "effort": "high"}}},
-            {"id": "api", "title": "API", "billing": "Billed separately",
-             "tiers": {"high": {"model": "anthropic-api/opus", "effort": "low"}}},
-        ]},
+        "profile": {
+            "key": "admin_profile",
+            "profiles": [
+                {
+                    "id": "oauth",
+                    "title": "OAuth",
+                    "billing": "Subscription",
+                    "tiers": {"high": {"model": "anthropic/opus", "effort": "high"}},
+                },
+                {
+                    "id": "api",
+                    "title": "API",
+                    "billing": "Billed separately",
+                    "tiers": {"high": {"model": "anthropic-api/opus", "effort": "low"}},
+                },
+            ],
+        },
         "efforts": ["low", "high"],
     }
 
@@ -596,10 +617,14 @@ async def test_restart_admin_model_settings_are_explicit_and_do_not_change_runti
     assert profile["pending"]["admin_profile"] == {"value": "api", "from": settings.USER}
     assert profile["model_controls"]["runtime"] == before_runtime
     assert settings.resolve(None)["admin_profile"] == "api"
-    assert (await _put(client, {"admin_profile": "oauth"}, token="agent-only-secret")).status_code == 403
+    assert (
+        await _put(client, {"admin_profile": "oauth"}, token="agent-only-secret")
+    ).status_code == 403
 
 
-async def test_live_model_callback_runs_only_after_authorized_persistence(served_dir, model_controls):
+async def test_live_model_callback_runs_only_after_authorized_persistence(
+    served_dir, model_controls
+):
     calls = []
     state = {"status": "pending"}
 
@@ -611,9 +636,13 @@ async def test_live_model_callback_runs_only_after_authorized_persistence(served
         return dict(state)
 
     model_controls.update(on_save=on_save, status=status)
-    client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
+    client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
     assert (await _put(client, {"admin_high_model": "bad/model"}, token="wrong")).status_code == 403
     assert (await _put(client, {"admin_high_effort": 42})).status_code == 400
     assert calls == []
@@ -631,13 +660,18 @@ async def test_live_model_callback_failure_reports_saved_not_applied(served_dir,
         raise RuntimeError("coordinator unavailable")
 
     model_controls["on_save"] = on_save
-    client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
+    client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
     response = await _put(client, {"admin_high_model": "new/model"})
     assert response.status_code == 200
     assert body_of(response)["model_apply"] == {
-        "status": "error", "error": "coordinator unavailable",
+        "status": "error",
+        "error": "coordinator unavailable",
     }
     assert settings.resolve(None)["admin_high_model"] == "new/model"
 
@@ -655,12 +689,20 @@ async def test_model_writes_are_serialized_through_notification(served_dir, mode
         return {"status": "applied"}
 
     model_controls["on_save"] = on_save
-    client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
-    other_client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
+    client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
+    other_client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
     first = asyncio.create_task(_put(client, {"admin_high_model": "first/model"}))
     await asyncio.wait_for(entered.wait(), 2)
     second = asyncio.create_task(_put(other_client, {"admin_high_model": "second/model"}))
@@ -673,7 +715,9 @@ async def test_model_writes_are_serialized_through_notification(served_dir, mode
 
 
 async def test_cancelled_request_keeps_write_and_notification_serialized(
-    served_dir, model_controls, monkeypatch,
+    served_dir,
+    model_controls,
+    monkeypatch,
 ):
     loop = asyncio.get_running_loop()
     writing = asyncio.Event()
@@ -694,12 +738,20 @@ async def test_cancelled_request_keeps_write_and_notification_serialized(
 
     monkeypatch.setattr(settings, "apply", blocked_apply)
     model_controls["on_save"] = on_save
-    first_client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
-    second_client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
+    first_client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
+    second_client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
     first = asyncio.create_task(_put(first_client, {"admin_high_model": "first/model"}))
     try:
         await asyncio.wait_for(writing.wait(), 2)
@@ -717,12 +769,18 @@ async def test_cancelled_request_keeps_write_and_notification_serialized(
         release.set()
 
 
-@pytest.mark.parametrize(("catalogue", "expected", "error"), [
-    (lambda: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"],
-     ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"], False),
-    (list, [], False),
-    (lambda: None, [], True),
-])
+@pytest.mark.parametrize(
+    ("catalogue", "expected", "error"),
+    [
+        (
+            lambda: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"],
+            ["anthropic/claude-opus-5-5", "openai-codex/gpt-6-luna"],
+            False,
+        ),
+        (list, [], False),
+        (lambda: None, [], True),
+    ],
+)
 async def test_model_catalogue_is_available_without_a_session(
     served_dir, model_controls, catalogue, expected, error
 ):
@@ -736,13 +794,18 @@ async def test_model_catalogue_is_available_without_a_session(
 
 
 async def test_model_override_equal_to_startup_reports_saved_provenance(served_dir, model_controls):
-    client = make_test_client(create_toy_app(
-        served_dir, token=TOKEN, settings_model_controls=model_controls,
-    ))
+    client = make_test_client(
+        create_toy_app(
+            served_dir,
+            token=TOKEN,
+            settings_model_controls=model_controls,
+        )
+    )
     payload = body_of(await _put(client, {"admin_high_model": "anthropic/opus"}))
     assert payload["settings"]["admin_high_model"]["from"] == settings.DEFAULT
     assert payload["pending"]["admin_high_model"] == {
-        "value": "anthropic/opus", "from": settings.USER,
+        "value": "anthropic/opus",
+        "from": settings.USER,
     }
     later = body_of(await client.get("/settings?t=%s" % TOKEN))
     assert later["pending"]["admin_high_model"] == payload["pending"]["admin_high_model"]

@@ -865,7 +865,8 @@ def create_app(
         agent_lock=agent_lock,
         restore_model_on_resume=(
             settings_model_controls.get("restore_model_on_resume", True)
-            if settings_model_controls and not hosted_mode else True
+            if settings_model_controls and not hosted_mode
+            else True
         ),
     )
     holder.redeliveries = redeliveries

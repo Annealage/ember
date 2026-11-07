@@ -337,9 +337,13 @@ async def test_policy_managed_reopen_does_not_restore_old_browser_model(served_d
         return session
 
     app = _app(
-        served_dir, built, resume_session=resume,
+        served_dir,
+        built,
+        resume_session=resume,
         settings_model_controls={
-            "groups": {}, "agents": [], "restore_model_on_resume": False,
+            "groups": {},
+            "agents": [],
+            "restore_model_on_resume": False,
         },
     )
     await app.agent_start()

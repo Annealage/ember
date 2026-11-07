@@ -220,7 +220,8 @@ def register_settings_routes(
                 "groups": controls["groups"],
                 "agents": controls["agents"],
                 "models": list(models if models is not None else runtime_info.get("models") or [])
-                if not catalogue or models is not None else [],
+                if not catalogue or models is not None
+                else [],
                 "models_error": bool(catalogue and models is None),
                 "runtime": runtime_info.get("resolved_runtime"),
                 "session_id": runtime_info.get("id"),
@@ -359,9 +360,13 @@ def register_settings_routes(
                     return None, None, ({"ok": False, "error": str(exc)}, 400)
                 except OSError as exc:
                     sys.stderr.write("error: could not write settings: %s\n" % exc)
-                    return None, None, (
-                        {"ok": False, "error": "could not write the settings file: %s" % exc},
-                        500,
+                    return (
+                        None,
+                        None,
+                        (
+                            {"ok": False, "error": "could not write the settings file: %s" % exc},
+                            500,
+                        ),
                     )
                 callback = controls.get("on_save") if controls else None
                 if callback and control_keys.intersection(changes):

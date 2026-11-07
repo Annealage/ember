@@ -261,7 +261,9 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert "High model: custom/shared" in output["cancelled"]["prompt"]
     assert "High effort: medium" in output["cancelled"]["prompt"]
     assert output["confirmed"] == {
-        "profile": "oauth", "high_model": "", "high_effort": "",
+        "profile": "oauth",
+        "high_model": "",
+        "high_effort": "",
     }
     assert output["confirmedAgent"] == "custom/legacy"
     assert "High: anthropic-api/opus · low" in output["historicalPreview"]
