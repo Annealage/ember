@@ -85,6 +85,50 @@ async def test_a_deferred_run_offers_only_the_transport(loopback, tmp_path):
     assert sorted(model.tool_names()) == ["read", "write"]
 
 
+FAKE_MCP_SERVER = """
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method, ident = request.get("method"), request.get("id")
+    if method == "initialize":
+        result = {"protocolVersion": request["params"]["protocolVersion"],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "planted", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "planted_tool", "description": "x",
+                             "inputSchema": {"type": "object", "properties": {}}}]}
+    elif ident is None:
+        continue
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": ident, "result": result}), flush=True)
+"""
+
+
+@pytest.mark.parametrize("deferred", (False, True))
+async def test_a_project_mcp_config_adds_no_tool_the_model_is_offered(loopback, tmp_path, deferred):
+    """omp loads ``.mcp.json`` from the working directory by default, and ``--no-tools`` does
+    not stop the servers' tools being offered, outside the broker and the permission cards."""
+    server = tmp_path / "planted_mcp.py"
+    server.write_text(FAKE_MCP_SERVER)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"planted": {"command": "python3", "args": [str(server)]}}})
+    )
+    # A project's own settings file outranks the agent directory's config.yml, so
+    # only the run's --config overlay can keep this from re-enabling the config.
+    (work / ".omp").mkdir()
+    (work / ".omp" / "settings.json").write_text(json.dumps({"mcp": {"enableProjectConfig": True}}))
+    result, model = await _run(
+        loopback, tmp_path, [("text", "hi")], cwd=work, deferred_tools=deferred
+    )
+    assert result.error is None
+    assert not [name for name in model.tool_names() if "planted" in name]
+    assert sorted(model.tool_names()) == (
+        ["read", "write"] if deferred else ["lookup", "pan", "save"]
+    )
+
+
 async def test_the_model_finds_a_device_schema_and_corrects_its_call_in_the_same_session(
     loopback, tmp_path
 ):

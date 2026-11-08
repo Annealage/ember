@@ -3483,7 +3483,10 @@ async def test_a_deferred_session_launches_omp_with_the_settings_it_needs_outran
         (client,) = built
         args = client.kwargs["extra_args"]
         overlay = Path(args[args.index("--config") + 1])
-        assert json.loads(overlay.read_text()) == {"tools": {"xdev": True, "xdevDocs": "catalog"}}
+        assert json.loads(overlay.read_text()) == {
+            "mcp": {"enableProjectConfig": False},
+            "tools": {"xdev": True, "xdevDocs": "catalog"},
+        }
         assert "--no-extensions" in args and "-e" in args
     finally:
         await session.close()

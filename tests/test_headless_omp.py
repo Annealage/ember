@@ -168,8 +168,8 @@ async def test_omp_run_end_to_end_with_a_read_view_and_ungranted_write_tool(omp_
     (client,) = omp_client.instances
     assert client.kwargs["model"] == "prov/model"
     assert client.kwargs["tools"] == ()
-    assert client.kwargs["extra_args"] == ("--auto-approve", "--no-extensions")
-    assert "--no-extensions" in client.kwargs["extra_args"]
+    args = client.kwargs["extra_args"]
+    assert "--auto-approve" in args and "--no-extensions" in args and "-e" not in args
     assert "ctx" in client.kwargs["append_system_prompt"]
     assert Path(client.kwargs["cwd"]) == tmp_path
     assert client.stopped
@@ -183,12 +183,8 @@ async def test_thinking_is_passed_to_omp(omp_client, tmp_path):
     result = await run_prompt("do it", **make_args(tmp_path, thinking="high"))
     assert result.error is None
     (client,) = omp_client.instances
-    assert client.kwargs["extra_args"] == (
-        "--auto-approve",
-        "--no-extensions",
-        "--thinking",
-        "high",
-    )
+    args = client.kwargs["extra_args"]
+    assert args[args.index("--thinking") + 1] == "high"
 
 
 async def test_an_explicit_omp_session_dir_is_where_omp_keeps_the_conversation(

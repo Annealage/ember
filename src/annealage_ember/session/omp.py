@@ -129,6 +129,15 @@ class only as correct as one build's private implementation. Instead:
    real handler. This is unaffected by whichever UI-request shape a given
    `omp` build happens to use for its own native gate, because that gate
    never fires.
+   Every run also forces ``mcp.enableProjectConfig: false`` through a ``--config``
+   overlay. omp loads ``.mcp.json`` from ``cwd`` by default, spawns its servers and
+   offers their tools (``mcp__<server>_<tool>``) to the model even under
+   ``--no-tools``, outside the broker gate and the permission cards, so a working
+   directory holding one would have made the claim above false in the same way an
+   extension did. Only the overlay holds: a project's ``.omp/settings`` outranks the
+   agent directory's ``config.yml`` (measured on omp 18.4.5). Project config is the
+   only MCP source a setting reaches; a server in the agent directory's own
+   ``mcp.json`` still loads, and a hosted profile's directory holds none.
    ``deferred_tools=True`` widens "every built-in disabled" by exactly two
    tools, ``read`` and ``write``, which omp uses as the ``xd://`` transport
    (``read xd://<tool>`` documents a device, ``write xd://<tool>`` runs it). On
@@ -378,10 +387,18 @@ _XD_DEVICE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 #: in omp 18.4.5 and 18.11.3). A host tool with one of these names would be shadowed
 #: by omp's device and, past the guard, would reach it.
 _XD_RESERVED_DEVICES = frozenset(("report_issue", "resolve", "reject", "propose"))
-#: What ``deferred_tools`` forces through a ``--config`` overlay, which outranks the
-#: user's, the profile's and the project's settings: the tools mount as devices, and
-#: the prompt lists them instead of inlining their schemas.
+#: What ``deferred_tools`` adds to the ``--config`` overlay: the tools mount as
+#: devices, and the prompt lists them instead of inlining their schemas.
 _XD_SETTINGS = {"tools": {"xdev": True, "xdevDocs": "catalog"}}
+#: What every run forces through a ``--config`` overlay, which outranks the user's, the
+#: profile's and the project's settings (a project's ``.omp/settings`` outranks the
+#: agent directory's ``config.yml``, so only the overlay holds). omp loads
+#: ``.mcp.json`` from the working directory by default, spawns its servers, and
+#: offers their tools to the model even under ``--no-tools``, outside the broker gate
+#: and the permission cards (omp 18.4.5 and 18.11.3; ``mcp__<server>_<tool>``).
+#: Project config is the only MCP source a settings key reaches: a server in the
+#: agent directory's own ``mcp.json`` still loads.
+_BASE_SETTINGS = {"mcp": {"enableProjectConfig": False}}
 
 # How long the ``compact`` request is waited for: it summarises the whole conversation, which
 # outlasts ``RpcClient``'s 30-second default for ordinary requests.
@@ -500,7 +517,7 @@ class OmpSession:
         self._builtin_tools = tuple(builtin_tools)
         # Host tools as ``xd://`` devices behind the packaged guard (class docstring).
         self._deferred_tools = bool(deferred_tools)
-        self._xd_dir: Optional[Path] = None
+        self._overlay_dir: Optional[Path] = None
         # Called on the session's loop with one ``hosted_state.usage_event`` per
         # provider request; ``None`` (the default) registers nothing extra.
         self._on_request_usage = on_request_usage
@@ -1329,14 +1346,18 @@ class OmpSession:
                 system_args = ("--system-prompt", str(prompt_file))
             elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
-            xd_args = ()
+            settings = {key: dict(value) for key, value in _BASE_SETTINGS.items()}
             if self._deferred_tools:
-                self._xd_dir = Path(tempfile.mkdtemp(prefix="annealage-xd-"))
-                overlay = self._xd_dir / "settings.yml"
-                fd = os.open(overlay, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(_XD_SETTINGS, handle)
-                xd_args = ("--config", str(overlay), "-e", str(XD_GUARD))
+                for key, value in _XD_SETTINGS.items():
+                    settings.setdefault(key, {}).update(value)
+            self._overlay_dir = Path(tempfile.mkdtemp(prefix="annealage-omp-"))
+            overlay = self._overlay_dir / "settings.yml"
+            fd = os.open(overlay, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle)
+            overlay_args = ("--config", str(overlay))
+            if self._deferred_tools:
+                overlay_args += ("-e", str(XD_GUARD))
             if self._session_dir is not None:
                 self._session_dir.mkdir(parents=True, exist_ok=True)
                 client_kwargs["session_dir"] = str(self._session_dir)
@@ -1365,7 +1386,7 @@ class OmpSession:
                 extra_args=(
                     "--auto-approve",
                     "--no-extensions",
-                    *xd_args,
+                    *overlay_args,
                     *system_args,
                     *(("--thinking", self._thinking) if self._thinking else ()),
                 ),
@@ -1770,9 +1791,9 @@ class OmpSession:
         if self._system_prompt_dir is not None:
             shutil.rmtree(self._system_prompt_dir, ignore_errors=True)
             self._system_prompt_dir = None
-        if self._xd_dir is not None:
-            shutil.rmtree(self._xd_dir, ignore_errors=True)
-            self._xd_dir = None
+        if self._overlay_dir is not None:
+            shutil.rmtree(self._overlay_dir, ignore_errors=True)
+            self._overlay_dir = None
 
     # -- host tools -------------------------------------------------------------
 
