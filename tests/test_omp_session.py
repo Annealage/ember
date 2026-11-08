@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
+from omp_conversation import conversation_body, write_conversation
 from omp_rpc import RpcClient
 
 from annealage_ember import launch, sessions
@@ -1871,8 +1872,7 @@ async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_thro
     figures are reported as the session starts, before any turn, and after
     each turn they are the running totals (the turn's own share is the
     turn_end's), beside the context window's fill."""
-    conversation = tmp_path / "conversation.jsonl"
-    conversation.write_text("{}\n")
+    conversation = write_conversation(tmp_path / "conversation.jsonl")
     switch = FakeRpcClient.switch_session
 
     def resume_with_history(self, session_path):
@@ -1970,7 +1970,7 @@ async def test_the_conversation_file_is_recorded_and_a_resume_switches_to_it(
         fake = FakeRpcClient(**kwargs)
         # What omp does with --session-dir: its conversation file lives there.
         fake.session_file = str(Path(kwargs["session_dir"]) / "conversation.jsonl")
-        Path(fake.session_file).write_text("{}\n")
+        write_conversation(fake.session_file)
         clients.append(fake)
         return fake
 
@@ -2019,11 +2019,45 @@ async def test_a_conversation_file_omp_never_wrote_is_nothing_to_resume(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("omp_refuses", (False, True))
+async def test_a_resume_moves_the_conversation_to_omps_directory_and_puts_it_back_if_omp_refuses(
+    tmp_path, monkeypatch, omp_refuses
+):
+    conversation = write_conversation(tmp_path / "saved.jsonl", "history\n")
+    original = conversation.read_bytes()
+    seen = {}
+
+    def switch(self, session_path):
+        seen["header"] = json.loads(Path(session_path).read_text().splitlines()[0])
+        if omp_refuses:
+            raise RpcCommandError("Invalid session file")
+        return SimpleNamespace(cancelled=False)
+
+    monkeypatch.setattr(FakeRpcClient, "switch_session", switch)
+    session, fake, recorder, _broker = await _started_session(
+        session_dir=tmp_path / "omp", resume=str(conversation)
+    )
+    try:
+        # omp was asked to open the file with the header already naming its own directory.
+        assert seen["header"]["cwd"] == os.path.realpath(fake.kwargs["cwd"])
+        assert seen["header"]["id"] == "01a1bcff-23d0-721e-a922-e8707eae2c5e"
+        backup = conversation.with_name("saved.jsonl.cwd-original")
+        assert backup.read_bytes() == original
+        if omp_refuses:
+            assert conversation.read_bytes() == original
+            assert any(isinstance(e, SessionReset) for e in recorder.all)
+        else:
+            assert conversation_body(conversation) == "history\n"
+            assert conversation.read_bytes() != original
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_a_conversation_omp_cannot_open_is_reported_and_the_session_starts_fresh(
     tmp_path, monkeypatch
 ):
-    broken = tmp_path / "broken.jsonl"
-    broken.write_text("not a session\n")
+    broken = write_conversation(tmp_path / "broken.jsonl")
 
     def refuse(self, session_path):
         raise RpcCommandError("Invalid session file")
@@ -2904,8 +2938,7 @@ class ResumingModelClient(FakeRpcClient):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_url", [None, "http://127.0.0.1:11434/v1"])
 async def test_resume_operator_selection_wins_on_the_same_native_conversation(tmp_path, base_url):
-    conversation = tmp_path / "saved.jsonl"
-    conversation.write_text("existing history\n")
+    conversation = write_conversation(tmp_path / "saved.jsonl", "existing history\n")
     model = "openai-codex/gpt-6.1-sol" if base_url is None else "gpt-6.1-sol"
     provider = "openai-codex" if base_url is None else _provider_id()
     session, fake, recorder, _broker = await _started_session(
@@ -2939,15 +2972,14 @@ async def test_resume_operator_selection_wins_on_the_same_native_conversation(tm
         assert (fake.model.provider, fake.model.id) == (provider, "gpt-6.1-sol")
         assert (fake.session_id, fake.session_file) == ("omp-resumed", str(conversation))
         assert fake.switch_calls == [str(conversation)]
-        assert conversation.read_text() == "existing history\n"
+        assert conversation_body(conversation) == "existing history\n"
     finally:
         await session.close()
 
 
 @pytest.mark.asyncio
 async def test_profile_queued_while_connecting_applies_after_resume_before_prompt(tmp_path):
-    conversation = tmp_path / "saved.jsonl"
-    conversation.touch()
+    conversation = write_conversation(tmp_path / "saved.jsonl")
     recorder = EventRecorder()
     session = OmpSession(
         recorder,
@@ -2985,8 +3017,7 @@ async def test_profile_queued_while_connecting_applies_after_resume_before_promp
     ],
 )
 async def test_resume_only_reapplies_explicit_operator_choices(tmp_path, model, thinking, expected):
-    conversation = tmp_path / "saved.jsonl"
-    conversation.touch()
+    conversation = write_conversation(tmp_path / "saved.jsonl")
     session, fake, _recorder, _broker = await _started_session(
         model=model,
         thinking=thinking,
@@ -3005,8 +3036,7 @@ async def test_resume_only_reapplies_explicit_operator_choices(tmp_path, model, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["smol", "default", "slow"])
 async def test_resume_reapplies_the_model_omp_resolved_for_the_role(tmp_path, role):
-    conversation = tmp_path / "saved.jsonl"
-    conversation.touch()
+    conversation = write_conversation(tmp_path / "saved.jsonl")
     session, fake, _recorder, _broker = await _started_session(
         model_role=role,
         thinking="low",
@@ -3066,8 +3096,7 @@ async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
         clients.append(client)
         return client
 
-    conversation = tmp_path / "saved.jsonl"
-    conversation.write_text("existing history\n")
+    conversation = write_conversation(tmp_path / "saved.jsonl", "existing history\n")
     recorder = EventRecorder()
     session = OmpSession(
         recorder,
@@ -3086,7 +3115,7 @@ async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
         assert clients[0].prompt_calls == []
         assert any(isinstance(e, AgentError) for e in recorder.all)
         assert not any(isinstance(e, SessionReset) for e in recorder.all)
-        assert conversation.read_text() == "existing history\n"
+        assert conversation_body(conversation) == "existing history\n"
     finally:
         await session.close()
 

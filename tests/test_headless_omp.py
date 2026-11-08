@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import tool
+from omp_conversation import conversation_body, write_conversation
 from test_headless import make_args, make_toolset
 
 from annealage_ember import headless
@@ -171,7 +172,8 @@ async def test_omp_run_end_to_end_with_a_read_view_and_ungranted_write_tool(omp_
     args = client.kwargs["extra_args"]
     assert "--auto-approve" in args and "--no-extensions" in args and "-e" not in args
     assert "ctx" in client.kwargs["append_system_prompt"]
-    assert Path(client.kwargs["cwd"]) == tmp_path
+    # omp does not run in the caller's directory, so project config there is never read.
+    assert Path(client.kwargs["cwd"]) != tmp_path
     assert client.stopped
     # The conversation file went under the run's own state, which is gone.
     assert not Path(client.kwargs["session_dir"]).exists()
@@ -746,7 +748,8 @@ class DurableRpcClient(FakeRpcClient):
 
     def prompt(self, message, **kwargs):
         self.prompt_runtimes.append((self.model.provider, self.model.id, self.thinking_level))
-        Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
+        if not Path(self.session_file).exists():
+            write_conversation(self.session_file)
         with open(self.session_file, "a", encoding="utf-8") as output:
             output.write(message + "\n")
         self.messages.append(message)
@@ -899,7 +902,7 @@ async def test_native_resume_failure_never_submits_into_fresh_conversation(
     )
     assert second.error is not None
     assert omp_client.instances[-1].messages == []
-    assert Path(first.recovery.conversation_file).read_text() == "original\n"
+    assert conversation_body(first.recovery.conversation_file) == "original\n"
     assert second.recovery.session_id == first.recovery.session_id
 
 

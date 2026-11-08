@@ -10,6 +10,7 @@ Everything the fake-client tests in ``test_headless_omp.py`` cannot show.
 
 import http.server
 import json
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -87,6 +88,7 @@ async def test_a_deferred_run_offers_only_the_transport(loopback, tmp_path):
 
 FAKE_MCP_SERVER = """
 import json, sys
+open(sys.argv[1], "a").write("mcp server started\\n")
 for line in sys.stdin:
     request = json.loads(line)
     method, ident = request.get("method"), request.get("id")
@@ -103,30 +105,264 @@ for line in sys.stdin:
     print(json.dumps({"jsonrpc": "2.0", "id": ident, "result": result}), flush=True)
 """
 
+# A custom tool module: omp imports and runs it at startup, so this is code execution
+# before any model call, and it offers a tool.
+PLANTED_TOOL = """
+import fs from "node:fs";
+fs.appendFileSync(%r, "custom tool loaded\\n");
+export default () => ({
+  name: "planted_js", description: "x",
+  parameters: {type: "object", properties: {}},
+  execute: async () => ({content: [{type: "text", text: "x"}]}),
+});
+"""
 
-@pytest.mark.parametrize("deferred", (False, True))
-async def test_a_project_mcp_config_adds_no_tool_the_model_is_offered(loopback, tmp_path, deferred):
-    """omp loads ``.mcp.json`` from the working directory by default, and ``--no-tools`` does
-    not stop the servers' tools being offered, outside the broker and the permission cards."""
-    server = tmp_path / "planted_mcp.py"
+
+def _plant(root, sentinel):
+    """Everything in a project directory that omp would otherwise start or load."""
+    server = root.parent / ("%s_mcp.py" % root.name)
     server.write_text(FAKE_MCP_SERVER)
-    work = tmp_path / "work"
-    work.mkdir()
-    (work / ".mcp.json").write_text(
-        json.dumps({"mcpServers": {"planted": {"command": "python3", "args": [str(server)]}}})
+    (root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "planted": {"command": "python3", "args": [str(server), str(sentinel)]}
+                }
+            }
+        )
     )
-    # A project's own settings file outranks the agent directory's config.yml, so
-    # only the run's --config overlay can keep this from re-enabling the config.
-    (work / ".omp").mkdir()
-    (work / ".omp" / "settings.json").write_text(json.dumps({"mcp": {"enableProjectConfig": True}}))
+    (root / ".omp" / "tools").mkdir(parents=True)
+    (root / ".omp" / "tools" / "planted.js").write_text(PLANTED_TOOL % str(sentinel))
+    (root / ".claude" / "tools").mkdir(parents=True)
+    (root / ".claude" / "tools" / "planted.js").write_text(PLANTED_TOOL % str(sentinel))
+    plugin = root / ".omp" / "plugins"
+    (plugin / "node_modules" / "planted").mkdir(parents=True)
+    (plugin / "package.json").write_text(json.dumps({"dependencies": {"planted": "1"}}))
+    (plugin / "node_modules" / "planted" / "package.json").write_text(
+        json.dumps({"name": "planted", "version": "1", "omp": {"tools": ["tool.js"]}})
+    )
+    (plugin / "node_modules" / "planted" / "tool.js").write_text(PLANTED_TOOL % str(sentinel))
+    # A project's own settings outrank the agent directory's config.yml, and can switch
+    # on discovery from other tools' user-level config.
+    (root / ".omp" / "settings.json").write_text(
+        json.dumps({"mcp": {"enableProjectConfig": True}, "enabledProviders": ["*"]})
+    )
+
+
+@pytest.mark.parametrize("where", ("cwd", "parent"))
+@pytest.mark.parametrize("deferred", (False, True))
+async def test_a_project_directory_starts_and_offers_nothing_to_omp(
+    loopback, tmp_path, monkeypatch, deferred, where
+):
+    """omp discovers project config (``.mcp.json``, ``.omp/tools``, ``.claude/tools``,
+    ``.omp/plugins``, ``.omp/settings``) from its working directory and every parent, imports
+    and starts what it finds before the first model call, and offers the tools even under
+    ``--no-tools``. None of that may happen, and the host tools still work beside it."""
+    sentinel = tmp_path / "sentinel"
+    project = tmp_path / "project"
+    work = project if where == "cwd" else project / "sub"
+    work.mkdir(parents=True)
+    _plant(project, sentinel)
+    home = tmp_path / "home"
+    # Another tool's user-level MCP config, which a project setting can opt in to.
+    (home).mkdir()
+    (home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "foreign": {
+                        "command": "python3",
+                        "args": [str(tmp_path / "project_mcp.py"), str(sentinel)],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("HOME", str(home))
+    call = (
+        _call("write", path="xd://lookup", content=json.dumps({"q": "board"}))
+        if deferred
+        else _call("lookup", q="board")
+    )
     result, model = await _run(
-        loopback, tmp_path, [("text", "hi")], cwd=work, deferred_tools=deferred
+        loopback, tmp_path, [call, ("text", "done")], cwd=work, deferred_tools=deferred
     )
-    assert result.error is None
-    assert not [name for name in model.tool_names() if "planted" in name]
+    assert result.error is None and result.text == "done"
+    assert not sentinel.exists(), sentinel.read_text() if sentinel.exists() else ""
     assert sorted(model.tool_names()) == (
         ["read", "write"] if deferred else ["lookup", "pan", "save"]
     )
+    assert "found board" in model.tool_output("call_0")
+
+
+async def test_a_durable_conversation_resumes_though_omp_runs_in_its_own_directory(
+    loopback, tmp_path
+):
+    """omp's working directory is private to each run, so a resumed conversation was started
+    in a different one."""
+    model, agent_dir = loopback([("text", "first answer"), ("text", "second answer")])
+    state = tmp_path / "state"
+    common = {"model": MODEL, "omp_agent_dir": agent_dir, "timeout": 60, "state_dir": state}
+    first = await run_prompt("remember the word kestrel", **make_args(tmp_path, **common))
+    assert first.error is None and first.text == "first answer"
+    second = await run_prompt("what was the word", **make_args(tmp_path, resume=True, **common))
+    assert second.error is None and second.text == "second answer"
+    assert "kestrel" in json.dumps(model.requests[-1])
+
+
+def _set_header_cwd(path, cwd):
+    """What a conversation an earlier Ember started looks like: the caller's directory recorded."""
+    lines = path.read_bytes().splitlines(True)
+    for index, line in enumerate(lines[:2]):
+        header = json.loads(line)
+        if header.get("type") == "session":
+            header["cwd"] = str(cwd)
+            lines[index] = json.dumps(header, separators=(",", ":")).encode() + b"\n"
+    path.write_bytes(b"".join(lines))
+
+
+def _conversation_file(state):
+    (found,) = (state / "omp").glob("*.jsonl")
+    return found
+
+
+async def test_a_conversation_an_earlier_version_recorded_resumes_with_its_history(
+    loopback, tmp_path
+):
+    """The real omp refuses to resume a conversation recorded in another directory; the file's
+    header is moved first, the original kept, and the strict headless resume works."""
+    model, agent_dir = loopback([("text", "first answer"), ("text", "second answer")])
+    state = tmp_path / "state"
+    common = {"model": MODEL, "omp_agent_dir": agent_dir, "timeout": 60, "state_dir": state}
+    first = await run_prompt("remember the word kestrel", **make_args(tmp_path, **common))
+    assert first.error is None
+    file = _conversation_file(state)
+    _set_header_cwd(file, tmp_path / "the-old-project")
+    before = file.read_bytes()
+    before_header = [json.loads(x) for x in before.splitlines()[:2]]
+    second = await run_prompt("what was the word", **make_args(tmp_path, resume=True, **common))
+    assert second.error is None and second.text == "second answer"
+    assert "kestrel" in json.dumps(model.requests[-1])
+    after = [json.loads(x) for x in file.read_bytes().splitlines()]
+    (session,) = [x for x in after if x["type"] == "session"]
+    (old,) = [x for x in before_header if x["type"] == "session"]
+    assert session["id"] == old["id"] and session["cwd"] != old["cwd"]
+    assert {k: v for k, v in session.items() if k != "cwd"} == {
+        k: v for k, v in old.items() if k != "cwd"
+    }
+    backup = file.with_name(file.name + ".cwd-original")
+    assert backup.read_bytes() == before
+    # Both runs were one conversation to the provider: same session, same cache identity.
+    assert len({json.dumps(r.get("prompt_cache_key")) for r in model.requests}) == 1
+
+
+async def test_a_conversation_file_that_cannot_be_moved_stops_a_strict_resume_and_is_untouched(
+    loopback, tmp_path
+):
+    model, agent_dir = loopback([("text", "first answer"), ("text", "second answer")])
+    state = tmp_path / "state"
+    common = {"model": MODEL, "omp_agent_dir": agent_dir, "timeout": 60, "state_dir": state}
+    first = await run_prompt("remember the word kestrel", **make_args(tmp_path, **common))
+    assert first.error is None
+    file = _conversation_file(state)
+    _set_header_cwd(file, tmp_path / "the-old-project")
+    lines = file.read_bytes().splitlines(True)
+    index = next(i for i, x in enumerate(lines[:2]) if json.loads(x).get("type") == "session")
+    header = json.loads(lines[index])
+    header["version"] = 99
+    lines[index] = json.dumps(header, separators=(",", ":")).encode() + b"\n"
+    file.write_bytes(b"".join(lines))
+    before = file.read_bytes()
+    second = await run_prompt("what was the word", **make_args(tmp_path, resume=True, **common))
+    assert second.error is not None and "cannot be moved" in second.error
+    assert file.read_bytes() == before
+    assert not list(file.parent.glob("*.cwd-original"))
+
+
+async def test_a_relative_session_directory_is_the_one_asked_for(loopback, tmp_path, monkeypatch):
+    model, agent_dir = loopback([("text", "hi")])
+    monkeypatch.chdir(tmp_path)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path, model=MODEL, omp_agent_dir=agent_dir, timeout=60, omp_session_dir="usage"
+        ),
+    )
+    assert result.error is None
+    assert len(list((tmp_path / "usage").glob("*.jsonl"))) == 1
+    assert not list(tmp_path.rglob(".omp-cwd"))
+
+
+async def test_a_poisoned_kept_directory_is_refused_before_omp_starts(loopback, tmp_path):
+    from annealage_ember.session.omp_cwd import omp_cwd
+
+    sentinel = tmp_path / "sentinel"
+    usage = tmp_path / "usage"
+    usage.mkdir()
+    directory, _ = omp_cwd(usage)
+    (directory / ".omp" / "tools").mkdir()
+    (directory / ".omp" / "tools" / "planted.js").write_text(PLANTED_TOOL % str(sentinel))
+    result, model = await _run(loopback, tmp_path, [("text", "hi")], omp_session_dir=str(usage))
+    assert result.error is not None and "refusing to run omp there" in result.error
+    assert not sentinel.exists() and model.requests == []
+
+
+async def test_nothing_above_the_private_directory_reaches_omp(loopback, tmp_path, monkeypatch):
+    """The temp directory sits under a tree an attacker could have written to: every
+    ancestor holds project config, context files and skills."""
+    sentinel = tmp_path / "sentinel"
+    tree = tmp_path / "attacker"
+    base = tree / "a" / "tmp"
+    base.mkdir(parents=True)
+    for ancestor in (tree, tree / "a", base):
+        _plant(ancestor, sentinel)
+        (ancestor / "AGENTS.md").write_text("MARK_ANCESTOR_AGENTS")
+        (ancestor / "CLAUDE.md").write_text("MARK_ANCESTOR_CLAUDE")
+        (ancestor / ".claude" / "skills" / "evil").mkdir(parents=True)
+        (ancestor / ".claude" / "skills" / "evil" / "SKILL.md").write_text(
+            "---\nname: evil-skill\ndescription: MARK_ANCESTOR_SKILL\n---\nx\n"
+        )
+        (ancestor / ".agents" / "skills" / "evil2").mkdir(parents=True)
+        (ancestor / ".agents" / "skills" / "evil2" / "SKILL.md").write_text(
+            "---\nname: evil2-skill\ndescription: MARK_ANCESTOR_SKILL2\n---\nx\n"
+        )
+    monkeypatch.setenv("ANNEALAGE_OMP_CWD_BASE", str(base))
+    work = tmp_path / "work"
+    work.mkdir()
+    result, model = await _run(loopback, tmp_path, [("text", "hi")], cwd=work)
+    assert result.error is None and not sentinel.exists()
+    body = json.dumps(model.requests[0])
+    assert "MARK_ANCESTOR" not in body, body[
+        body.index("MARK_ANCESTOR") - 260 : body.index("MARK_ANCESTOR")
+    ]
+    assert sorted(model.tool_names()) == ["lookup", "pan", "save"]
+
+
+async def test_host_tools_run_in_the_hosts_directory_not_omps(loopback, tmp_path, monkeypatch):
+    from claude_agent_sdk import tool
+
+    from annealage_ember.headless import ToolSet
+
+    seen = []
+
+    @tool("where", "report the working directory", {})
+    async def where(args):
+        seen.append(os.getcwd())
+        return ok(text="cwd %s" % os.getcwd())
+
+    from annealage_ember.tools import Grading, ok
+
+    toolset = ToolSet(tools=[where], grading=Grading(read=("where",), view=(), write=()))
+    monkeypatch.chdir(tmp_path)
+    result, model = await _run(
+        loopback,
+        tmp_path,
+        [_call("where"), ("text", "done")],
+        toolset=toolset,
+    )
+    assert result.error is None and seen == [str(tmp_path)]
+    assert str(tmp_path) in model.tool_output("call_0")
+    assert "annealage-omp" not in model.tool_output("call_0")
 
 
 async def test_the_model_finds_a_device_schema_and_corrects_its_call_in_the_same_session(

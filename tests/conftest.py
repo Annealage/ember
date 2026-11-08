@@ -152,6 +152,17 @@ def isolated_user_config(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def omp_working_directory_base(tmp_path_factory, monkeypatch):
+    """Keep omp's private working directories (``session/omp_cwd.py``) out of the developer's home.
+
+    The directory must not sit under ``$HOME``, and a scratch ``TMPDIR`` often does, so a test's
+    ``HOME`` is a directory of its own and the base is another one beside it. A test that sets the
+    base itself overrides this."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    monkeypatch.setenv("ANNEALAGE_OMP_CWD_BASE", str(tmp_path_factory.mktemp("omp-cwd-base")))
+
+
+@pytest.fixture(autouse=True)
 def one_backend_installed(monkeypatch):
     """Report exactly one installed agent backend, ``claude``, for every test.
 

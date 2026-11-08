@@ -129,15 +129,32 @@ class only as correct as one build's private implementation. Instead:
    real handler. This is unaffected by whichever UI-request shape a given
    `omp` build happens to use for its own native gate, because that gate
    never fires.
-   Every run also forces ``mcp.enableProjectConfig: false`` through a ``--config``
-   overlay. omp loads ``.mcp.json`` from ``cwd`` by default, spawns its servers and
-   offers their tools (``mcp__<server>_<tool>``) to the model even under
-   ``--no-tools``, outside the broker gate and the permission cards, so a working
-   directory holding one would have made the claim above false in the same way an
-   extension did. Only the overlay holds: a project's ``.omp/settings`` outranks the
-   agent directory's ``config.yml`` (measured on omp 18.4.5). Project config is the
-   only MCP source a setting reaches; a server in the agent directory's own
-   ``mcp.json`` still loads, and a hosted profile's directory holds none.
+   omp also discovers project config from its working directory and every parent,
+   and acts on it before the first model call, with ``--no-tools`` and ``--no-extensions``
+   both set (reproduced on omp 18.4.5 and 18.11.3 with sentinel files): a ``.mcp.json``
+   starts its servers and offers their tools (``mcp__<server>_<tool>``); ``.omp/tools``,
+   ``.claude/tools`` and ``.omp/plugins`` modules are imported and their factories run,
+   and the tools they return are offered; a project ``.omp/settings`` can opt in to other
+   tools' user-level MCP config (``enabledProviders``); a parent's ``AGENTS.md`` and
+   skills reach the prompt. Every one of these sits outside the broker gate and the
+   permission cards, and under ``deferred_tools`` the guard below blocks the calls but
+   not the startup. No setting reaches the plugin path, so omp runs in a directory of its
+   own instead, made and checked by ``omp_cwd`` (its module docstring has the rules): a
+   private, empty directory outside ``$HOME``, in a base nobody else can rename in, that holds only the ``.omp`` and ``.git``
+   anchors, refused if anything else is in it. Host tools do not use omp's working
+   directory (they run in this process), so nothing a product registers moves. A
+   ``--config`` overlay also forces ``mcp.enableProjectConfig`` off, as a second layer.
+   Neither reaches the agent directory and ``$HOME``, which belong to the deployment: a
+   hosted profile's directory holds only the auth file and ``models.yml``. A relative
+   ``session_dir`` is made absolute in ``__init__``, against the caller's directory,
+   because omp starts elsewhere.
+   omp refuses to resume a conversation whose recorded working directory is not its own
+   (``switch_session`` comes back cancelled), so a kept conversation runs in the same
+   directory every time, and one an earlier Ember recorded in the caller's directory has
+   its header moved first by ``omp_session_file.relocate_session_file`` (under omp's own
+   publish lock, with a backup of every state kept; its module docstring has the guarantees).
+   ``_switch_to`` puts the file back if the switch then fails, and a file that cannot be
+   moved is a reported reset, or a failure when the resume was strict.
    ``deferred_tools=True`` widens "every built-in disabled" by exactly two
    tools, ``read`` and ``write``, which omp uses as the ``xd://`` transport
    (``read xd://<tool>`` documents a device, ``write xd://<tool>`` runs it). On
@@ -317,6 +334,8 @@ from .base import (
     context_figures,
     turn_not_sent,
 )
+from .omp_cwd import omp_cwd as _omp_cwd
+from .omp_session_file import SessionFileError, relocate_session_file, rollback
 from .rpc_client import LeanRpcClient as RpcClient
 from .rpc_client import SendRefused
 
@@ -392,12 +411,9 @@ _XD_RESERVED_DEVICES = frozenset(("report_issue", "resolve", "reject", "propose"
 _XD_SETTINGS = {"tools": {"xdev": True, "xdevDocs": "catalog"}}
 #: What every run forces through a ``--config`` overlay, which outranks the user's, the
 #: profile's and the project's settings (a project's ``.omp/settings`` outranks the
-#: agent directory's ``config.yml``, so only the overlay holds). omp loads
-#: ``.mcp.json`` from the working directory by default, spawns its servers, and
-#: offers their tools to the model even under ``--no-tools``, outside the broker gate
-#: and the permission cards (omp 18.4.5 and 18.11.3; ``mcp__<server>_<tool>``).
-#: Project config is the only MCP source a settings key reaches: a server in the
-#: agent directory's own ``mcp.json`` still loads.
+#: agent directory's ``config.yml``, so only the overlay holds). It is the second layer:
+#: omp runs in a directory of its own (the module docstring), where there is no project
+#: config to load.
 _BASE_SETTINGS = {"mcp": {"enableProjectConfig": False}}
 
 # How long the ``compact`` request is waited for: it summarises the whole conversation, which
@@ -518,6 +534,8 @@ class OmpSession:
         # Host tools as ``xd://`` devices behind the packaged guard (class docstring).
         self._deferred_tools = bool(deferred_tools)
         self._overlay_dir: Optional[Path] = None
+        self._omp_cwd: Optional[str] = None
+        self._omp_cwd_ephemeral: Optional[Path] = None
         # Called on the session's loop with one ``hosted_state.usage_event`` per
         # provider request; ``None`` (the default) registers nothing extra.
         self._on_request_usage = on_request_usage
@@ -551,7 +569,9 @@ class OmpSession:
         # PI_CONFIG_DIR's value, relative to $HOME; set by _configuration_refusal.
         self._config_rel: Optional[str] = None
         self._binary = os.path.expanduser(binary) if binary else None
-        self._session_dir = Path(session_dir) if session_dir is not None else None
+        # Absolute now, against the caller's directory: omp starts in another one, so a
+        # relative path would be read against that.
+        self._session_dir = Path(os.path.abspath(session_dir)) if session_dir is not None else None
         self._resume = resume or None
         self._strict_resume = strict_resume
         self.last_request_timeout = None
@@ -1351,6 +1371,12 @@ class OmpSession:
                 for key, value in _XD_SETTINGS.items():
                     settings.setdefault(key, {}).update(value)
             self._overlay_dir = Path(tempfile.mkdtemp(prefix="annealage-omp-"))
+            # omp's own working directory, private and empty of project config (omp_cwd).
+            omp_cwd, ephemeral = _omp_cwd(
+                self._session_dir, keep_out_of=(self.cwd, *(p for p in (self._session_dir,) if p))
+            )
+            self._omp_cwd = str(omp_cwd)
+            self._omp_cwd_ephemeral = omp_cwd if ephemeral else None
             overlay = self._overlay_dir / "settings.yml"
             fd = os.open(overlay, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1371,7 +1397,7 @@ class OmpSession:
                 **client_kwargs,
                 executable=self._binary or "omp",
                 model=model_arg,
-                cwd=self.cwd,
+                cwd=self._omp_cwd,
                 env=env,
                 # Every built-in tool disabled unless the caller named some
                 # (``builtin_tools``, headless only): the model's only
@@ -1673,12 +1699,28 @@ class OmpSession:
                 raise RuntimeError("the requested OMP conversation file does not exist")
             return False
         reason = None
+        migration = None
         try:
-            result = await self._run_blocking(self._client.switch_session, session_file)
-            if getattr(result, "cancelled", False):
-                reason = "omp cancelled the switch to %s" % session_file
-        except Exception as exc:
-            reason = "omp could not open %s (%s)" % (session_file, exc)
+            # omp resumes a conversation only from the directory it was recorded in.
+            migration = await self._run_blocking(relocate_session_file, session_file, self._omp_cwd)
+        except (SessionFileError, OSError) as exc:
+            reason = "its file cannot be moved to omp's working directory (%s)" % exc
+        if reason is None:
+            try:
+                result = await self._run_blocking(self._client.switch_session, session_file)
+                if getattr(result, "cancelled", False):
+                    reason = "omp cancelled the switch to %s" % session_file
+            except Exception as exc:
+                reason = "omp could not open %s (%s)" % (session_file, exc)
+            if reason is not None and migration is not None:
+                # The conversation goes back as it was; the backup stays either way.
+                try:
+                    await self._run_blocking(rollback, migration)
+                except Exception as exc:
+                    reason += "; and putting the file back failed (%s), the original is %s" % (
+                        exc,
+                        migration.backup,
+                    )
         if reason is not None:
             if self._strict_resume:
                 raise RuntimeError(reason)
@@ -1794,6 +1836,10 @@ class OmpSession:
         if self._overlay_dir is not None:
             shutil.rmtree(self._overlay_dir, ignore_errors=True)
             self._overlay_dir = None
+        if self._omp_cwd_ephemeral is not None:
+            # Only the throwaway directory this session made; a kept one is never removed.
+            shutil.rmtree(self._omp_cwd_ephemeral, ignore_errors=True)
+            self._omp_cwd_ephemeral = None
 
     # -- host tools -------------------------------------------------------------
 
