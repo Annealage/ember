@@ -61,6 +61,9 @@ export class ProjectError extends Error {
     this.name = "ProjectError";
     this.status = status;
     this.data = data;
+    const error = data && data.error;
+    this.code = error && typeof error === "object" ? error.code || error.type || null : null;
+    this.type = error && typeof error === "object" ? error.type || null : null;
   }
 }
 
@@ -131,6 +134,17 @@ async function pageRequest(route, body) {
   return { status: res.status, data };
 }
 
+function errorMessage(data, fallback) {
+  const error = data && data.error;
+  if (typeof error === "string" && error.trim()) return error;
+  if (error && typeof error === "object") {
+    if (typeof error.message === "string" && error.message.trim()) return error.message;
+    const code = [error.code, error.type].find((value) => typeof value === "string" && value.trim());
+    if (code) return `${fallback}: ${code}`;
+  }
+  return fallback;
+}
+
 export function createProjectClient({ endpoints = {}, request = pageRequest } = {}) {
   const ep = { ...DEFAULT_ENDPOINTS, ...endpoints };
   const route = (name, ...args) => (typeof ep[name] === "function" ? ep[name](...args) : ep[name]);
@@ -138,12 +152,12 @@ export function createProjectClient({ endpoints = {}, request = pageRequest } = 
   async function call(path, body) {
     const { status, data } = await request(path, body);
     // The server's own 403 says forbidden: true; the authentication refusal is plain text.
+    const message = errorMessage(data, `${path} failed (${status})`);
     if (status === 403 && data && data.forbidden) {
-      throw new ForbiddenError(data.error || "You may not do that.", status, data);
+      throw new ForbiddenError(errorMessage(data, "You may not do that."), status, data);
     }
     if (status === 403) throw new ProjectError(REFUSED, status, data);
-    if (status >= 200 && status < 300 && data && data.ok !== false) return data;
-    const message = (data && data.error) || `${path} failed (${status})`;
+    if (status >= 200 && status < 300 && data && data.ok !== false && !data.error) return data;
     if (data && data.conflict) throw new ConflictError(message, status, data);
     if (data && data.busy) throw new BusyError(message, status, data);
     throw new ProjectError(message, status, data);
@@ -657,7 +671,8 @@ export function createLineageModel(ctx, { onChange = () => {} } = {}) {
   const emit = () => listeners.forEach((fn) => fn(st));
   const targetOf = (product) => st.targets.find((t) => t.product === product);
 
-  /** A host without lineage: its app has no such route (404, no JSON) or says so. */
+  // A bare hosted not_found can also hide an access refusal, not just a
+  // missing route. Only no JSON or an explicit capability opt-out is absent.
   const absent = (err) => err.status === 404 && (!err.data || err.data.unsupported === true);
 
   async function refresh() {

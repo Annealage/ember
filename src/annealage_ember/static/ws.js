@@ -307,6 +307,9 @@ function wsUrl() {
  * connection state is shown on (default: `#connIndicator`); a page without
  * one passes null. `allowModelChange` controls whether `send` permits a
  * `set_model` frame; other frame types are unaffected.
+ * `beforeConnect`, when supplied, is awaited before each socket attempt. A
+ * false result keeps read-only polling active without probing an absent
+ * worker; a rejection displays the failure and retries the gate.
  */
 export function initWs({
   onEvent = {},
@@ -320,6 +323,7 @@ export function initWs({
   connTitles = {},
   indicator = document.getElementById("connIndicator"),
   allowModelChange = true,
+  beforeConnect = null,
 } = {}) {
   let ws = null;
   let opened = false; // true once this attempt's WebSocket has reached readyState OPEN
@@ -334,6 +338,7 @@ export function initWs({
   let fallbackFired = false; // whether this downtime episode has already switched to polling
   let fallbackTimer = null;
   let reconnectTimer = null;
+  let gateError = null;
   let livenessTimer = null;
   let historyBefore = null;
   let initialHistoryExpected = false;
@@ -416,6 +421,29 @@ export function initWs({
     if (stopped) return;
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    if (beforeConnect) {
+      Promise.resolve().then(beforeConnect).then((allowed) => {
+        if (stopped) return;
+        const banner = document.getElementById("err");
+        if (gateError && banner?.textContent === gateError) {
+          banner.textContent = "";
+          banner.style.display = "none";
+        }
+        gateError = null;
+        if (allowed) openSocket();
+        else scheduleRetry();
+      }, (error) => {
+        if (stopped) return;
+        gateError = `Live connection unavailable: ${error?.message || String(error)}`;
+        showError(gateError);
+        scheduleRetry();
+      });
+      return;
+    }
+    openSocket();
+  }
+
+  function openSocket() {
     opened = false;
     try {
       ws = new WebSocket(wsUrl());

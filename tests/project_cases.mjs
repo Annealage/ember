@@ -163,6 +163,57 @@ const cases = {
     await assert.rejects(client.create({ id: "x" }), (e) => e.constructor === P.ProjectError && e.message === "bad id");
   },
 
+  async client_preserves_structured_error_messages_and_metadata() {
+    for (const [status, data, ErrorType, message, code, type] of [
+      [404, { error: { type: "not_found" } }, P.ProjectError, "api/history failed (404): not_found", "not_found", "not_found"],
+      [400, { error: { code: "invalid_id", type: "invalid", message: "Choose another project id." } }, P.ProjectError, "Choose another project id.", "invalid_id", "invalid"],
+      [500, { error: { detail: { internal: "not a display message" } } }, P.ProjectError, "api/history failed (500)", null, null],
+      [400, { error: { code: "bad_request", message: { unexpected: "object" } } }, P.ProjectError, "api/history failed (400): bad_request", "bad_request", null],
+      [200, { error: { type: "failed", message: "The read failed." } }, P.ProjectError, "The read failed.", "failed", "failed"],
+      [403, { forbidden: true, error: { type: "forbidden", message: "Viewers cannot change this project." } }, P.ForbiddenError, "Viewers cannot change this project.", "forbidden", "forbidden"],
+      [403, { error: { type: "forbidden" } }, P.ProjectError, P.REFUSED, "forbidden", "forbidden"],
+      [409, { conflict: true, current_etag: "v9", error: { code: "stale", message: "The project changed." } }, P.ConflictError, "The project changed.", "stale", null],
+      [409, { busy: true, error: { type: "busy" } }, P.BusyError, "api/history failed (409): busy", "busy", "busy"],
+    ]) {
+      const client = P.createProjectClient({ request: async () => ({ status, data }) });
+      await assert.rejects(client.history(), (e) => {
+        assert.equal(e.constructor, ErrorType);
+        assert.equal(e.message, message);
+        assert.equal(e.status, status);
+        assert.equal(e.data, data, "keep the complete response, not just its error");
+        assert.equal(e.code, code);
+        assert.equal(e.type, type);
+        if (ErrorType === P.ConflictError) assert.equal(e.currentEtag, "v9");
+        return true;
+      });
+    }
+  },
+
+  async hosted_error_response_is_read_by_the_default_transport() {
+    const fetcher = globalThis.fetch;
+    const pathname = location.pathname;
+    const calls = [];
+    try {
+      location.pathname = "/w/workspace/p/camera/";
+      globalThis.fetch = async (url, init) => {
+        calls.push({ url, init });
+        return new Response(JSON.stringify({ error: { type: "not_found" } }), {
+          status: 404, headers: { "Content-Type": "application/json" },
+        });
+      };
+      const ctx = P.createProjectContext({ client: P.createProjectClient(), notify() {} });
+      const model = P.createLineageModel(ctx);
+      await model.refresh();
+      assert.equal(model.state.available, null, "an ambiguous hosted 404 is not a capability opt-out");
+      assert.equal(model.state.error, "api/lineage failed (404): not_found");
+      assert.equal(model.state.loading, false);
+      assert.deepEqual(calls, [{ url: "/w/workspace/p/camera/api/lineage", init: { cache: "no-store" } }]);
+    } finally {
+      globalThis.fetch = fetcher;
+      location.pathname = pathname;
+    }
+  },
+
   async client_names_routes_and_always_sends_the_etag() {
     const calls = [];
     const client = P.createProjectClient({ request: async (route, body) => (calls.push({ route, body }), { status: 200, data: { ok: true } }) });
@@ -464,11 +515,20 @@ const cases = {
       assert.equal(model.state.available, false);
       assert.equal(model.state.error, "");
     }
-    // A project that does not exist is the store's answer, not an absent feature.
-    const { model } = lineageSetup({ answer: { status: 404, data: { ok: false, error: "there is no project camera" } } });
-    await model.refresh();
-    assert.equal(model.state.available, null);
-    assert.equal(model.state.error, "there is no project camera");
+    // Store failures and the hosted access-masking envelope are not opt-outs.
+    for (const [answer, message] of [
+      [{ status: 404, data: { ok: false, error: "there is no project camera" } }, "there is no project camera"],
+      [{ status: 404, data: { error: { type: "not_found" } } }, "api/lineage failed (404): not_found"],
+      [{ status: 404, data: { error: { type: "project_not_found", message: "The project was removed." } } }, "The project was removed."],
+      [{ status: 500, data: { unsupported: true, error: "The store failed." } }, "The store failed."],
+      [{ status: 403, data: { forbidden: true, error: { message: "You cannot read this project." } } }, "You cannot read this project."],
+    ]) {
+      const { model, host } = lineageSetup({ answer });
+      await model.refresh();
+      assert.equal(model.state.available, null);
+      assert.equal(model.state.error, message);
+      assert.equal(host.calls.length, 1, "a failed read is never retried or sent");
+    }
   },
 
   async the_read_gives_the_options_and_both_directions_in_the_hosts_words() {
