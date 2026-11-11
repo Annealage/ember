@@ -8,6 +8,9 @@ configuration from ``data-ember-*`` attributes on the pane and calls
 no hash in its policy, and ``agent_page_csp`` is the policy to serve it with
 (it differs from the app's only in who may frame it).
 
+The page needs the Annealage theme for its look: ``agent-page.css`` only gives
+the pane the full window height.
+
 Nothing here knows a product: a product's theme comes in as stylesheet and
 script hrefs it names, and its own view lives outside the pane. A page that
 needs hooks of its own links a module of its own that imports
