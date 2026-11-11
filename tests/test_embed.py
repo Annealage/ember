@@ -39,6 +39,7 @@ def test_the_page_has_every_element_the_shared_modules_look_up():
     page = embed.render_agent_page(product="x", title="X")
     missing = (pane_ids() | PAGE_LEVEL) - ids_in(page)
     assert not missing
+    assert re.search(r'<textarea id="chatInput"[^>]*\sdata-palette-ignore[\s>]', page)
 
 
 def test_a_pane_without_a_model_control_drops_only_that_row():

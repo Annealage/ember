@@ -104,7 +104,7 @@ def chat_markup(
         'accept="image/png,image/jpeg,image/webp" multiple hidden>\n'
         '<button id="chatAttachBtn" type="button" class="attachbtn" aria-label="Attach an image" '
         'title="Attach an image (or paste or drop one into the message box)">%s</button>\n'
-        '<textarea id="chatInput" rows="2" aria-label="Message" placeholder="Message the agent"></textarea>\n'
+        '<textarea id="chatInput" rows="2" aria-label="Message" data-palette-ignore placeholder="Message the agent"></textarea>\n'
         '<div class="chatbtns"><button id="chatInterrupt" type="button" title="Stop the current turn">'
         "Interrupt</button>\n"
         '<button id="chatSend" type="button" class="primary">Send</button></div>\n'
