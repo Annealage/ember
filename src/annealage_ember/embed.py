@@ -65,11 +65,11 @@ def chat_markup(
     attach = (
         '<svg class="ico"><use href="%s"/></svg>' % html.escape(attach_icon_href, quote=True)
         if attach_icon_href
-        else "+"
+        else "Attach"
     )
     model_row = (
         '<div class="chatmodelrow"><label for="chatModelInput">Model</label>'
-        '<input id="chatModelInput" type="text" placeholder="backend default" '
+        '<input id="chatModelInput" type="text" placeholder="Default" '
         'autocomplete="off" spellcheck="false"></div>'
         if model_control
         else ""

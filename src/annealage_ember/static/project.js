@@ -952,7 +952,7 @@ function lineageItem(link, forward) {
         ? h("span", { class: "pj-chip pj-relation" }, link.relation_label || link.relation) : null,
       link.state ? h("span", { class: "pj-state" }, link.state) : null),
     h("div", { class: "pj-meta" },
-      here && there ? h("span", {}, ...(forward ? [here, " → ", there] : [there, " → ", here])) : (here || there),
+      here && there ? h("span", {}, ...(forward ? [here, " to ", there] : [there, " to ", here])) : (here || there),
       link.created_at ? h("span", {}, when(link.created_at)) : null,
       link.intent ? h("span", { class: "pj-intent" }, link.intent) : null));
 }

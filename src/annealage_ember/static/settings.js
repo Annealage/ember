@@ -196,7 +196,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
       ? "pending restart; startup setting was " + JSON.stringify(entry.value)
       : "saved; this run is still using " + JSON.stringify(entry.value));
   }
-  note.textContent = parts.join(" · ");
+  note.textContent = parts.join(", ");
   row.appendChild(note);
 
   const help = document.createElement("div");
@@ -243,12 +243,18 @@ function modelSettingsBlock(payload) {
   runtime.className = "setnote";
   const actual = controls.runtime;
   runtime.textContent = actual
-    ? "Actual coordinator runtime (backend-reported): " + [
+    ? "Running now: " + [
       actual.backend, actual.provider, actual.model,
       actual.effort ? "effort " + actual.effort : null,
-    ].filter(Boolean).join(" · ")
-    : "Actual coordinator runtime: not reported by the backend. Saved selections are not runtime confirmation.";
+    ].filter(Boolean).join(", ")
+    : "Running now: not reported.";
   block.appendChild(runtime);
+  const runtimeHelp = document.createElement("p");
+  runtimeHelp.className = "sethelp";
+  runtimeHelp.textContent = actual
+    ? "As reported by the backend."
+    : "Saved selections are not a report of what is running.";
+  block.appendChild(runtimeHelp);
   const session = document.createElement("p");
   session.className = "setnote";
   session.textContent = "Conversation: " + (controls.session_id || "not started")
@@ -360,11 +366,11 @@ function modelSettingsBlock(payload) {
     const selectedProfile = profileEntry && profile.profiles.find(item => item.id === value(profile.key));
     if (profileEntry) {
       profileDetail.textContent = selectedProfile
-        ? selectedProfile.billing + " · Profile tiers" : "No profile details available for this selection.";
+        ? selectedProfile.billing + ". Profile tiers:" : "No profile details available for this selection.";
       for (const [id, point] of Object.entries(tierPoints)) {
         const config = selectedProfile && selectedProfile.tiers[id];
         point.textContent = config
-          ? (controls.groups[id].title || id) + ": " + config.model + " · " + config.effort
+          ? (controls.groups[id].title || id) + ": " + config.model + ", " + config.effort
           : "";
       }
     }
@@ -384,7 +390,7 @@ function modelSettingsBlock(payload) {
           + (inherits && !own ? " (inherited " + controls.groups[inherits].title + ")" : "");
       });
       preview.textContent = (edited ? "Selected configuration (save to persist): " : "Saved configuration: ")
-        + configured.join(" · ");
+        + configured.join("; ");
     }
   }
   block.addEventListener("input", () => updatePreviews(true));

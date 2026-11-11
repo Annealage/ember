@@ -380,49 +380,67 @@ function dollars(cost) {
 
 /**
  * The conversation's usage (the hello's `session.usage`, or a live `usage`
- * event's figures) as the header shows it: `text`, how full the context
- * window is and what the conversation has cost, whichever the backend
- * reports, and `title`, every figure with the unknown ones said to be so.
- * `text` is "" when there is nothing to show.
+ * event's figures) as the header shows it: `context` and `cost`, each
+ * `{value, unit, title}` or null when the backend does not report it (value is
+ * the numeral, unit the word beside it, title the tooltip's facts); `text`,
+ * the two read as one plain string ("" when there is nothing to show); and
+ * `title`, every figure with the unknown ones said to be so.
  */
 export function usageSummary(usage) {
-  if (!usage) return { text: "", title: "" };
-  const parts = [];
+  if (!usage) return { text: "", title: "", context: null, cost: null };
   const title = [];
+  let contextReadout = null;
+  let costReadout = null;
   const context = usage.context;
   if (context && context.window_tokens > 0) {
     const percent = Math.round((100 * context.used_tokens) / context.window_tokens);
-    parts.push(percent + "% context");
-    title.push("Context window: " + tokenCount(context.used_tokens) + " of "
-      + tokenCount(context.window_tokens) + " tokens (" + percent + "%)");
+    const fact = "Context window: " + tokenCount(context.used_tokens) + " of "
+      + tokenCount(context.window_tokens) + " tokens (" + percent + "%)";
+    contextReadout = { value: percent + "%", unit: "context", title: fact };
+    title.push(fact);
   } else {
     title.push("Context window: unknown");
   }
   const cost = usage.cost_usd;
   if (typeof cost === "number") {
-    parts.push(dollars(cost));
-    title.push("Cost so far: $" + cost.toFixed(4));
+    const fact = "Cost so far: $" + cost.toFixed(4);
+    costReadout = { value: dollars(cost), unit: "cost", title: fact };
+    title.push(fact);
   } else {
     title.push("Cost so far: unknown");
   }
   const tokens = usage.tokens || {};
-  title.push("Tokens: " + tokenCount(tokens.input) + " in, " + tokenCount(tokens.output)
+  const tokenFact = "Tokens: " + tokenCount(tokens.input) + " in, " + tokenCount(tokens.output)
     + " out, " + tokenCount(tokens.cache_read) + " read from the cache, "
-    + tokenCount(tokens.cache_write) + " written to it");
-  if (Number.isInteger(usage.usage_epoch)) {
-    title.push("Cumulative snapshot: current epoch " + usage.usage_epoch);
-  }
-  if (usage.usage_source) title.push("Usage source: " + usage.usage_source);
-  return { text: parts.join(" · "), title: title.join("\n") };
+    + tokenCount(tokens.cache_write) + " written to it";
+  title.push(tokenFact);
+  if (costReadout) costReadout.title += "\n" + tokenFact;
+  const text = [contextReadout, costReadout].filter(Boolean)
+    .map((r) => r.value + " " + r.unit).join(", ");
+  return { text, title: title.join("\n"), context: contextReadout, cost: costReadout };
 }
 
-// The usage before the agent status. Built here rather than asked of the
-// page's markup, like the signed-in chip, so every product's pane has it;
-// hidden until the backend has reported a context fill or a cost.
+// The usage before the agent status: a wrapper holding a context readout and
+// a cost readout, each hidden while its figure is unknown. Built here rather
+// than asked of the page's markup, like the signed-in chip, so every
+// product's pane has it; the wrapper is hidden until the backend has reported
+// a context fill or a cost.
 function usageChip(agentStatusEl) {
   const chip = document.createElement("span");
   chip.className = "chatusage";
   chip.hidden = true;
+  for (const key of ["context", "cost"]) {
+    const readout = document.createElement("span");
+    readout.className = "readout";
+    readout.dataset.usage = key;
+    readout.hidden = true;
+    const val = document.createElement("span");
+    val.className = "val";
+    const unit = document.createElement("span");
+    unit.className = "lg";
+    readout.append(val, unit);
+    chip.appendChild(readout);
+  }
   agentStatusEl.before(chip);
   return chip;
 }
@@ -880,9 +898,9 @@ export function initChat({
     const count = segment.tools.length;
     const name = shortToolName(segment.tools[0].name);
     const label = count === 1 ? name : `${name} (${count})`;
-    rec.summary.textContent = label
-      + (pending ? ` · ${pending} running` : "")
-      + (failed ? ` · ${failed} failed` : "");
+    rec.summary.textContent = [label,
+      pending ? `${pending} running` : "",
+      failed ? `${failed} failed` : ""].filter(Boolean).join(", ");
     // A collapsed run is one summary, however many calls the real turn has.
     // Once opened, its cards stay mounted so expansion and inner scroll survive.
     if (!rec.el.open) return;
@@ -1202,10 +1220,18 @@ export function initChat({
   }
 
   function renderUsage(chat) {
-    const { text, title } = usageSummary(chat.usage);
-    usageEl.hidden = !text;
-    usageEl.textContent = text;
-    usageEl.title = title;
+    const summary = usageSummary(chat.usage);
+    usageEl.hidden = !summary.text;
+    usageEl.title = summary.title;
+    for (const readout of usageEl.children) {
+      const figure = summary[readout.dataset.usage];
+      readout.hidden = !figure;
+      readout.title = figure ? figure.title : "";
+      if (figure) {
+        readout.children[0].textContent = figure.value;
+        readout.children[1].textContent = figure.unit;
+      }
+    }
   }
 
   // Set to the requested model right before sending `set_model`, and

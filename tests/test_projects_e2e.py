@@ -408,7 +408,7 @@ def test_the_lineage_lists_show_both_directions_as_links(lpage):
     assert link.get_attribute("href") == "/p/boards/"
     expect(derived).to_contain_text("Loom")
     expect(derived).to_contain_text("rescued from")
-    expect(derived).to_contain_text("b042 → c000")
+    expect(derived).to_contain_text("b042 to c000")
     expect(derived).to_contain_text("start from the reviewed boards")
     sent = box.locator(".pj-sent")
     expect(sent.locator("h4")).to_have_text("Sent to")
@@ -439,7 +439,7 @@ def test_a_send_chooses_a_product_and_a_target_and_lands_in_the_list(lpage, line
     expect(lpage.locator("#toast")).to_contain_text("Sent to Trace")
     sent = lpage.locator("#lineage .pj-sent")
     expect(sent.locator(".pj-link")).to_have_count(1)
-    expect(sent).to_contain_text("c006 → r001")
+    expect(sent).to_contain_text("c006 to r001")
     expect(sent).to_contain_text("check the rails")
     [derive] = [c for c in lineage.calls if c[0] == "derive"]
     assert derive == ("derive", "camera", "c006", "trace", None, "check the rails")

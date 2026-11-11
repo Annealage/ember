@@ -30,7 +30,7 @@ export function initPause({ send, button = document.getElementById("pauseBtn") }
   function renderPause(state) {
     button.classList.toggle("on", state.paused);
     if (label) label.textContent = state.paused ? "Paused" : "Pause";
-    else button.textContent = state.paused ? "❙❙ Paused" : "❙❙ Pause";
+    else button.textContent = state.paused ? "Paused" : "Pause";
     button.setAttribute("aria-pressed", state.paused ? "true" : "false");
     // Disabled when there is no agent, which is both viewer-only mode and a
     // session that failed to start. In viewer-only mode the server refuses a

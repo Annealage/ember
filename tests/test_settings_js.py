@@ -223,22 +223,19 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert "Saved model settings applied." in output["liveApplied"]
     assert "require a restart" in output["restartRequired"]
     assert "model: openai-codex/gpt (inherited High)" in output["initial"]
-    assert (
-        "Actual coordinator runtime (backend-reported): omp · anthropic · actual-opus · effort low"
-        in output["initial"]
-    )
+    assert "Running now: omp, anthropic, actual-opus, effort low" in output["initial"]
     assert "same-conversation" in output["initial"]
     assert output["changed"] == {"high_model": "anthropic/sonnet"}
     assert "model: anthropic/sonnet (inherited High)" in output["updated"]
-    assert "model: openai-codex/override · effort: high (inherited High)" in output["overridden"]
+    assert "model: openai-codex/override; effort: high (inherited High)" in output["overridden"]
     assert "model: anthropic/opus (inherited High)" in output["cleared"]
     assert output["blankChanges"] == {"high_model": ""}
     assert "actual-opus" in output["updated"]
     assert "API usage billed separately" in output["profileInitial"]
-    assert "High: anthropic-api/opus · low" in output["profileInitial"]
-    assert "Low: anthropic-api/sonnet · medium" in output["profileInitial"]
-    assert "High: anthropic-api/opus · low" in output["tierRows"]
-    assert "Low: anthropic-api/sonnet · medium" in output["tierRows"]
+    assert "High: anthropic-api/opus, low" in output["profileInitial"]
+    assert "Low: anthropic-api/sonnet, medium" in output["profileInitial"]
+    assert "High: anthropic-api/opus, low" in output["tierRows"]
+    assert "Low: anthropic-api/sonnet, medium" in output["tierRows"]
     assert "pending restart; startup setting was" in output["profileInitial"]
     assert "actual-opus" in output["profileInitial"]
     assert output["profileUnchanged"] == {}
@@ -251,8 +248,8 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["profileChanged"] == {"profile": "oauth"}
     assert "No catalogue models available" in output["emptyCatalog"]
     assert "Subscription" in output["profileUpdated"]
-    assert "High: anthropic/opus · high" in output["profileUpdated"]
-    assert "Low: anthropic/sonnet · medium" in output["profileUpdated"]
+    assert "High: anthropic/opus, high" in output["profileUpdated"]
+    assert "Low: anthropic/sonnet, medium" in output["profileUpdated"]
     assert output["catalogueChange"] == {"profile": "oauth", "model": "openai-codex/gpt"}
     assert output["manualChange"] == {"profile": "oauth", "model": "custom/new"}
     assert output["defaultChange"] == {"profile": "oauth"}
@@ -266,7 +263,7 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
         "high_effort": "",
     }
     assert output["confirmedAgent"] == "custom/legacy"
-    assert "High: anthropic-api/opus · low" in output["historicalPreview"]
+    assert "High: anthropic-api/opus, low" in output["historicalPreview"]
     assert output["historicalChange"] == {"high_model": "anthropic/opus"}
     assert output["sameValueVisible"] == "anthropic/opus"
     assert output["sameValueUnchanged"] == {}

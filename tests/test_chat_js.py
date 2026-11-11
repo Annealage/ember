@@ -81,7 +81,7 @@ globalThis.document = {
 };
 
 const dir = process.argv[2];
-const { initChat } = await import(pathToFileURL(dir + "/chat.js").href);
+const { initChat, usageSummary } = await import(pathToFileURL(dir + "/chat.js").href);
 const { store } = await import(pathToFileURL(dir + "/store.js").href);
 
 const sent = [];
@@ -163,13 +163,19 @@ chat.handleHello({ id: "s", agent: "ready", usage: {
   tokens: { input: 1200, output: 300, cache_read: 45000, cache_write: 900 },
   context: { used_tokens: 24500, window_tokens: 200000 },
 } });
-out.usageFromHello = { text: usageChip.textContent, title: usageChip.title, hidden: usageChip.hidden };
+const readouts = () => usageChip.children.map((r) => ({
+  usage: r.dataset.usage, val: r.children[0].textContent, unit: r.children[1].textContent,
+  hidden: r.hidden, title: r.title }));
+out.usageFromHello = { readouts: readouts(), title: usageChip.title, hidden: usageChip.hidden };
+out.usageSummaryText = usageSummary({ cost_usd: 0.4312, tokens: {},
+  context: { used_tokens: 24500, window_tokens: 200000 } }).text;
+out.usageZeroCost = usageSummary({ cost_usd: 0, tokens: {}, context: null }).cost.value;
 chat.handleEvent({ kind: "usage", cost_usd: 0.01, tokens: {}, context: null }, { replayed: true });
-out.usageAfterReplay = usageChip.textContent;
+out.usageAfterReplay = readouts().map((r) => r.val);
 chat.handleEvent({ kind: "usage", cost_usd: null,
                    tokens: { input: 5, output: null, cache_read: null, cache_write: null },
                    context: { used_tokens: 150000, window_tokens: 200000 } }, { replayed: false });
-out.usageLive = { text: usageChip.textContent, title: usageChip.title };
+out.usageLive = { readouts: readouts(), title: usageChip.title };
 chat.handleHello({ id: "s", agent: "ready", usage: null });
 out.usageHiddenWhenUnknown = usageChip.hidden;
 chat.handleHello({ id: "s", agent: "ready", usage: { cost_usd: 1, tokens: {}, context: null } });
@@ -615,22 +621,43 @@ def test_a_message_lost_in_a_drop_comes_back_when_the_replay_ends(observed):
 
 
 def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_events(observed):
+    tokens_fact = "Tokens: 1,200 in, 300 out, 45,000 read from the cache, 900 written to it"
     assert observed["usageFromHello"] == {
-        "text": "12% context · $0.431",
+        "readouts": [
+            {
+                "usage": "context",
+                "val": "12%",
+                "unit": "context",
+                "hidden": False,
+                "title": "Context window: 24,500 of 200,000 tokens (12%)",
+            },
+            {
+                "usage": "cost",
+                "val": "$0.431",
+                "unit": "cost",
+                "hidden": False,
+                "title": "Cost so far: $0.4312\n" + tokens_fact,
+            },
+        ],
         "title": "Context window: 24,500 of 200,000 tokens (12%)\n"
-        "Cost so far: $0.4312\n"
-        "Tokens: 1,200 in, 300 out, 45,000 read from the cache, 900 written to it",
+        "Cost so far: $0.4312\n" + tokens_fact,
         "hidden": False,
     }
     # A replayed usage event is older than the hello; each is the whole
     # conversation's, so the live one replaces what was shown.
-    assert observed["usageAfterReplay"] == "12% context · $0.431"
-    assert observed["usageLive"] == {
-        "text": "75% context",
-        "title": "Context window: 150,000 of 200,000 tokens (75%)\n"
+    assert observed["usageAfterReplay"] == ["12%", "$0.431"]
+    live = observed["usageLive"]
+    assert [(r["usage"], r["val"], r["hidden"]) for r in live["readouts"]] == [
+        ("context", "75%", False),
+        ("cost", "$0.431", True),
+    ]
+    assert live["title"] == (
+        "Context window: 150,000 of 200,000 tokens (75%)\n"
         "Cost so far: unknown\n"
-        "Tokens: 5 in, unknown out, unknown read from the cache, unknown written to it",
-    }
+        "Tokens: 5 in, unknown out, unknown read from the cache, unknown written to it"
+    )
+    assert observed["usageSummaryText"] == "12% context, $0.431 cost"
+    assert observed["usageZeroCost"] == "$0.000", "a zero cost is a figure, not unknown"
     assert observed["usageHiddenWhenUnknown"] is True
     assert observed["usageHiddenAfterReset"] is True, (
         "a new conversation's usage is not the old one's"
@@ -756,7 +783,7 @@ def test_long_tool_stream_is_grouped_in_its_turn_and_keeps_inspection_state(obse
         "tag": "details",
         "className": "toolgroup",
         "collapsed": True,
-        "summary": "read (120) · 1 failed",
+        "summary": "read (120), 1 failed",
         "count": 0,
         "nextTurnTools": 0,
     }
@@ -781,8 +808,8 @@ def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
         "sameNodes": True,
         "sameCard": True,
         "result": "late earlier result",
-        "summaryA": "read (2) · 1 failed",
-        "summaryB": "write · 1 running",
+        "summaryA": "read (2), 1 failed",
+        "summaryB": "write, 1 running",
         "inspector": [True, True, 42, 17],
         "nextTurn": ["next"],
     }
@@ -793,7 +820,7 @@ def test_interleaved_prose_stays_around_its_own_inline_tool_run(observed):
 def test_different_tools_get_their_own_line_and_only_repeats_are_counted(observed):
     assert observed["mixedTools"] == [
         "read (2)",
-        "edit_file (3) · 1 failed",
+        "edit_file (3), 1 failed",
         "read",
     ]
 

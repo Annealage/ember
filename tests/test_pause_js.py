@@ -99,5 +99,5 @@ def test_the_pause_button_shows_the_server_s_flag_and_keeps_the_page_s_markup(tm
     assert out["iconKept"] is True
     assert out["resumed"] == {"pressed": "false", "on": False, "text": "Pause"}
     # A button with no label child gets its whole text, as before.
-    assert out["plainBefore"]["text"] == "❙❙ Pause"
-    assert out["plainPaused"] == {"pressed": "true", "on": True, "text": "❙❙ Paused"}
+    assert out["plainBefore"]["text"] == "Pause"
+    assert out["plainPaused"] == {"pressed": "true", "on": True, "text": "Paused"}
