@@ -1,6 +1,6 @@
 /**
  * The single writer for the page's application state: the agent layer's own
- * keys (the chat pane, the connection, the pause flag, the layout) and every
+ * keys (the chat pane, the connection, the pause flag) and every
  * key a product adds through `defineSlice`.
  *
  * Every other module reads state through `store.getState()` or a subscriber
@@ -27,12 +27,6 @@
  * to reconcile against.
  *
  * State shape (this file's keys; a product documents its own slice):
- *   activeTab     string | null
- *                 which narrow-viewport tab is showing; the id of one of the
- *                 tabs the page handed layout.js's `initLayout`, which sets
- *                 the first one. Null only before that.
- *   panelOpen     boolean
- *                 whether the side panel is shown at wide viewports.
  *   paused        boolean
  *                 whether the human has paused the agent's control of this
  *                 page. Written only from what the server reports (the
@@ -147,8 +141,6 @@
  */
 
 let state = Object.freeze({
-  activeTab: null,
-  panelOpen: false,
   paused: false,
   connection: "connecting",
   toolCardsCollapsed: true,
@@ -310,18 +302,6 @@ function setToolCardsCollapsed(collapsed) {
   commit(() => {
     state = { ...state, toolCardsCollapsed: !!collapsed };
   }, ["toolCardsCollapsed"]);
-}
-
-function setActiveTab(tabId) {
-  commit(() => {
-    state = { ...state, activeTab: tabId };
-  }, ["activeTab"]);
-}
-
-function setPanelOpen(v) {
-  commit(() => {
-    state = { ...state, panelOpen: !!v };
-  }, ["panelOpen"]);
 }
 
 function setConnection(v) {
@@ -892,8 +872,6 @@ export const store = Object.freeze({
   subscribe,
   batch,
   setToolCardsCollapsed,
-  setActiveTab,
-  setPanelOpen,
   setConnection,
   setPaused,
   setChatUserTurn,
