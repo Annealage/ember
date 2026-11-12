@@ -165,6 +165,7 @@ async def test_get_reports_every_key_with_provenance_and_diagnostics(make_client
             "effect",
             "editable",
             "type",
+            "label",
             "description",
             "choices",
             "nullable",

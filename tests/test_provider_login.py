@@ -254,6 +254,19 @@ async def test_an_app_without_a_provider_login_has_no_such_routes(served_dir):
 
 
 @pytest.mark.asyncio
+async def test_the_settings_say_whether_there_is_a_login_so_the_window_never_asks_in_vain(
+    served_dir,
+):
+    """The window asks for the provider list only when the settings say the app
+    has one: asking an app without one is a 404 in the browser's console."""
+    q = "?t=" + TOKEN
+    with_login = make_test_client(_app(served_dir, _login()[0]))
+    without = make_test_client(_app(served_dir, None))
+    assert (await with_login.get("/settings" + q)).json["provider_login"] is True
+    assert (await without.get("/settings" + q)).json["provider_login"] is False
+
+
+@pytest.mark.asyncio
 async def test_logout_names_each_stored_credential(served_dir):
     login, made = _login()
     client = make_test_client(_app(served_dir, login))

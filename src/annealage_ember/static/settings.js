@@ -48,18 +48,18 @@ import { appUrl } from "./url.js";
 import { providerLoginSection } from "./login.js";
 
 // Which layer a value came from, in words a person can act on. The keys are
-// the layer names `settings.py` reports; the project file lives in the
-// product's own state directory, which the payload names.
-function originText(from, product) {
+// the layer names `settings.py` reports. A value nobody set says nothing:
+// repeating "default" on every row would only be noise.
+function originText(from) {
   switch (from) {
     case "flag":
-      return "from a command-line flag, this run only";
+      return "Set when the server started, for this run only";
     case "project":
-      return `from this project's ${product.state_dirname}/config.toml`;
+      return "Set for this project";
     case "user":
-      return "from your user settings";
+      return "Set in your user settings";
     case "default":
-      return "built-in default";
+      return "";
     default:
       return from;
   }
@@ -72,6 +72,29 @@ function choicesOf(entry) {
   const choices = entry.choices || [];
   if (!choices.length) return null;
   return entry.nullable ? ["", ...choices] : choices;
+}
+
+// A key's name is for config files; the window shows its label, or the name in words.
+function labelOf(name, entry) {
+  return (entry && entry.label) || name.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+const KIND_LABELS = { model: "Model", effort: "Reasoning effort" };
+
+// The values of the generic keys with a closed set of choices, in words. A
+// product's own choices are shown as it declared them.
+const CHOICE_TEXT = {
+  effort: { low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Maximum" },
+  permission_mode: { default: "Ask as usual", acceptEdits: "Accept edits", plan: "Plan only" },
+  backend: { claude: "Claude", codex: "Codex" },
+};
+function choiceText(kind, choice) {
+  return (CHOICE_TEXT[kind] && CHOICE_TEXT[kind][choice]) || choice;
+}
+
+// A saved value in a sentence: nothing for an empty one.
+function shown(value) {
+  return value === null || value === "" ? "nothing set" : String(value);
 }
 
 /**
@@ -120,7 +143,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
 
   const label = document.createElement("label");
   label.className = "setlabel";
-  label.textContent = options.label || name;
+  label.textContent = options.label || labelOf(name, entry);
   label.htmlFor = "set-" + name;
   row.appendChild(label);
 
@@ -139,7 +162,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
     for (const choice of choices) {
       const option = document.createElement("option");
       option.value = choice;
-      option.textContent = choice === "" ? (options.configured ? "Default (inherit)" : "(not set)") : choice;
+      option.textContent = choice === "" ? (options.configured ? "Default (inherit)" : "(not set)") : choiceText(options.choiceKind || name, choice);
       input.appendChild(option);
     }
     if (options.models) {
@@ -182,22 +205,20 @@ function fieldRow(name, entry, pending, product, options = {}) {
   const note = document.createElement("div");
   note.className = "setnote";
   const origin = originText(options.configured && pending ? pending.from : entry.from, product);
-  const parts = options.compact ? [] : [origin];
+  const parts = options.compact || !origin ? [] : [origin];
   if (entry.in_effect === false) {
     // A value this app does not use at all (the bind of an app a front door
     // serves): saying when it would take effect would be wrong.
     parts.push("not in effect: " + entry.reason);
-  } else if (entry.effect === "restart" && !options.compact) {
-    parts.push("takes effect next run");
   }
   if (pending && !options.live) {
     // The field holds the saved value; explain the startup value beside it.
     parts.push(options.configured
-      ? "pending restart; startup setting was " + JSON.stringify(entry.value)
-      : "saved; this run is still using " + JSON.stringify(entry.value));
+      ? "pending restart; startup setting was " + shown(entry.value)
+      : "saved; this run is still using " + shown(entry.value));
   }
   note.textContent = parts.join(", ");
-  row.appendChild(note);
+  if (note.textContent) row.appendChild(note);
 
   const help = document.createElement("div");
   help.className = "sethelp";
@@ -209,7 +230,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
 
 // A product declares its tier/role keys; the UI does not know product names.
 // Saved configuration and backend-reported runtime are distinct.
-function modelSettingsBlock(payload) {
+function modelSettingsBlock(payload, confirmRow = null) {
   const controls = payload.model_controls;
   const block = document.createElement("section");
   block.className = "setmodels";
@@ -257,8 +278,7 @@ function modelSettingsBlock(payload) {
   block.appendChild(runtimeHelp);
   const session = document.createElement("p");
   session.className = "setnote";
-  session.textContent = "Conversation: " + (controls.session_id || "not started")
-    + ". Child runtime is reported by each work run.";
+  session.textContent = controls.session_id ? "A conversation is running." : "No conversation has started.";
   block.appendChild(session);
 
   const profile = controls.profile;
@@ -284,22 +304,35 @@ function modelSettingsBlock(payload) {
       if (item) option.textContent = item.title;
     }
     let previous = select.value;
-    select.addEventListener("change", () => {
+    select.addEventListener("change", async () => {
       if (select.value === previous) return;
       const overrides = [];
       for (const spec of Object.values(controls.groups)) {
         for (const kind of ["model", "effort"]) {
           const input = block.querySelector("#set-" + spec[kind]);
-          if (input && value(spec[kind])) overrides.push({ input, title: spec.title + " " + kind, value: value(spec[kind]) });
+          if (input && value(spec[kind])) {
+            overrides.push({ input, title: spec.title + " " + kind, value: value(spec[kind]) });
+          }
         }
       }
-      if (overrides.length && !window.confirm(
-        "Switching profiles will clear these shared overrides on Save:\n\n"
-        + overrides.map(item => item.title + ": " + item.value).join("\n")
-        + "\n\nPer-agent overrides will not be changed. Continue?"
-      )) {
+      const chosen = select.value;
+      if (overrides.length) {
+        // The page's own confirmation row (the style library's confirm.js),
+        // never a browser dialog. Without one the switch is not made.
+        const ask = confirmRow || globalThis.annealageConfirmRow || null;
         select.value = previous;
-        return;
+        const sure = ask ? await ask(select, {
+          title: "Switch profile",
+          detail: "These shared overrides are cleared when you save. Per-agent overrides stay.",
+          fields: overrides.map((item) => [item.title, item.value]),
+          action: "Switch",
+        }) : false;
+        if (!sure) {
+          if (!ask) toast("The profile was not changed: this page cannot ask for confirmation.");
+          updatePreviews(true);
+          return;
+        }
+        select.value = chosen;
       }
       for (const { input } of overrides) {
         input.value = "";
@@ -307,6 +340,7 @@ function modelSettingsBlock(payload) {
         if (custom) custom.hidden = true;
       }
       previous = select.value;
+      updatePreviews(true);
     });
     block.append(row, profileDetail, ...Object.values(tierPoints));
   }
@@ -334,7 +368,7 @@ function modelSettingsBlock(payload) {
         : null;
       block.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
         saved, payload.product || {}, {
-          label: kind === "model" ? "Provider / model" : "Reasoning effort",
+          label: KIND_LABELS[kind], choiceKind: kind === "effort" ? "effort" : undefined,
           models: kind === "model" ? (controls.models || []) : null, inherits, configured: true, compact: true, live,
           displayDefault: !!profileEntry && !inherits && (saved ? saved.from : entry.from) === "default",
           description: "",
@@ -354,7 +388,7 @@ function modelSettingsBlock(payload) {
   overrides.textContent = "Optional per-agent overrides";
   block.appendChild(overrides);
   for (const spec of controls.agents) {
-    pair(spec, spec.title + " — inherits " + controls.groups[spec.inherits].title, spec.inherits);
+    pair(spec, spec.title + ": inherits " + controls.groups[spec.inherits].title, spec.inherits);
   }
   function value(name) {
     const input = block.querySelector("#set-" + name);
@@ -386,8 +420,8 @@ function modelSettingsBlock(payload) {
         const own = inherits ? value(spec[kind]) : "";
         const id = inherits || spec.group_id;
         const effective = own || tierValue(id, kind);
-        return kind + ": " + (effective || "backend default")
-          + (inherits && !own ? " (inherited " + controls.groups[inherits].title + ")" : "");
+        return KIND_LABELS[kind] + ": " + (effective || "the backend's default")
+          + (inherits && !own ? " (inherited from " + controls.groups[inherits].title + ")" : "");
       });
       preview.textContent = (edited ? "Selected configuration (save to persist): " : "Saved configuration: ")
         + configured.join("; ");
@@ -606,7 +640,7 @@ function collectChanges(root, payload) {
     } else if (entry.type === "int") {
       const parsed = Number(selected);
       if (!Number.isInteger(parsed)) {
-        throw new Error(name + " must be a whole number");
+        throw new Error(labelOf(name, entry) + " must be a whole number");
       }
       value = parsed;
     } else {
@@ -657,6 +691,7 @@ export function initSettings({
   openButton = document.getElementById("settingsBtn"),
   container = document.getElementById("settingsModal"),
   onLoad = () => {},
+  confirmRow = null,
 } = {}) {
   let current = null;
 
@@ -726,20 +761,26 @@ export function initSettings({
         modelKeys.add(spec.effort);
       }
       if (controls.profile) modelKeys.add(controls.profile.key);
-      body.appendChild(modelSettingsBlock(payload));
+      body.appendChild(modelSettingsBlock(payload, confirmRow));
     }
     for (const section of payload.sections || []) {
-      if (!section.keys.some((name) => !modelKeys.has(name))) continue;
+      const names = section.keys.filter((name) => !modelKeys.has(name) && payload.settings[name]);
+      if (!names.length) continue;
       const block = document.createElement("section");
       const heading = document.createElement("h3");
       heading.textContent = section.title;
       block.appendChild(heading);
-      for (const name of section.keys) {
-        if (modelKeys.has(name)) continue;
-        const entry = payload.settings[name];
-        if (!entry) continue;
+      // One line for a section whose keys all wait for a restart, instead of
+      // the same words on every row.
+      if (names.every((name) => payload.settings[name].effect === "restart")) {
+        const when = document.createElement("p");
+        when.className = "sethelp";
+        when.textContent = "Changes here take effect the next time the server starts.";
+        block.appendChild(when);
+      }
+      for (const name of names) {
         block.appendChild(
-          fieldRow(name, entry, payload.pending && payload.pending[name], product));
+          fieldRow(name, payload.settings[name], payload.pending && payload.pending[name], product));
       }
       body.appendChild(block);
     }
@@ -750,9 +791,11 @@ export function initSettings({
     diagSection.appendChild(diagHeading);
     diagSection.appendChild(diagnosticsBlock(payload.diagnostics || {}, product));
     body.appendChild(diagSection);
-    providerLoginSection().then((section) => {
-      if (section) body.insertBefore(section, diagSection);
-    });
+    if (payload.provider_login === true) {
+      providerLoginSection().then((section) => {
+        if (section) body.insertBefore(section, diagSection);
+      });
+    }
     body.appendChild(agentLogSection());
     panel.appendChild(body);
 
@@ -793,7 +836,8 @@ export function initSettings({
           toast("Saved. Model settings will apply after current turns finish.");
         } else {
           toast(restart.length
-            ? "Saved. " + restart.join(", ") + " takes effect next run."
+            ? "Saved. " + restart.map((name) => labelOf(name, saved.settings[name])).join(", ")
+              + " will change the next time the server starts."
             : "Saved.");
         }
       } catch (err) {

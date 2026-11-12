@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 // Isolate the settings DOM helpers from transport/store dependencies. They
 // remain the production source, with only their imports replaced by this host.
 const source = readFileSync(process.argv[2], "utf8").replace(/^import .*;$/gm, "")
-  + "\nexport { modelSettingsBlock, collectChanges };";
+  + "\nexport { modelSettingsBlock, collectChanges, fieldRow };";
 function el(tag) {
   return {
     tagName: tag.toUpperCase(), children: [], dataset: {}, attrs: {}, listeners: {},
@@ -42,8 +42,14 @@ function el(tag) {
 globalThis.document = { createElement: el };
 let confirmed = false;
 let prompt = "";
-globalThis.window = { confirm(message) { prompt = message; return confirmed; } };
-const { modelSettingsBlock, collectChanges } = await import(
+const toasts = [];
+globalThis.toast = (message) => toasts.push(message);
+// The page's confirmation row: the style library's confirmRow, handed in.
+const confirmRow = async (anchor, opts) => {
+  prompt = opts.title + "\n" + opts.fields.map(([name, value]) => name + ": " + value).join("\n");
+  return confirmed;
+};
+const { modelSettingsBlock, collectChanges, fieldRow } = await import(
   "data:text/javascript;base64," + Buffer.from(source).toString("base64")
 );
 const entry = (value, nullable = false) => ({
@@ -70,7 +76,7 @@ const payload = {
     models: ["anthropic/opus", "openai-codex/gpt"], session_id: "same-conversation",
   },
 };
-const block = modelSettingsBlock(payload);
+const block = modelSettingsBlock(payload, confirmRow);
 // The modal also contains unrelated generic settings. An untouched empty
 // nonnullable string must not turn into a null change when saving a model.
 const panel = el("div");
@@ -128,7 +134,7 @@ const profilePayload = {
     ] },
   },
 };
-const profiles = modelSettingsBlock(profilePayload);
+const profiles = modelSettingsBlock(profilePayload, confirmRow);
 output.profileInitial = profiles.textContent;
 output.tierRows = profiles.querySelectorAll(".setnote").map(c => c.textContent);
 output.profileUnchanged = collectChanges(profiles, profilePayload);
@@ -167,14 +173,14 @@ const explicitPayload = {
   ...profilePayload,
   settings: { ...profilePayload.settings, high_model: entry("custom/shared"), high_effort: entry("medium") },
 };
-const explicit = modelSettingsBlock(explicitPayload);
+const explicit = modelSettingsBlock(explicitPayload, confirmRow);
 const profileSelect = explicit.querySelector("#set-profile");
 profileSelect.value = "oauth";
-profileSelect.listeners.change();
+await profileSelect.listeners.change();
 output.cancelled = { value: profileSelect.value, changes: collectChanges(explicit, explicitPayload), prompt };
 confirmed = true;
 profileSelect.value = "oauth";
-profileSelect.listeners.change();
+await profileSelect.listeners.change();
 output.confirmed = collectChanges(explicit, explicitPayload);
 output.confirmedAgent = explicit.querySelector("#set-author_model").value;
 const historical = modelSettingsBlock(profilePayload);
@@ -187,18 +193,40 @@ const sameValuePayload = {
   ...profilePayload,
   pending: { ...profilePayload.pending, high_model: { value: "anthropic/opus", from: "user" } },
 };
-const sameValue = modelSettingsBlock(sameValuePayload);
+const sameValue = modelSettingsBlock(sameValuePayload, confirmRow);
 output.sameValueVisible = sameValue.querySelector("#set-high_model").value;
 output.sameValueUnchanged = collectChanges(sameValue, sameValuePayload);
 const sameProfile = sameValue.querySelector("#set-profile");
 sameProfile.value = "oauth";
-sameProfile.listeners.change();
+await sameProfile.listeners.change();
 output.sameValueCleared = collectChanges(sameValue, sameValuePayload);
 output.sameValuePrompt = prompt;
+// A page that gave no confirmRow and has no "style/" import map entry cannot
+// ask, so the profile is left as it was and the person is told.
+const noAsk = modelSettingsBlock(explicitPayload);
+const noAskSelect = noAsk.querySelector("#set-profile");
+noAskSelect.value = "oauth";
+await noAskSelect.listeners.change();
+output.noAsk = { value: noAskSelect.value, changes: collectChanges(noAsk, explicitPayload), toasts };
 output.livePending = modelSettingsBlock({ ...payload, model_apply: {status: "pending"} }).textContent;
 output.liveError = modelSettingsBlock({ ...payload, model_apply: {status: "error", error: "refused"} }).textContent;
 output.liveApplied = modelSettingsBlock({ ...payload, model_apply: {status: "applied"} }).textContent;
 output.restartRequired = modelSettingsBlock({ ...payload, model_apply: {status: "restart_required"} }).textContent;
+const plain = fieldRow("open_browser", {
+  value: true, from: "default", effect: "restart", editable: true, type: "bool",
+  label: "Open a browser on start", description: "Open a browser tab when the server starts.",
+}, null, {});
+const named = fieldRow("permission_mode", {
+  value: null, from: "project", effect: "restart", editable: true, type: "str or null",
+  choices: ["default", "acceptEdits", "plan"], nullable: true, description: "How often it asks.",
+}, null, {});
+output.rows = {
+  plainLabel: plain.querySelector(".setlabel").textContent,
+  plainNotes: plain.querySelectorAll(".setnote").map(c => c.textContent),
+  fallbackLabel: named.querySelector(".setlabel").textContent,
+  fallbackNote: named.querySelector(".setnote").textContent,
+  options: named.querySelector("#set-permission_mode").children.map(c => c.textContent),
+};
 console.log(JSON.stringify(output));
 """
 
@@ -222,13 +250,16 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert "Saved, but applying failed: refused" in output["liveError"]
     assert "Saved model settings applied." in output["liveApplied"]
     assert "require a restart" in output["restartRequired"]
-    assert "model: openai-codex/gpt (inherited High)" in output["initial"]
+    assert "Model: openai-codex/gpt (inherited from High)" in output["initial"]
     assert "Running now: omp, anthropic, actual-opus, effort low" in output["initial"]
-    assert "same-conversation" in output["initial"]
+    assert "same-conversation" not in output["initial"]  # an id is not shown
     assert output["changed"] == {"high_model": "anthropic/sonnet"}
-    assert "model: anthropic/sonnet (inherited High)" in output["updated"]
-    assert "model: openai-codex/override; effort: high (inherited High)" in output["overridden"]
-    assert "model: anthropic/opus (inherited High)" in output["cleared"]
+    assert "Model: anthropic/sonnet (inherited from High)" in output["updated"]
+    assert (
+        "Model: openai-codex/override; Reasoning effort: high (inherited from High)"
+        in output["overridden"]
+    )
+    assert "Model: anthropic/opus (inherited from High)" in output["cleared"]
     assert output["blankChanges"] == {"high_model": ""}
     assert "actual-opus" in output["updated"]
     assert "API usage billed separately" in output["profileInitial"]
@@ -255,6 +286,7 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["defaultChange"] == {"profile": "oauth"}
     assert output["cancelled"]["value"] == "api"
     assert output["cancelled"]["changes"] == {}
+    assert "Switch profile" in output["cancelled"]["prompt"]
     assert "High model: custom/shared" in output["cancelled"]["prompt"]
     assert "High effort: medium" in output["cancelled"]["prompt"]
     assert output["confirmed"] == {
@@ -269,3 +301,15 @@ def test_model_controls_separate_saved_runtime_and_resolve_inheritance(tmp_path)
     assert output["sameValueUnchanged"] == {}
     assert output["sameValueCleared"] == {"profile": "oauth", "high_model": ""}
     assert "High model: anthropic/opus" in output["sameValuePrompt"]
+    assert output["noAsk"]["value"] == "api"
+    assert output["noAsk"]["changes"] == {}
+    assert output["noAsk"]["toasts"] == [
+        "The profile was not changed: this page cannot ask for confirmation."
+    ]
+    assert "window.confirm" not in SETTINGS_JS.read_text()
+    rows = output["rows"]
+    assert rows["plainLabel"] == "Open a browser on start"
+    assert rows["plainNotes"] == []  # a built-in default says nothing
+    assert rows["fallbackLabel"] == "Permission mode"  # the key's name in words
+    assert rows["fallbackNote"] == "Set for this project"
+    assert rows["options"] == ["(not set)", "Ask as usual", "Accept edits", "Plan only"]

@@ -304,7 +304,7 @@ const cases = {
     assert.deepEqual(restoreCalls(store).map((c) => c.body), [{ target: "turn:2", expected_etag: shown }]);
     assert.equal(st.pending, null);
     assert.equal(st.conflict, null);
-    assert.deepEqual(notes, [{ message: "Restore to before turn 2: commit c7", ok: true }]);
+    assert.deepEqual(notes, [{ message: "Restore to before turn 2", ok: true }]);
     assert.equal(st.commits[0].subject, "restore turn:2"); // reloaded
     assert.notEqual(st.etag, shown);
   },

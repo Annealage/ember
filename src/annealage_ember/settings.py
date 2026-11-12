@@ -113,6 +113,11 @@ class Key:
     reported and writable through ``PUT /settings``). Keys sharing a title
     share a section, in listing order, so a product key can join a generic
     section by naming its title (``sections``).
+
+    ``label`` is the name the window shows for the key, in plain words; the
+    key's own name (``open_browser``) is for config files and never shown.
+    Left out, it is the name with spaces and a capital (``Open browser``).
+    The description is one line, with no command-line flags and no key names.
     """
 
     __slots__ = (
@@ -126,6 +131,7 @@ class Key:
         "nullable",
         "choices",
         "section",
+        "label",
     )
 
     def __init__(
@@ -140,6 +146,7 @@ class Key:
         nullable=False,
         choices=(),
         section=None,
+        label=None,
     ):
         self.name = name
         self.type_name = type_name
@@ -151,6 +158,7 @@ class Key:
         self.nullable = nullable
         self.choices = choices
         self.section = section
+        self.label = label or name.replace("_", " ").capitalize()
 
     @property
     def write_layer(self):
@@ -178,10 +186,8 @@ _AGENT_KEYS = (
         default="127.0.0.1",
         layers=(USER,),
         effect="restart",
-        description=(
-            "The address this process listens on. 127.0.0.1 is "
-            "loopback-only; see --host for the other bind modes."
-        ),
+        label="Listen address",
+        description="The address this server listens on. 127.0.0.1 means this computer only.",
         py_type=str,
         section=SERVER_SECTION,
     ),
@@ -191,7 +197,8 @@ _AGENT_KEYS = (
         default=8765,
         layers=(USER,),
         effect="restart",
-        description="The TCP port this process listens on.",
+        label="Port",
+        description="The port this server listens on.",
         py_type=int,
         section=SERVER_SECTION,
     ),
@@ -201,7 +208,8 @@ _AGENT_KEYS = (
         default=True,
         layers=(USER,),
         effect="restart",
-        description="Whether a browser tab opens automatically on startup.",
+        label="Open a browser on start",
+        description="Open a browser tab when the server starts.",
         py_type=bool,
         section=SERVER_SECTION,
     ),
@@ -211,13 +219,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(USER, PROJECT),
         effect="restart",
-        description=(
-            "The model the agent backend uses. Unset falls back to the backend's own "
-            "default. For backend=omp with no omp_base_url set, this is a "
-            '"provider/model" reference (e.g. "titan/qwen3.8-27b") against whatever '
-            "providers the omp CLI is already configured with, the same form its own "
-            "--model flag accepts."
-        ),
+        label="Model",
+        description="The model the agent uses. Empty uses the backend's own default.",
         py_type=str,
         nullable=True,
         section=AGENT_SECTION,
@@ -228,11 +231,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(USER, PROJECT),
         effect="restart",
-        description=(
-            "The reasoning effort passed to the agent session: low, "
-            "medium, high, xhigh or max. Unset falls back to the CLI's own "
-            "default."
-        ),
+        label="Reasoning effort",
+        description="How much the agent reasons before it answers. Empty uses the backend's own default.",
         py_type=str,
         nullable=True,
         choices=_EFFORT_CHOICES,
@@ -244,11 +244,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(PROJECT,),
         effect="restart",
-        description=(
-            "The permission mode passed to the agent session: default, "
-            "acceptEdits or plan. Project-scoped only, so a personal "
-            "default cannot silently loosen prompting in every project."
-        ),
+        label="Permission mode",
+        description="How often the agent asks before it acts. Set for this project only.",
         py_type=str,
         nullable=True,
         choices=_PERMISSION_MODE_CHOICES,
@@ -260,13 +257,8 @@ _AGENT_KEYS = (
         default=300,
         layers=(USER,),
         effect="restart",
-        description=(
-            "Seconds an approval card waits for the human before the request "
-            "expires and the agent is told no. A persistent service the human "
-            "checks in on now and then wants this long, an hour or more; the "
-            "agent's turn stays open while it waits. User-scoped only, like host "
-            "and port."
-        ),
+        label="Approval wait, in seconds",
+        description="How long an approval waits for you before the agent is told no.",
         py_type=int,
         section=AGENT_SECTION,
     ),
@@ -276,15 +268,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(USER, PROJECT),
         effect="restart",
-        description=(
-            "Which agent backend this session uses: claude (claude-agent-sdk, "
-            "Claude subscription or API billing), codex (OpenAI's openai-codex "
-            "SDK, ChatGPT subscription or API billing), or omp (the Oh My Pi CLI "
-            "with every provider it is configured for, including local models, "
-            "or an arbitrary OpenAI-compatible endpoint via omp_base_url). "
-            "Unset: agent mode uses whichever one is on PATH, and asks when "
-            "there is more than one."
-        ),
+        label="Agent backend",
+        description="Which agent runs the conversation. Empty uses the one installed here.",
         py_type=str,
         nullable=True,
         choices=BACKENDS,
@@ -296,13 +281,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(USER, PROJECT),
         effect="restart",
-        description=(
-            "The OpenAI-compatible base URL an arbitrary, self-hosted endpoint "
-            "backend=omp talks to. Only used when backend is omp, and only "
-            "needed for an endpoint the omp CLI does not already know about as a "
-            "named provider -- leave unset to use omp exactly as already configured "
-            'on this host (see the model key\'s "provider/model" form).'
-        ),
+        label="Endpoint address",
+        description="The address of a self-hosted model endpoint. Only used when the agent backend is omp.",
         py_type=str,
         nullable=True,
     ),
@@ -312,12 +292,8 @@ _AGENT_KEYS = (
         default=None,
         layers=(USER, PROJECT),
         effect="restart",
-        description=(
-            "The API key sent to omp_base_url, if that endpoint requires one. "
-            "Only used when backend is omp and omp_base_url is set -- a "
-            "provider omp already knows about (omp_base_url unset) carries its "
-            "own credentials instead."
-        ),
+        label="Endpoint API key",
+        description="The API key for that endpoint, if it needs one.",
         py_type=str,
         nullable=True,
     ),
@@ -334,7 +310,8 @@ _PRESENTATION_KEYS = (
         default=True,
         layers=(USER,),
         effect="load",
-        description=("Whether a tool call's detail card starts collapsed in the chat pane."),
+        label="Collapse tool calls",
+        description="Show each tool call in the chat as one closed line.",
         py_type=bool,
         section=VIEWER_SECTION,
     ),
@@ -429,7 +406,7 @@ class Resolved:
 
     def to_wire(self):
         """``{name: {"value", "from", "effect", "editable", "type",
-        "description", "choices", "nullable"}}`` for every key, the shape
+        "label", "description", "choices", "nullable"}}`` for every key, the shape
         ``GET /settings`` and the settings window read directly.
 
         ``editable`` means this key has at least one file it can be written
@@ -448,6 +425,7 @@ class Resolved:
                 "effect": key.effect,
                 "editable": bool(key.layers),
                 "type": key.type_name,
+                "label": key.label,
                 "description": key.description,
                 "choices": list(key.choices),
                 "nullable": key.nullable,

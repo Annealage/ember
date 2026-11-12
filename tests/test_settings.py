@@ -377,6 +377,22 @@ def test_emitter_quotes_a_key_name_that_is_not_a_bare_key(tmp_path):
 # --- to_wire ---------------------------------------------------------------
 
 
+def test_every_generic_key_has_a_plain_label_and_a_one_line_description():
+    """The window shows labels and descriptions as they are: no key names, no
+    command-line flags and no second paragraph."""
+    for key in settings.SETTING_KEYS:
+        assert "_" not in key.label and key.label[0].isupper(), key.name
+        assert "\n" not in key.description and "--" not in key.description, key.name
+        assert "_" not in key.description, key.name
+        assert len(key.description) < 110, key.name
+    assert settings.KEYS_BY_NAME["open_browser"].label == "Open a browser on start"
+
+
+def test_a_key_without_a_label_is_labelled_with_its_name_in_words():
+    key = settings.Key("up_axis", "str", "z", (settings.USER,), "load", "Which way is up.", str)
+    assert key.label == "Up axis"
+
+
 def test_to_wire_shape(tmp_path):
     resolved = settings.resolve(tmp_path, flags={"port": 9001})
     wire = resolved.to_wire()
@@ -390,3 +406,4 @@ def test_to_wire_shape(tmp_path):
     assert port_entry["editable"] is True
     assert port_entry["type"] == "int"
     assert isinstance(port_entry["description"], str) and port_entry["description"]
+    assert port_entry["label"] == "Port"

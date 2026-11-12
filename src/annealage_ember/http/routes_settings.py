@@ -113,8 +113,12 @@ def register_settings_routes(
     mounted=False,
     browser_runtime_controls=True,
     model_controls=None,
+    provider_login=False,
 ):
     """Register GET/PUT settings routes.
+
+    ``provider_login`` says whether the app serves the provider login routes;
+    the window asks for the provider list only when it does.
 
     Hosted mode filters service-controlled settings and writes only to the
     supplied per-project cache directory. ``model_controls`` is an explicit
@@ -211,6 +215,7 @@ def register_settings_routes(
                 "state_dirname": installed.state_dirname,
             },
             "diagnostics": {} if hosted_mode else facts,
+            "provider_login": bool(provider_login) and not hosted_mode,
         }
         if controls:
             runtime_info = getattr(app, "agent_runtime_info", {})

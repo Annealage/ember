@@ -15,6 +15,7 @@ real with:
 import asyncio
 import glob
 import os
+import re
 import socket
 import threading
 
@@ -238,8 +239,20 @@ def test_history_groups_and_pages_back(page):
     )
 
 
+def test_a_row_says_it_in_words_and_keeps_the_id_and_files_behind_details(page):
+    row = page.locator("#history .pj-commit").first
+    expect(row.locator(".pj-meta")).to_contain_text("Saved at")
+    expect(row.locator(".pj-meta")).to_contain_text("Changed: a")
+    row_text = row.inner_text()
+    assert "Id " not in row_text and "+++" not in row_text and "Files:" not in row_text
+    row.get_by_role("button", name="Details").click()
+    expect(row).to_contain_text("Files: a.py")
+    expect(row.locator(".pj-detail code")).to_have_text(re.compile(r"^c\d+$"))
+    expect(row.get_by_role("button", name="Hide details")).to_be_visible()
+
+
 def test_a_diff_opens_in_place(page):
-    page.locator("#history .pj-commit").first.get_by_role("button", name="Diff").click()
+    page.locator("#history .pj-commit").first.get_by_role("button", name="Details").click()
     expect(page.locator("#history pre.pj-diff")).to_contain_text("+++ a.py")
 
 
@@ -250,7 +263,7 @@ def test_restore_asks_first_and_escape_leaves_the_project_alone(page, store):
     page.get_by_role("button", name="Restore to before turn 2").click()
     dialog = page.get_by_role("dialog")
     expect(dialog).to_be_visible()
-    expect(dialog).to_contain_text("This undoes 3 commits or more")
+    expect(dialog).to_contain_text("This undoes 3 changes or more")
     page.keyboard.press("Escape")
     expect(dialog).to_be_hidden()
     assert [c for c in store.calls if c[0] == "restore"] == []
@@ -260,7 +273,7 @@ def test_restore_puts_the_project_back_as_a_new_commit(page, store):
     page.get_by_role("button", name="Restore to before turn 3").click()
     page.get_by_role("dialog").get_by_role("button", name="Restore to before turn 3").click()
     expect(page.get_by_role("dialog")).to_be_hidden()
-    expect(page.locator("#toast")).to_contain_text("Restore to before turn 3: commit c007")
+    expect(page.locator("#toast")).to_contain_text("Restore to before turn 3")
     expect(page.locator("#history .pj-commit .pj-subject").first).to_have_text(
         "restore: to before turn 3"
     )
@@ -314,7 +327,7 @@ def test_a_title_is_renamed_with_enter_and_escape_puts_it_back(page, store):
     field.press("Enter")
     expect(page.locator("#header .pj-title")).to_have_text("Camera v2")
     assert store.projects["camera"]["title"] == "Camera v2"
-    expect(page.locator("#toast")).to_contain_text("Renamed: commit")
+    expect(page.locator("#toast")).to_have_text("Renamed")
 
 
 def test_a_title_refused_as_stale_keeps_what_was_typed(page, store):

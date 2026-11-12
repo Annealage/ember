@@ -394,7 +394,7 @@ export function createHistoryModel(ctx, { pageSize = 100, onChange = () => {}, o
       st.conflict = null;
       ctx.notify(result.noop
         ? "Nothing to restore: the project is already as it was then"
-        : `${request.label}: commit ${result.commit}`, true);
+        : request.label, true);
       st.restoring = false;
       await onRestored(result);
       await ctx.reload();
@@ -474,7 +474,7 @@ export function createNameModel(ctx, { onChange = () => {}, onTitle = () => {}, 
       if (kind === "title") {
         const r = await ctx.client.setTitle(value, etag);
         ctx.setEtag(r.etag);
-        ctx.notify(r.commit ? `Renamed: commit ${r.commit}` : "Name unchanged", true);
+        ctx.notify(r.commit ? "Renamed" : "Name unchanged", true);
         onTitle(r.name);
       } else {
         const r = await ctx.client.renameId(st.projectId, value, etag);
@@ -856,6 +856,15 @@ function h(tag, attrs, ...children) {
 
 const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 
+// What a commit changed, in words: its files by name without folder or
+// extension ("requirements"), the first three, then how many more.
+function changedNames(files) {
+  const names = [...new Set((files || []).map((f) => String(f).match(/[^/]*$/)[0].replace(/\.[^.]*$/, "").replace(/[_-]+/g, " ")))]
+    .filter(Boolean);
+  if (!names.length) return "";
+  return names.slice(0, 3).join(", ") + (names.length > 3 ? ` and ${names.length - 3} more` : "");
+}
+
 function when(iso) {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
@@ -992,7 +1001,7 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
   const error = h("div", { class: "pj-error", role: "alert" });
   const notice = h("div", { class: "pj-notice", role: "status" });
   const list = h("div", { class: "pj-list" });
-  const more = h("button", { type: "button", class: "pj-btn pj-more", hidden: true }, "Load older commits");
+  const more = h("button", { type: "button", class: "pj-btn pj-more", hidden: true }, "Load older changes");
   root.replaceChildren(h("div", { class: "pj-bar" }, now, refreshButton), banner, error, notice, list, more);
   const modal = createModal(root);
   let model;
@@ -1000,6 +1009,7 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
   function commitRow(c) {
     const open = model.state.open.has(c.commit);
     const diff = model.state.diffs.get(c.commit);
+    const changed = changedNames(c.files);
     return h("div", { class: "pj-commit" },
       h("div", { class: "pj-commithead" },
         h("span", { class: "pj-subject" }, c.subject),
@@ -1007,13 +1017,18 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
           ? h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", "data-send": c.commit,
             onclick: () => lineage.chooseRevision(c.commit) }, `${lineage.state.labels.send}…`) : null,
         h("button", { type: "button", class: "pj-btn pj-sm pj-quiet", "aria-expanded": String(open),
-          onclick: () => model.toggleDiff(c.commit) }, open ? "Hide diff" : "Diff")),
+          onclick: () => model.toggleDiff(c.commit) }, open ? "Hide details" : "Details")),
       h("div", { class: "pj-meta" },
         h("span", { class: `pj-author pj-author-${c.actor || "other"}` }, c.author),
-        c.date ? h("span", {}, when(c.date)) : null, h("code", {}, c.commit),
-        c.files && c.files.length ? h("span", {}, c.files.join(", ")) : null),
-      open ? h("pre", { class: "pj-diff" },
-        ...(diff === null ? ["Reading the diff…"] : diffLines(diff || "(no changes)"))) : null);
+        c.date ? h("span", {}, "Saved at " + when(c.date)) : null,
+        changed ? h("span", {}, "Changed: " + changed) : null),
+      // The id, the file names and the raw diff are for someone checking the
+      // record, so they sit behind Details rather than on the row.
+      open ? h("div", { class: "pj-detail" },
+        h("p", { class: "pj-meta" }, "Id ", h("code", {}, c.commit)),
+        c.files && c.files.length ? h("p", { class: "pj-meta" }, "Files: " + c.files.join(", ")) : null,
+        h("pre", { class: "pj-diff" },
+          ...(diff === null ? ["Reading the diff…"] : diffLines(diff || "(no changes)")))) : null);
   }
 
   function renderModal(st) {
@@ -1034,12 +1049,12 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
       ok: () => model.confirmRestore(),
       closed: () => model.cancelRestore(),
       content: [
-        h("p", {}, `The project goes back to how it was before ${p.groupLabel}, as a new commit by you, ` +
+        h("p", {}, `The project goes back to how it was before ${p.groupLabel}, as a new saved change by you, ` +
           "so nothing is lost and you can restore past this too."),
-        h("p", { class: "pj-hint" }, `This undoes ${plural(undone.length, "commit")}${p.incomplete ? " or more" : ""}:`),
+        h("p", { class: "pj-hint" }, `This undoes ${plural(undone.length, "change")}${p.incomplete ? " or more" : ""}:`),
         h("ul", {}, ...undone.slice(0, 12).map((c) => h("li", {}, `${c.subject} (${c.author})`)),
           undone.length > 12 ? h("li", {}, `and ${undone.length - 12} more`) : null,
-          p.incomplete ? h("li", {}, "older commits of this group are not loaded yet") : null),
+          p.incomplete ? h("li", {}, "older changes of this group are not loaded yet") : null),
       ],
     });
   }
@@ -1059,8 +1074,8 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
       const restore = group && group.restore;
       return h("section", { class: "pj-group" },
         h("header", {},
-          h("span", { class: "pj-grouplabel" }, group ? group.label : "Other commits"),
-          h("span", { class: "pj-count" }, plural(run.commits.length, "commit")),
+          h("span", { class: "pj-grouplabel" }, group ? group.label : "Other changes"),
+          h("span", { class: "pj-count" }, plural(run.commits.length, "change")),
           restore ? h("button", { type: "button", class: "pj-btn pj-sm", disabled: st.busy,
             title: st.busy ? busyText : restore.label, onclick: () => model.requestRestore(run.key) },
           restore.label) : null),
@@ -1098,7 +1113,7 @@ export function initProjectHeader({ ctx, root, title, projectId, idChange = null
 
   const labels = {
     title: { label: "Project title", placeholder: "Project title", pattern: null },
-    id: { label: "Project id", placeholder: "project_id", pattern: "[a-z0-9][a-z0-9_]*" },
+    id: { label: "Project id", placeholder: "For example my_project", pattern: "[a-z0-9][a-z0-9_]*" },
   };
 
   function render(st) {
@@ -1187,7 +1202,7 @@ export function initProjectList({ ctx, root, onRenamed = () => {} } = {}) {
   root.replaceChildren(error, form, cards);
   let model;
 
-  const idField = h("input", { type: "text", name: "id", placeholder: "project_id", "aria-label": "New project id" });
+  const idField = h("input", { type: "text", name: "id", placeholder: "For example my_project", "aria-label": "New project id" });
   const titleField = h("input", { type: "text", name: "title", placeholder: "Title", "aria-label": "New project title" });
   const briefField = h("textarea", { name: "brief", rows: "2", placeholder: "What is it for?", "aria-label": "New project brief" });
   const createError = h("div", { class: "pj-error", role: "alert" });
@@ -1321,7 +1336,9 @@ export function initProjectLineage({ ctx, root, heading = "Lineage", onSent = ()
       ok: () => model.confirm(),
       closed: () => model.cancelDraft(),
       content: [
-        h("p", {}, "Revision ", h("code", {}, d.revision || "(none)")),
+        h("p", {}, "This sends the saved version you chose."),
+        h("details", { class: "pj-detail" }, h("summary", {}, "Details"),
+          h("p", {}, "Revision ", h("code", {}, d.revision || "(none)"))),
         h("fieldset", { class: "pj-choices" },
           target.can_create === false ? null : choice(null, target.new_label || "A new project", null),
           ...existing.map((p) => choice(p.id, p.title || p.id, p.summary))),

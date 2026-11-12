@@ -70,7 +70,7 @@ function flowPanel(flow, { onSubmit, onCancel }) {
   if (flow.instructions) box.appendChild(el("div", "lognote", flow.instructions));
   box.appendChild(el("div", "lognote",
     "When the page finishes it may send your browser to an address on localhost, " +
-    "which shows a connection error unless this is the machine omp runs on. " +
+    "which shows a connection error unless this is the machine the agent runs on. " +
     "That's expected: copy the whole address from the browser's address bar " +
     "(or the code the page shows) and paste it below."));
   if (flow.state === "awaiting_code") {
@@ -160,7 +160,7 @@ export async function providerLoginSection() {
       await reload();
     } else if (flow.state === "failed") {
       renderFlow(null);
-      say("Sign-in failed: " + (flow.error || "omp gave no reason") + ".");
+      say("Sign-in failed: " + (flow.error || "no reason was given") + ".");
     } else {
       say("");
       renderFlow(flow);

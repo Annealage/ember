@@ -613,6 +613,7 @@ def create_app(
         mounted=bool(url_prefix),
         browser_runtime_controls=installed.browser_runtime_controls,
         model_controls=settings_model_controls,
+        provider_login=provider_login is not None,
     )
     recorder = StateRecorder(state_sink)
     register_review_routes(app, store=review_store, auth=auth, recorder=recorder)
