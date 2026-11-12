@@ -49,6 +49,16 @@
  *   a confirmed refusal): the product starts whatever poll keeps its view
  *   current without the socket. ws.js owns the decision of when; the product
  *   owns the poll's mechanics, so the push and the poll never both run.
+ * - `onGated` runs each time `beforeConnect` answers false: there is nothing
+ *   to connect to (a hosted project with no running worker), which is a
+ *   steady state and not a failed connection. No fallback is armed and no
+ *   socket or probe is attempted; the gate is asked again on a slow timer.
+ *   The product shows the snapshot it has and stops any poll it started.
+ * - `onDiagnostic({event, attempt, ...detail})` receives each transport
+ *   transition worth monitoring (`socket_closed`, `probe`, `fallback`,
+ *   `refused`, `protocol_mismatch`, `gate_closed`, `gate_error`, `live`), so
+ *   a product can report why the page left the socket. A throwing reporter
+ *   never affects the transport.
  * - `connTitles` overrides the indicator's tooltips by state, for a product
  *   whose live channel means something more specific than "updates".
  *
@@ -84,6 +94,7 @@ const PROTOCOL_VERSION = 2;
 
 const BASE_BACKOFF_MS = 500; // also the "one backoff interval" the fallback poll waits out
 const MAX_BACKOFF_MS = 15000;
+const GATE_RETRY_MS = 5000; // how often a closed gate (no worker) is asked again
 
 // How long a connection attempt is given to prove it is alive, from the
 // moment connect() constructs the socket: past this, with no message
@@ -308,13 +319,16 @@ function wsUrl() {
  * one passes null. `allowModelChange` controls whether `send` permits a
  * `set_model` frame; other frame types are unaffected.
  * `beforeConnect`, when supplied, is awaited before each socket attempt. A
- * false result keeps read-only polling active without probing an absent
- * worker; a rejection displays the failure and retries the gate.
+ * false result means there is no worker to reach: `onGated` runs and the gate
+ * is asked again later, with no fallback and no probe. A rejection displays
+ * the failure and retries the gate on the ordinary backoff, with the fallback.
  */
 export function initWs({
   onEvent = {},
   onLive = () => {},
   onFallback = () => {},
+  onGated = () => {},
+  onDiagnostic = () => {},
   onHello = () => {},
   onAgentEvent = () => {},
   onPaused = () => {},
@@ -344,6 +358,15 @@ export function initWs({
   let initialHistoryExpected = false;
   let historyFloor = 0;
   const delivered = new Map();
+  let gateClosed = false; // whether the last gate answer was false, so gate_closed is reported once per episode
+
+  function diag(event, detail = {}) {
+    try {
+      onDiagnostic({ event, attempt, ...detail });
+    } catch (err) {
+      // a reporter must never break the transport it reports on
+    }
+  }
 
   // A Map rather than the object itself, so an event kind can never resolve
   // to something the object inherited ("constructor", "toString").
@@ -430,12 +453,17 @@ export function initWs({
           banner.style.display = "none";
         }
         gateError = null;
-        if (allowed) openSocket();
-        else scheduleRetry();
+        if (allowed) {
+          gateClosed = false;
+          openSocket();
+        } else {
+          scheduleGateRetry();
+        }
       }, (error) => {
         if (stopped) return;
         gateError = `Live connection unavailable: ${error?.message || String(error)}`;
         showError(gateError);
+        diag("gate_error", { message: String(error?.message || error).slice(0, 200) });
         scheduleRetry();
       });
       return;
@@ -598,11 +626,13 @@ export function initWs({
     // Everything up to here is replay of what already happened; only a later
     // seq is live (chat.js raises no notification for a replayed attention).
     liveAfter = frame.seq;
+    const recovered = attempt > 0 || fallbackFired;
     attempt = 0;
     fallbackFired = false;
     clearTimeout(fallbackTimer);
     fallbackTimer = null;
     store.setConnection("live");
+    if (recovered) diag("live", { recovered: true });
     // The product's resync, on every (re)connect: it stops its fallback poll
     // and refetches what it shows, because a replayed product event is not
     // handed to its handler (handleEvent), so a change announced while this
@@ -702,6 +732,7 @@ export function initWs({
       }
     }
     showError(MISMATCH_MESSAGE);
+    diag("protocol_mismatch");
     store.setConnection("polling");
     onFallback();
   }
@@ -712,6 +743,7 @@ export function initWs({
     ws = null;
     clearLiveness();
     if (stopped) return;
+    diag("socket_closed", { opened: wasOpened, code: event.code });
     if (wasOpened && event.code === 4400) {
       handleProtocolMismatch();
       return;
@@ -748,6 +780,7 @@ export function initWs({
     if (stopped) return;
     try {
       const res = await fetch(wsPath(), { cache: "no-store" });
+      diag("probe", { status: res.status });
       if (res.status === 403) {
         // Confirmed: this exact request, over a channel that does expose
         // its status, was refused before any upgrade was attempted. Per
@@ -767,6 +800,7 @@ export function initWs({
         // needs no Origin for a tailnet login, which is what lets the probe,
         // which a browser sends without one, tell the two apart for a page
         // with no token too.)
+        diag("refused");
         stopped = true;
         clearTimeout(fallbackTimer);
         fallbackTimer = null;
@@ -776,11 +810,28 @@ export function initWs({
         return;
       }
     } catch (err) {
+      diag("probe", { status: 0, message: String(err?.message || err).slice(0, 200) });
       // The probe failed too (offline, DNS, TLS): no more information than
       // the WebSocket attempt already gave. Falls through to the ordinary
       // retry path below.
     }
     scheduleRetry();
+  }
+
+  // No worker to reach: not a failure, so no fallback. The poll a previous
+  // downtime started is the product's to stop (`onGated`).
+  function scheduleGateRetry() {
+    if (stopped) return;
+    clearTimeout(fallbackTimer);
+    fallbackTimer = null;
+    fallbackFired = false;
+    attempt = 0;
+    if (!gateClosed) {
+      gateClosed = true;
+      diag("gate_closed");
+    }
+    onGated();
+    reconnectTimer = setTimeout(connect, GATE_RETRY_MS * (0.75 + Math.random() * 0.5));
   }
 
   function scheduleRetry() {
@@ -793,6 +844,7 @@ export function initWs({
         fallbackTimer = null;
         if (stopped || fallbackFired || store.getState().connection === "live") return;
         fallbackFired = true;
+        diag("fallback");
         store.setConnection("polling");
         onFallback();
       }, BASE_BACKOFF_MS);

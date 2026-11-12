@@ -37,13 +37,15 @@ globalThis.WebSocket = Socket;
 const { initWs } = await import(pathToFileURL(process.argv[2]).href);
 const flush = async () => { for (let i=0;i<12;i++) await Promise.resolve(); };
 const tick = async () => { const pending = [...timers.values()]; timers.clear(); for(const fn of pending) fn(); await flush(); };
-let running = false, calls = 0, fallbacks = 0, failure = null;
+let running = false, calls = 0, fallbacks = 0, gated = 0, failure = null;
+const events = [];
 initWs({ indicator: null, beforeConnect: async () => {
   calls++; if (failure) throw failure; return running;
-}, onFallback: () => fallbacks++ });
+}, onFallback: () => fallbacks++, onGated: () => gated++,
+  onDiagnostic: (d) => events.push(d.event) });
 await flush();
 await tick();
-const idle = { sockets: sockets.length, probes, fallbacks, calls };
+const idle = { sockets: sockets.length, probes, fallbacks, gated, calls, events: [...events] };
 running = true;
 await tick();
 const started = sockets.length;
@@ -68,7 +70,15 @@ console.log(JSON.stringify({ idle, started, ended, failed,
     )
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data["idle"] == {"sockets": 0, "probes": 0, "fallbacks": 1, "calls": 2}
+    # A closed gate is a steady state: no fallback poll, one gate_closed report per episode.
+    assert data["idle"] == {
+        "sockets": 0,
+        "probes": 0,
+        "fallbacks": 0,
+        "gated": 2,
+        "calls": 2,
+        "events": ["gate_closed"],
+    }
     assert data["started"] == 1
     assert data["ended"]["sockets"] == 1
     assert data["ended"]["calls"] > data["idle"]["calls"]
