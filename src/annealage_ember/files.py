@@ -755,9 +755,9 @@ def safe_join(base, rel):
 # into that directory can never make it servable by accident.
 #
 # ".svg" and ".woff2" are for a product's brand fonts, icons and marks (the
-# shared Workbench style, pulled in as lib/style and served from the
-# product's /static/style/). They are allowed here, in packaged static trees
-# (build_static_index), and nowhere else. A user's served directory reaches
+# Annealage style library, which a product carries as its lib/style
+# submodule and serves from a route of its own). They are allowed here, in
+# packaged static trees (build_static_index), and nowhere else. A user's served directory reaches
 # the browser through ASSET_CONTENT_TYPES above, which names neither, so an
 # SVG dropped into images/ goes out as application/octet-stream; and through
 # a product's model index, which admits only its model extensions (Mesh's
