@@ -50,6 +50,11 @@ back as ``RunResult.error``, with whatever text arrived first; ``run_prompt``
 raises only for a bad argument (``ValueError``) or because the caller
 cancelled it (``CancelledError``, after the session is closed).
 
+Model loading. An optional ``model_readiness`` callback can pause the inactivity
+window while the host reports that the model is loading. The whole-run deadline
+remains active. If readiness is unknown, the first model text or tool-use event
+starts the window; transport and startup events do not count as model output.
+
 When a run ends early. An unrecovered timeout or a cancel ends the run: the
 broker refuses any further call, each tool handler starts refusing ("this run has ended") and
 those running are cancelled and waited for (up to ``_DRAIN_TIMEOUT``, so their
@@ -119,6 +124,8 @@ BUILTIN_TOOLS = ("web_search",)
 
 #: OMP's configured model roles available to a headless child.
 MODEL_ROLES = ("smol", "default", "slow")
+_MODEL_READINESS_POLL_SECONDS = 5
+
 
 #: The common thinking levels supported by both backends.
 THINKING_LEVELS = ("low", "medium", "high")
@@ -312,6 +319,7 @@ class _Run:
         # When anything last happened in this run (an event, a host tool starting or
         # finishing); ``_drive``'s ``work_timeout`` is the quiet time since then.
         self.last_active = time.monotonic()
+        self.model_activity = asyncio.Event()
         self.role_resolution_error = False
         self.timeout_kind = None
         self.paused = False
@@ -414,6 +422,8 @@ class _Run:
 
     def on_event(self, event) -> None:
         self.last_active = time.monotonic()
+        if isinstance(event, (TextDelta, ToolUse)):
+            self.model_activity.set()
         if self.over:
             return
         if self.finished and not isinstance(
@@ -860,25 +870,65 @@ async def _timeout_callback(callback, context):
     return text
 
 
-async def _wait_while_active(settled, run: _Run, work_timeout) -> None:
-    """Wait for ``settled``, or until the run has been quiet for ``work_timeout``
-    seconds: no session event, and no host tool or native tool call in flight (a
-    long call is work, not silence). Returns with ``settled`` not done only then.
-    ``None`` waits for ``settled`` alone."""
+async def _wait_while_active(settled, run: _Run, work_timeout, model_readiness=None) -> None:
+    """Wait for settlement or an inactivity interval, accounting for model loading."""
     if work_timeout is None:
         await asyncio.wait({settled})
         return
+
+    readiness = "pending" if model_readiness is not None else "ready"
+    changed = asyncio.Event()
+
+    async def poll_readiness():
+        nonlocal readiness
+        while True:
+            value = model_readiness()
+            if not inspect.isawaitable(value):
+                raise TypeError("model_readiness must return an awaitable")
+            value = await value
+            if value not in ("ready", "loading", "unknown"):
+                raise ValueError("model_readiness must return ready, loading or unknown")
+            readiness = value
+            changed.set()
+            await asyncio.sleep(_MODEL_READINESS_POLL_SECONDS)
+
+    poller = asyncio.create_task(poll_readiness()) if model_readiness is not None else None
+    model_event = asyncio.create_task(run.model_activity.wait()) if poller else None
+    changed_event = asyncio.create_task(changed.wait()) if poller else None
     run.last_active = time.monotonic()
-    while True:
-        now = time.monotonic()
-        if run._inflight or run._pending_calls:
-            run.last_active = now
-        remaining = work_timeout - (now - run.last_active)
-        if remaining <= 0:
-            return
-        await asyncio.wait({settled}, timeout=max(remaining, 0.005))
-        if settled.done():
-            return
+    was_paused = False
+    try:
+        while True:
+            if poller and poller.done():
+                poller.result()
+            paused = readiness in ("pending", "loading") or (
+                readiness == "unknown" and not run.model_activity.is_set()
+            )
+            now = time.monotonic()
+            if paused or was_paused or run._inflight or run._pending_calls:
+                run.last_active = now
+            was_paused = paused
+            remaining = None if paused else work_timeout - (now - run.last_active)
+            if remaining is not None and remaining <= 0:
+                return
+            waiters = {settled}
+            if poller:
+                waiters.add(poller)
+                if not model_event.done():
+                    waiters.add(model_event)
+                waiters.add(changed_event)
+            await asyncio.wait(waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if poller and poller.done():
+                poller.result()
+            if settled.done():
+                return
+            if changed_event and changed_event.done():
+                changed.clear()
+                changed_event = asyncio.create_task(changed.wait())
+    finally:
+        for task in (poller, model_event, changed_event):
+            if task is not None:
+                await _cancelled(task)
 
 
 async def _drive(
@@ -889,6 +939,7 @@ async def _drive(
     max_followups: int,
     *,
     work_timeout=None,
+    model_readiness=None,
     interrupt_timeout=10,
     on_timeout=None,
     max_timeout_recoveries=0,
@@ -953,7 +1004,7 @@ async def _drive(
     try:
         while True:
             settled = asyncio.ensure_future(boundary())
-            await _wait_while_active(settled, run, work_timeout)
+            await _wait_while_active(settled, run, work_timeout, model_readiness)
             if not settled.done():
                 # Refuse new host calls while allowing successful writes already
                 # running to finish. Never cancel/replay them to recover time.
@@ -1230,6 +1281,7 @@ async def run_prompt(
     on_turn_result=None,
     max_followups=0,
     work_timeout=None,
+    model_readiness=None,
     interrupt_timeout=10,
     on_timeout=None,
     max_timeout_recoveries=0,
@@ -1264,6 +1316,13 @@ async def run_prompt(
     submission must settle and all host tools/results must finish, within
     ``interrupt_timeout`` seconds. New tool calls are refused during settlement.
     Unknown/failed interruption fails closed. Claude reports unsupported.
+
+    ``model_readiness`` optionally supplies an async no-argument callback returning
+    ``"loading"``, ``"ready"`` or ``"unknown"``. It is polled every five seconds
+    while a turn is active. Loading pauses the inactivity window; ready starts a
+    fresh window. Unknown pauses it until the first model text or tool-use event,
+    ignoring startup and input acknowledgement events. Callback errors fail the
+    run. The hard total deadline remains in force, including during the callback.
 
     ``on_timeout(TimeoutContext) -> str | None`` may return a diagnostic user
     prompt ONLY after a ``work_interval`` with ``interruption="safe"``. At most
@@ -1597,6 +1656,7 @@ async def run_prompt(
                     on_turn_result,
                     max_followups,
                     work_timeout=work_timeout,
+                    model_readiness=model_readiness,
                     interrupt_timeout=interrupt_timeout,
                     on_timeout=on_timeout,
                     max_timeout_recoveries=max_timeout_recoveries,

@@ -692,6 +692,16 @@ result = await run_prompt(
 )
 ```
 
+The optional `model_readiness` async callback lets a host pause `work_timeout`
+while a model loads. It takes no arguments and returns `"loading"`, `"ready"` or
+`"unknown"`; Ember polls it every five seconds during an active turn. Loading
+pauses the inactivity window, and readiness starts a fresh window. If readiness
+is unknown, the window starts with the first model text or tool-use event in
+the run, not startup or input acknowledgement events. The host should return
+unknown when its loading endpoint or model identity is unavailable. Callback
+errors end the run; the whole-run `timeout` still applies while the callback
+or model is loading. Without `work_timeout`, the callback is not called.
+
 The OMP recovery path refuses new host tool calls, lets existing handlers
 **and their native tool results** settle before aborting, then requires an
 acknowledged abort, the original submission to settle and a true terminal turn

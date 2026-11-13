@@ -192,6 +192,98 @@ async def test_hard_deadline_does_not_accept_observer_prompt(monkeypatch, tmp_pa
     assert built.session.interrupted == 0 and len(built.session.submitted_turns) == 1
 
 
+async def test_model_loading_pauses_work_timeout_until_ready(monkeypatch, tmp_path):
+    monkeypatch.setattr(headless, "_MODEL_READINESS_POLL_SECONDS", 0.01)
+    checks = []
+    loading = asyncio.Event()
+
+    async def readiness():
+        checks.append(1)
+        return "loading" if not loading.is_set() else "ready"
+
+    async def script(session):
+        await asyncio.sleep(0.08)
+        assert session.interrupted == 0
+        loading.set()
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path, work_timeout=0.03, model_readiness=readiness, on_timeout=contexts.append
+        ),
+    )
+    assert len(checks) > 1
+    assert result.timeout_kind == "work_interval"
+    assert built.session.interrupted == 1 and contexts[0].kind == "work_interval"
+
+
+async def test_unknown_readiness_waits_for_model_output_not_input_events(monkeypatch, tmp_path):
+    from annealage_ember.session.base import InputState
+
+    async def readiness():
+        return "unknown"
+
+    async def script(session):
+        session.emit(InputState("input", 1, "received"))
+        await asyncio.sleep(0.08)
+        assert session.interrupted == 0
+        session.emit(TextDelta(turn=1, text="first"))
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path, work_timeout=0.03, model_readiness=readiness, on_timeout=contexts.append
+        ),
+    )
+    assert result.timeout_kind == "work_interval"
+    assert built.session.interrupted == 1 and contexts[0].kind == "work_interval"
+
+
+@pytest.mark.parametrize("mode", ("loading", "unknown", "stalled_callback"))
+async def test_hard_deadline_wins_while_readiness_is_paused(monkeypatch, tmp_path, mode):
+    async def readiness():
+        if mode == "stalled_callback":
+            await asyncio.Event().wait()
+        return mode
+
+    async def script(session):
+        pass
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            timeout=0.08,
+            work_timeout=0.01,
+            model_readiness=readiness,
+            on_timeout=contexts.append,
+        ),
+    )
+    assert result.timeout_kind == "hard_deadline" and result.error == "timeout"
+    assert built.session.interrupted == 0 and contexts[0].kind == "hard_deadline"
+
+
+async def test_readiness_callback_failure_is_a_run_error(monkeypatch, tmp_path):
+    async def readiness():
+        raise RuntimeError("readiness failure")
+
+    async def script(session):
+        pass
+
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go", **make_args(tmp_path, work_timeout=0.02, model_readiness=readiness)
+    )
+    assert "readiness failure" in result.error
+    assert built.session.interrupted == 0
+
+
 async def test_native_error_does_not_invoke_timeout_callback(monkeypatch, tmp_path):
     async def script(session):
         session.emit(AgentError(stderr="authentication failed", remediation=""))
