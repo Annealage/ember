@@ -97,6 +97,14 @@ chat.handleHello({ id: "s", agent: "unavailable",
 out.bannerFromHello = store.getState().chat.banner;
 out.sendDisabledWhileDown = el("chatSend").disabled;
 
+// A viewer-only run: nothing can be sent, and every disabled control says why.
+chat.handleHello({ id: "viewer-only", agent: "unavailable" });
+out.viewerOnly = ["chatSend", "chatInput", "chatAttachBtn", "chatInterrupt"].map(
+  (id) => [el(id).disabled, el(id).title]);
+chat.handleHello({ id: "s", agent: "unavailable",
+                   agent_error: { remediation: "log omp in", stderr: "401 no credentials" } });
+out.afterViewerOnly = [el("chatInput").disabled, el("chatAttachBtn").disabled];
+
 // A replayed agent_error is history; a live one is news.
 store.clearChatBanner();
 chat.handleEvent({ kind: "agent_error", remediation: "old trouble", stderr: "" }, { replayed: true });
@@ -589,6 +597,9 @@ def test_a_page_opened_while_the_agent_is_down_shows_why(observed):
     assert "401 no credentials" in json.dumps(banner)
     # Sending is what starts a closed or failed agent again.
     assert observed["sendDisabledWhileDown"] is False
+    # Viewer-only: Send, the box, Attach and Interrupt are off, each with a reason.
+    assert all(disabled and title for disabled, title in observed["viewerOnly"])
+    assert observed["afterViewerOnly"] == [False, False]
 
 
 def test_only_a_live_agent_error_raises_the_banner(observed):

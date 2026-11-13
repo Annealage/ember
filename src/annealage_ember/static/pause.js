@@ -23,9 +23,12 @@ import { store } from "./store.js";
  *                child's text is written ("Pause" / "Paused"), so an icon or other
  *                markup the page put in the button stays; without one, the
  *                button's whole text is.
+ * @param disabledTitle  the tooltip while the control is disabled (no agent)
  * Returns `{setPausedFromServer}`, which the page hands to ws.js's `onPaused`.
  */
-export function initPause({ send, button = document.getElementById("pauseBtn") }) {
+export function initPause({ send, button = document.getElementById("pauseBtn"),
+  disabledTitle = "No agent is running, so there are no tools to pause." }) {
+  const markupTitle = button.title;
   const label = button.querySelector("[data-label]");
   function renderPause(state) {
     button.classList.toggle("on", state.paused);
@@ -38,7 +41,9 @@ export function initPause({ send, button = document.getElementById("pauseBtn") }
     // control whose every click produces a refusal toast is worse than one that
     // plainly cannot be pressed. Keyed on the same status the composer's Send
     // button reads, so the pane and the topbar agree about what is available.
-    button.disabled = state.chat.agentStatus === "unavailable";
+    const off = state.chat.agentStatus === "unavailable";
+    button.disabled = off;
+    button.title = off ? disabledTitle : markupTitle;
   }
   renderPause(store.getState());
   store.subscribe("paused", renderPause);

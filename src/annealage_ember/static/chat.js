@@ -303,6 +303,9 @@ const AGENT_TITLE = {
   ready: "The agent is ready to receive a message.",
   idle: "The session is idle after a finished turn. Send a message to continue.",
   closed: "The agent is not running. Sending a message starts it again.",
+  viewer_only:
+    "This server runs viewer-only, with no agent, so there is nothing to send a message to.",
+  interrupt_idle: "No turn is running.",
   unavailable:
     "The agent is not available right now. Sending a message tries to start it again; the rest of the page keeps working regardless.",
 };
@@ -502,6 +505,8 @@ export function initChat({
   // The session this pane belongs to, learned from the hello frame. Null until
   // then, and null for a viewer-only run, which has no conversation to write.
   let sessionId = null;
+  // The hello named the viewer-only session: the server refuses every send.
+  let viewerOnly = false;
   let historyCursor = null;
   let historyHasMore = false;
   let historyReady = false;
@@ -1331,6 +1336,15 @@ export function initChat({
   // the field has focus, so a store update racing a human mid-edit (a
   // reconnect's hello, another tab's own AgentModelChanged) cannot overwrite
   // what they are typing.
+  // Disables `el` with `reason` as its tooltip, or enables it and puts back the
+  // title the markup gave it.
+  const markupTitles = new Map();
+  function gate(el, reason) {
+    if (!markupTitles.has(el)) markupTitles.set(el, el.title);
+    el.disabled = !!reason;
+    el.title = reason || markupTitles.get(el);
+  }
+
   function renderModel(chat) {
     if (!modelControl) return;
     if (chat.models !== listedModels) {
@@ -1343,7 +1357,8 @@ export function initChat({
         }),
       );
     }
-    chatModelInputEl.disabled = chat.agentStatus === "unavailable";
+    gate(chatModelInputEl, viewerOnly ? titles.viewer_only
+      : (chat.agentStatus === "unavailable" ? titles.unavailable : ""));
     if (document.activeElement !== chatModelInputEl) {
       chatModelInputEl.value = chat.model || "";
     }
@@ -1367,9 +1382,11 @@ export function initChat({
     const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
     const steering = steers && busy && ready;
     const queueing = !steers && busy && ready;
-    chatSendBtn.disabled = uploading;
+    gate(chatInputEl, viewerOnly ? titles.viewer_only : "");
+    gate(chatAttachBtn, viewerOnly ? titles.viewer_only : "");
+    chatSendBtn.disabled = uploading || viewerOnly;
     chatSendBtn.textContent = steering ? "Steer" : (queueing ? "Queue" : "Send");
-    chatSendBtn.title = uploading
+    chatSendBtn.title = viewerOnly ? titles.viewer_only : uploading
       ? "Waiting for an attachment to finish uploading"
       : (!ready ? titles[chat.agentStatus] || ""
         : (steering
@@ -1398,7 +1415,7 @@ export function initChat({
 
   function renderInterrupt(chat) {
     const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
-    chatInterruptBtn.disabled = !busy;
+    gate(chatInterruptBtn, viewerOnly ? titles.viewer_only : (busy ? "" : titles.interrupt_idle));
   }
 
   // When each running turn started, in epoch ms, by turn number. The event
@@ -1738,8 +1755,11 @@ export function initChat({
     // writing out. Viewer-only runs report "viewer-only" here and have no
     // conversation to export, which the button reflects by staying disabled.
     sessionId = nextSessionId;
+    viewerOnly = sessionId === "viewer-only";
     steers = !!(session && session.steers);
     renderSendButton(store.getState().chat);
+    renderModel(store.getState().chat);
+    renderInterrupt(store.getState().chat);
     renderExportButton();
   }
 

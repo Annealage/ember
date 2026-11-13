@@ -77,6 +77,13 @@ out.iconKept = themed.children[0] === icon && themed.children.length === 2;
 out.plainPaused = look(plain);
 store.setPaused(false);
 out.resumed = look(themed);
+const off = el("button");
+off.title = "markup title";
+initPause({ send: () => {}, button: off });
+store.setChatAgentStatus("unavailable");
+out.offState = [off.disabled, off.title];
+store.setChatAgentStatus("ready");
+out.onState = [off.disabled, off.title];
 console.log(JSON.stringify(out));
 """
 
@@ -101,3 +108,6 @@ def test_the_pause_button_shows_the_server_s_flag_and_keeps_the_page_s_markup(tm
     # A button with no label child gets its whole text, as before.
     assert out["plainBefore"]["text"] == "Pause"
     assert out["plainPaused"] == {"pressed": "true", "on": True, "text": "Paused"}
+    # Disabled for want of an agent it says why; enabled again it has the markup's title back.
+    assert out["offState"][0] is True and out["offState"][1] != "markup title"
+    assert out["onState"] == [False, "markup title"]
