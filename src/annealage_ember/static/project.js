@@ -856,10 +856,10 @@ function h(tag, attrs, ...children) {
 
 const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
 
-// What a commit changed, in words: its files by name without folder or
-// extension ("requirements"), the first three, then how many more.
+// What a commit changed, in words: its files by name without folder
+// ("requirements.md"), the first three, then how many more.
 function changedNames(files) {
-  const names = [...new Set((files || []).map((f) => String(f).match(/[^/]*$/)[0].replace(/\.[^.]*$/, "").replace(/[_-]+/g, " ")))]
+  const names = [...new Set((files || []).map((f) => String(f).match(/[^/]*$/)[0]))]
     .filter(Boolean);
   if (!names.length) return "";
   return names.slice(0, 3).join(", ") + (names.length > 3 ? ` and ${names.length - 3} more` : "");

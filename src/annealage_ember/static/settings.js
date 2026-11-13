@@ -197,6 +197,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
     const custom = document.createElement("input");
     custom.id = "set-custom-" + name;
     custom.type = "text";
+    custom.className = "setinput";
     custom.placeholder = "provider/model";
     custom.hidden = true;
     custom.disabled = !entry.editable;

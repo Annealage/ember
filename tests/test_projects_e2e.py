@@ -242,7 +242,7 @@ def test_history_groups_and_pages_back(page):
 def test_a_row_says_it_in_words_and_keeps_the_id_and_files_behind_details(page):
     row = page.locator("#history .pj-commit").first
     expect(row.locator(".pj-meta")).to_contain_text("Saved at")
-    expect(row.locator(".pj-meta")).to_contain_text("Changed: a")
+    expect(row.locator(".pj-meta")).to_contain_text("Changed: a.py")
     row_text = row.inner_text()
     assert "Id " not in row_text and "+++" not in row_text and "Files:" not in row_text
     row.get_by_role("button", name="Details").click()
