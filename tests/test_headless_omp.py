@@ -627,6 +627,68 @@ async def test_terminal_assistant_error_message_reaches_headless_result(omp_clie
     assert [(event["tokens_input"], event["cost_usd"]) for event in usage] == [(5, 0.001)]
 
 
+_STALL = "OpenAI completions stream timed out while waiting for the first event"
+
+
+def _failed_request(client, error):
+    client._listeners["message_update"](
+        SimpleNamespace(
+            assistant_message_event={
+                "type": "error",
+                "reason": "error",
+                "error": {"errorMessage": error},
+            }
+        )
+    )
+    client._listeners["message_end"](
+        SimpleNamespace(message={"role": "assistant", "stopReason": "error", "errorMessage": error})
+    )
+    client._listeners["agent_end"](SimpleNamespace(is_terminal=False))
+    client._listeners["auto_retry_start"](
+        SimpleNamespace(attempt=1, max_attempts=10, delay_ms=1, error_message=error)
+    )
+
+
+async def test_an_error_omp_retried_and_recovered_from_is_not_the_run_s_error(omp_client, tmp_path):
+    def script(client):
+        _failed_request(client, _STALL)
+        client.say("done")
+        client._listeners["message_end"](
+            SimpleNamespace(message={"role": "assistant", "stopReason": "stop"})
+        )
+        client._listeners["auto_retry_end"](
+            SimpleNamespace(success=True, attempt=1, final_error=None)
+        )
+        client.end()
+
+    omp_client.script = script
+    activity = []
+    result = await run_prompt("go", **make_args(tmp_path, on_activity=activity.append))
+
+    assert [r for r in activity if r["kind"] == "retrying"] == [
+        {"kind": "retrying", "state": "waiting", "attempt": 1, "max_attempts": 10, "delay_ms": 1},
+        {"kind": "retrying", "state": "recovered"},
+    ]
+    assert result.error is None
+    assert result.text == "done"
+    assert result.stop_reason == "end"
+
+
+async def test_retries_omp_gave_up_on_are_the_run_s_error(omp_client, tmp_path):
+    def script(client):
+        _failed_request(client, _STALL)
+        _failed_request(client, "502 bad gateway")
+        client._listeners["auto_retry_end"](
+            SimpleNamespace(success=False, attempt=2, final_error="502 bad gateway")
+        )
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt("go", **make_args(tmp_path))
+
+    assert result.error == "502 bad gateway"
+
+
 async def test_concurrent_runs_never_share_an_event_id(omp_client, tmp_path):
     events = []
     lock = threading.Lock()

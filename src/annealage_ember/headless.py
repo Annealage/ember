@@ -96,6 +96,7 @@ from .session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentError,
+    AgentRetrying,
     AgentRuntimeResolved,
     AgentStatus,
     TextDelta,
@@ -416,7 +417,7 @@ class _Run:
         if self.over:
             return
         if self.finished and not isinstance(
-            event, (AgentRuntimeResolved, AgentError, AgentStatus, ToolResult)
+            event, (AgentRuntimeResolved, AgentError, AgentRetrying, AgentStatus, ToolResult)
         ):
             return
         if (
@@ -448,6 +449,11 @@ class _Run:
                     "tool_use_id": event.tool_use_id,
                     "is_error": event.is_error,
                 }
+        elif isinstance(event, AgentRetrying):
+            activity = {"kind": "retrying", "state": event.state}
+            for field in ("attempt", "max_attempts", "delay_ms"):
+                if getattr(event, field) is not None:
+                    activity[field] = getattr(event, field)
         if activity is not None and self._on_activity is not None:
             try:
                 self._on_activity(activity)
@@ -485,6 +491,8 @@ class _Run:
                 if event.is_error:
                     self._tool_errors.append((self._calls[index][0], event.text))
         elif isinstance(event, AgentError):
+            if event.will_retry:
+                return
             if event.role_resolution_error is True:
                 self.role_resolution_error = True
             message = (event.stderr or event.remediation or "").strip()
@@ -1385,7 +1393,10 @@ async def run_prompt(
     change the run.
     ``on_activity(event: dict) -> None`` receives ordered public ``text_delta``,
     ``tool_use`` (name/id/turn only) and ``tool_result`` (id/is_error only)
-    records, including results arriving after a turn boundary. It receives no
+    records, including results arriving after a turn boundary, and, from omp,
+    ``retrying`` records (``state`` of ``waiting``, ``recovered`` or ``failed``,
+    with ``attempt``, ``max_attempts`` and ``delay_ms`` when known; never the
+    failed request's error text) while it retries a failed model request. It receives no
     prompts, reasoning, tool arguments or tool result text. It is synchronous,
     best effort, and observer exceptions never change execution.
     ``on_owner(event)`` optionally receives native-process ownership and

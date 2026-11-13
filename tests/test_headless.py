@@ -761,6 +761,14 @@ async def test_a_run_that_finished_cleanly_does_not_kill_the_session(monkeypatch
     assert killed == []
 
 
+async def test_an_error_a_backend_is_retrying_is_not_the_run_s_error():
+    run = headless._Run("mcp__toy__")
+    run.on_event(AgentError(stderr="stream disconnected", remediation="r", will_retry=True))
+    assert run.error() is None
+    run.on_event(AgentError(stderr="gave up", remediation="r"))
+    assert run.error() == "gave up"
+
+
 async def test_ending_a_run_twice_is_harmless():
     run = headless._Run("mcp__toy__")
     run.end()

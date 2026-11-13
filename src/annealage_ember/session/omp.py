@@ -256,6 +256,20 @@ an unanswered ``prompt`` error) reaches the page as a short owner-facing sentenc
 ``AgentError.fault_code="agent_login_missing"`` (``_refusal_view``); omp's own text
 names a server path and is written only to the server's stderr.
 
+**Retried errors.** omp retries a failed model request itself (a stalled stream, a 429, a
+5xx; ``retry.maxRetries``) and announces it with ``auto_retry_start`` after the failed
+message, so the failure is not known to be final when it arrives. ``_hold_error`` keeps
+each failed request's ``AgentError`` back: ``auto_retry_start`` drops them, and they are
+published at ``TurnEnd`` or the session's close, or by ``auto_retry_end`` with
+``success=false`` (with omp's own ``finalError`` if nothing was held). A turn that
+recovered therefore carries no error, and a run's ``RunResult.error`` is not set by an
+attempt omp had already retried. An aborted message is published at once: omp never
+retries it, and the host's timeout interrupt reads it as soon as it arrives.
+The retry itself is published as ``AgentRetrying`` (``waiting`` with the attempt and
+delay, then ``recovered`` or ``failed``, never the error text), so a host can show the
+model as retrying while the error is held; ``headless`` passes it on as a ``retrying``
+``on_activity`` record.
+
 **Input delivery.** The inspected RPC API exposes a ``streamingBehavior`` prompt
 option but no negotiated steering capability. OMP therefore reports
 ``steers=False`` and this session queues new user inputs locally until the
@@ -301,7 +315,7 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 from omp_rpc import host_tool
 from omp_rpc.client import RpcCommandError, RpcTimeoutError
@@ -318,6 +332,7 @@ from .base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRetrying,
     AgentRuntimeResolved,
     AgentStatus,
     InputState,
@@ -585,6 +600,11 @@ class OmpSession:
         #: Turns omp itself reported finished (``agent_end``), read in wire order.
         self._agent_end_turns: set = set()
         self._timeout_interrupt_turn = None
+        # A failed model request's errors, kept back until omp says whether it
+        # retries (``_hold_error``). Loop thread only.
+        self._held_errors: List[AgentError] = []
+        # An ``AgentRetrying("waiting")`` has been published and not settled.
+        self._retry_waiting = False
         self._on_session_file = on_session_file
         self._thinking = thinking
         self._provider_session_id = provider_session_id
@@ -1939,6 +1959,8 @@ class OmpSession:
         client.on_tool_execution_start(self._on_tool_execution_start)
         client.on_tool_execution_end(self._on_tool_execution_end)
         client.on_agent_end(self._on_agent_end)
+        client.on_auto_retry_start(self._on_auto_retry_start)
+        client.on_auto_retry_end(self._on_auto_retry_end)
         client.on_ui_request(self._on_ui_request)
         client.on_protocol_error(self._on_protocol_error)
 
@@ -1997,9 +2019,12 @@ class OmpSession:
             )
         self._loop.call_soon_threadsafe(self._emit_request_usage, report)
         error = _nonempty_string(message.get("errorMessage"))
+        if error is None:
+            self._loop.call_soon_threadsafe(self._retry_settled, "recovered")
         if error is not None:
+            aborted = message.get("stopReason") == "aborted"
             self._loop.call_soon_threadsafe(
-                self._emit,
+                self._emit if aborted else self._hold_error,
                 AgentError(
                     stderr=error,
                     remediation="the model reported an error during this turn; "
@@ -2012,6 +2037,70 @@ class OmpSession:
                     ),
                 ),
             )
+
+    def _hold_error(self, error: AgentError) -> None:
+        """Keep a failed request's error until omp has said whether it retries.
+
+        omp retries a transient failure (a stalled stream, a 429, a 5xx) on its
+        own, announcing ``auto_retry_start`` after the failed message, and the
+        turn then carries on and can finish well. Such an error is not the
+        turn's error, so it is not published until the turn is known to have
+        ended with it: at ``TurnEnd`` or the close of the session, or when omp
+        reports the retries exhausted (``_on_auto_retry_end``). An announced
+        retry drops what is held (``_on_auto_retry_start``): everything held
+        belongs to the attempt that failed, since the next attempt starts only
+        after the announcement.
+        """
+        self._held_errors.append(error)
+
+    def _flush_held_errors(self) -> None:
+        held, self._held_errors = self._held_errors, []
+        for error in held:
+            self._emit(error)
+
+    def _on_auto_retry_start(self, event) -> None:
+        """Reader thread. omp is retrying the failed request: its error is
+        not the turn's."""
+        self._loop.call_soon_threadsafe(
+            self._retry_announced, event.attempt, event.max_attempts, event.delay_ms
+        )
+
+    def _retry_announced(self, attempt, max_attempts, delay_ms) -> None:
+        self._held_errors = []
+        self._retry_waiting = True
+        self._emit(
+            AgentRetrying(
+                state="waiting", attempt=attempt, max_attempts=max_attempts, delay_ms=delay_ms
+            )
+        )
+
+    def _on_auto_retry_end(self, event) -> None:
+        """Reader thread. A retry saga that did not recover ends the turn with
+        its error: the one held, else omp's own final error."""
+        self._loop.call_soon_threadsafe(self._retries_ended, event.success, event.final_error)
+
+    def _retry_settled(self, state: str) -> None:
+        """``recovered`` once a request after the retry answered, else ``failed``.
+        Published once: the answer itself settles it, which is before the run
+        can end, where omp's own ``auto_retry_end`` can arrive after the turn's end."""
+        if self._retry_waiting:
+            self._retry_waiting = False
+            self._emit(AgentRetrying(state=state))
+
+    def _retries_ended(self, success: bool, final_error: Optional[str]) -> None:
+        if success:
+            self._retry_settled("recovered")
+            return
+        self._retry_settled("failed")
+        if not self._held_errors and _nonempty_string(final_error) is not None:
+            self._held_errors.append(
+                AgentError(
+                    stderr=final_error,
+                    remediation="the model reported an error during this turn; "
+                    "the session otherwise remains ready",
+                )
+            )
+        self._flush_held_errors()
 
     def _record_resolved_runtime(self, event: AgentRuntimeResolved) -> None:
         previous = self.resolved_runtime or {}
@@ -2078,8 +2167,9 @@ class OmpSession:
                 message = _content_to_text(error)
             else:
                 message = "the model reported an error"
+            aborted = assistant_event.get("reason") == "aborted"
             self._loop.call_soon_threadsafe(
-                self._emit,
+                self._emit if aborted else self._hold_error,
                 AgentError(
                     stderr=message,
                     remediation="the model reported an error during this turn; "
@@ -2498,6 +2588,8 @@ class OmpSession:
         )
 
     def _emit(self, event) -> None:
+        if self._held_errors and isinstance(event, (TurnEnd, AgentClosed, SessionReset)):
+            self._flush_held_errors()
         if isinstance(event, TurnEnd):
             started = getattr(self, "_turn_started", None)
             if event.stop_reason in {"backend_exited", "rejected"}:

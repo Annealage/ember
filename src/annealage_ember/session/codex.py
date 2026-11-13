@@ -911,6 +911,7 @@ class CodexSession:
                     stderr=payload.error.message,
                     remediation="the Codex turn reported an error"
                     + (" and will retry" if payload.will_retry else ""),
+                    will_retry=True if payload.will_retry else None,
                     viewer=viewer,
                 )
             )

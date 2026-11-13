@@ -40,6 +40,7 @@ from openai_codex.generated.v2_all import (
     CommandExecutionSource,
     CommandExecutionStatus,
     CommandExecutionThreadItem,
+    ErrorNotification,
     ItemStartedNotification,
     SandboxMode,
     ThreadItem,
@@ -48,6 +49,7 @@ from openai_codex.generated.v2_all import (
     TokenUsageBreakdown,
     Turn,
     TurnCompletedNotification,
+    TurnError,
     TurnStatus,
 )
 from openai_codex.models import Notification
@@ -408,6 +410,33 @@ async def test_a_model_listing_codex_never_answers_holds_up_no_turn_and_no_close
 # ---------------------------------------------------------------------------
 # turn/start -> commandExecution approval -> approval-handler -> turn/completed
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("will_retry, expected", ((True, True), (False, None)))
+async def test_an_error_notification_says_whether_codex_is_retrying(will_retry, expected):
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn([{"type": "text", "text": "go"}])
+        turn_id = fake.turn_start_calls[0].turn_id
+        fake.push_notification(
+            turn_id,
+            Notification(
+                method="error",
+                payload=ErrorNotification(
+                    error=TurnError(message="stream disconnected"),
+                    thread_id="thread-1",
+                    turn_id=turn_id,
+                    will_retry=will_retry,
+                ),
+            ),
+        )
+        error = await recorder.next()
+        assert isinstance(error, AgentError)
+        assert error.stderr == "stream disconnected"
+        assert error.will_retry is expected
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio

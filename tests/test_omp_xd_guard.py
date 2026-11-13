@@ -40,10 +40,10 @@ def loopback(monkeypatch):
     models = []
     dirs = []
 
-    def build(script):
+    def build(script, retry=None, settings=None, api="openai-codex-responses"):
         model = LoopbackModel(script)
         models.append(model)
-        agent_dir = write_agent_dir(model.port)
+        agent_dir = write_agent_dir(model.port, retry=retry, settings=settings, api=api)
         dirs.append(agent_dir)
         for key, value in loopback_env(agent_dir).items():
             monkeypatch.setenv(key, value)
@@ -708,3 +708,43 @@ async def test_the_tool_sets_receipt_observer_sees_the_real_server_tool_and_argu
     assert answered is not None and not answered.startswith("Blocked:")
     assert [event[:3] for event in receipts] == [("fake", "lookup", args)]
     assert upstream.calls.count("lookup") == 1
+
+
+# omp's first-event watchdog, shortened, ends a request that never answers; the
+# provider retries it itself a couple of times, then the agent's own retry
+# (announced after the failed message) makes the next. Three stalls reach it.
+STALLS = {"providers": {"streamFirstEventTimeoutSeconds": 1}}
+
+
+async def test_a_request_omp_retries_and_recovers_from_is_not_the_run_s_error(loopback, tmp_path):
+    """Real omp: a stalled request ends as a failed assistant message, omp announces its
+    retry and the next request succeeds. The failed attempt's error is not the run's."""
+    retry = {"enabled": True, "maxRetries": 3, "baseDelayMs": 50, "modelFallback": False}
+    model, agent_dir = loopback(
+        [("stall", 3)] * 3 + [("text", "recovered")],
+        retry=retry,
+        settings=STALLS,
+        api="openai-completions",
+    )
+    activity = []
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path, model=MODEL, omp_agent_dir=agent_dir, timeout=120, on_activity=activity.append
+        ),
+    )
+    assert [r["state"] for r in activity if r["kind"] == "retrying"] == ["waiting", "recovered"]
+    assert len(model.requests) == 4
+    assert result.error is None
+    assert result.text == "recovered"
+
+
+async def test_a_request_omp_gives_up_retrying_is_the_run_s_error(loopback, tmp_path):
+    retry = {"enabled": True, "maxRetries": 1, "baseDelayMs": 50, "modelFallback": False}
+    model, agent_dir = loopback(
+        [("stall", 3)] * 40, retry=retry, settings=STALLS, api="openai-completions"
+    )
+    result = await run_prompt(
+        "go", **make_args(tmp_path, model=MODEL, omp_agent_dir=agent_dir, timeout=120)
+    )
+    assert result.error and "timed out" in result.error

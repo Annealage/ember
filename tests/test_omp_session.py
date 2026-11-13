@@ -47,6 +47,7 @@ from annealage_ember.session.base import (
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
+    AgentRetrying,
     AgentRuntimeResolved,
     AgentStatus,
     InputState,
@@ -187,6 +188,12 @@ class FakeRpcClient:
     def on_agent_end(self, listener):
         self._listeners["agent_end"] = listener
 
+    def on_auto_retry_start(self, listener):
+        self._listeners["auto_retry_start"] = listener
+
+    def on_auto_retry_end(self, listener):
+        self._listeners["auto_retry_end"] = listener
+
     def on_ui_request(self, listener):
         self._listeners["ui_request"] = listener
 
@@ -211,6 +218,18 @@ class FakeRpcClient:
 
     def push_message_end(self, message):
         self._listeners["message_end"](SimpleNamespace(message=message))
+
+    def push_auto_retry_start(self, error_message="stream stalled", attempt=1):
+        self._listeners["auto_retry_start"](
+            SimpleNamespace(
+                attempt=attempt, max_attempts=10, delay_ms=2000, error_message=error_message
+            )
+        )
+
+    def push_auto_retry_end(self, success, attempt=1, final_error=None):
+        self._listeners["auto_retry_end"](
+            SimpleNamespace(success=success, attempt=attempt, final_error=final_error)
+        )
 
     def push_tool_execution_start(self, tool_call_id, tool_name, args):
         self._listeners["tool_execution_start"](
@@ -1854,12 +1873,103 @@ async def test_terminal_assistant_error_message_emits_agent_error_and_keeps_usag
         )
 
         usage = await _next_of(recorder, RequestUsage)
+        # Held until omp has said it is not retrying: the turn's end.
+        fake.push_agent_end()
         error = await _next_of(recorder, AgentError)
         assert error.stderr == ("Codex error event: Invalid schema for function create_footprint")
         assert usage.tokens_input == 5
         assert usage.cost_usd == pytest.approx(0.001)
         assert session.agent_status() == AGENT_READY
         assert fake.prompt_calls and len(fake.prompt_calls) == 1
+    finally:
+        await session.close()
+
+
+STALL = "OpenAI completions stream timed out while waiting for the first event"
+
+
+def _errors(recorder):
+    return [e.stderr for e in recorder.all if isinstance(e, AgentError)]
+
+
+@pytest.mark.asyncio
+async def test_an_error_omp_retried_and_recovered_from_is_never_published():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage=STALL))
+        fake.push_agent_end(is_terminal=False)
+        fake.push_auto_retry_start(STALL)
+        fake.push_message_end(_assistant({"input": 9, "output": 3}, stopReason="stop"))
+        fake.push_auto_retry_end(True)
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+        assert _errors(recorder) == []
+        assert [
+            (e.state, e.attempt, e.max_attempts, e.delay_ms)
+            for e in recorder.all
+            if isinstance(e, AgentRetrying)
+        ] == [("waiting", 1, 10, 2000), ("recovered", None, None, None)]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_does_not_recover_publishes_the_error_before_the_turn_ends():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage=STALL))
+        fake.push_agent_end(is_terminal=False)
+        fake.push_auto_retry_start(STALL)
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage="502 bad gateway"))
+        fake.push_auto_retry_end(False, final_error="502 bad gateway")
+        fake.push_agent_end()
+        events = []
+        while not events or not isinstance(events[-1], TurnEnd):
+            events.append(await recorder.next())
+        assert [e.stderr for e in events if isinstance(e, AgentError)] == ["502 bad gateway"]
+        assert [type(e) for e in events if isinstance(e, (AgentError, TurnEnd))] == [
+            AgentError,
+            TurnEnd,
+        ]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_retries_exhausted_with_nothing_held_publishes_omps_final_error():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage=STALL))
+        fake.push_auto_retry_start(STALL)
+        fake.push_auto_retry_end(False, attempt=10, final_error="Retry cancelled")
+        assert (await _next_of(recorder, AgentError)).stderr == "Retry cancelled"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_nobody_retries_is_published_when_the_turn_ends_and_aborts_at_once():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage="400 bad request"))
+        assert _errors(recorder) == []
+        fake.push_agent_end()
+        events = []
+        while not events or not isinstance(events[-1], TurnEnd):
+            events.append(await recorder.next())
+        assert [type(e) for e in events if isinstance(e, (AgentError, TurnEnd))] == [
+            AgentError,
+            TurnEnd,
+        ]
+        await session.submit_turn(_text("two"))
+        fake.push_message_end(
+            _assistant({"input": 1, "output": 0}, errorMessage="aborted", stopReason="aborted")
+        )
+        assert (await _next_of(recorder, AgentError)).stderr == "aborted"
     finally:
         await session.close()
 

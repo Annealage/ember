@@ -591,6 +591,12 @@ class AgentError(AgentEvent):
     reports differently from the raw text; ``"agent_login_missing"`` is a model
     provider login omp does not have (``stderr`` is then a short owner-facing
     sentence, never omp's own text, which names a server path).
+
+    ``will_retry`` is true on an error the backend says it is retrying itself
+    (Codex's ``error`` notification). It is shown, but a run does not count it
+    as the run's error: if the retries fail the backend reports that failure
+    separately. omp does not set it: it announces a retry after the failed
+    message, so ``OmpSession`` holds the error back instead.
     """
 
     kind: ClassVar[str] = "agent_error"
@@ -600,6 +606,29 @@ class AgentError(AgentEvent):
     role_resolution_error: Optional[bool] = None
     interruption_reason: Optional[str] = None
     fault_code: Optional[str] = None
+    will_retry: Optional[bool] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentRetrying(AgentEvent):
+    """The backend is retrying a failed model request itself, or has stopped.
+
+    ``state`` is ``"waiting"`` when a retry has been announced (``attempt`` of
+    ``max_attempts``, after ``delay_ms``), ``"recovered"`` when the retries
+    ended with a request that worked, and ``"failed"`` when they ended without
+    one (the failure is then also an ``AgentError``). The failed request's own
+    error is not part of it: until the turn ends or the retries fail it is
+    held back (``OmpSession._hold_error``), and may be confidential. A host
+    shows this to say the model is busy retrying or loading rather than idle.
+    Only omp emits it.
+    """
+
+    kind: ClassVar[str] = "agent_retrying"
+    state: str
+    attempt: Optional[int] = None
+    max_attempts: Optional[int] = None
+    delay_ms: Optional[int] = None
+    viewer: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -711,6 +740,7 @@ GENERIC_EVENTS = (
     AgentRuntimeResolved,
     SessionReset,
     AgentError,
+    AgentRetrying,
     ReviewChanged,
     Attention,
     UserTurn,

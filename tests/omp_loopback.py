@@ -13,6 +13,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROVIDER = "loop"
@@ -76,6 +77,26 @@ class LoopbackModel:
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.end_headers()
+                if step[0] == "stall":
+                    # Headers sent, then nothing: omp's first-event watchdog fires.
+                    time.sleep(step[1])
+                    self.close_connection = True
+                    return
+                if "messages" in body:
+                    # Chat completions (the "openai-completions" api), text steps only.
+                    chunk = {"id": "c", "object": "chat.completion.chunk", "model": "stub"}
+                    for delta, finish in (
+                        ({"role": "assistant", "content": step[1]}, None),
+                        ({}, "stop"),
+                    ):
+                        payload = dict(
+                            chunk, choices=[{"index": 0, "delta": delta, "finish_reason": finish}]
+                        )
+                        self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 for chunk in outer._events(step, index):
                     self.wfile.write(chunk)
                 self.wfile.flush()
@@ -169,14 +190,16 @@ class LoopbackModel:
         return None
 
 
-def write_agent_dir(port):
-    """A throwaway omp agent dir whose only provider is the loopback model."""
+def write_agent_dir(port, retry=None, settings=None, api="openai-codex-responses"):
+    """A throwaway omp agent dir whose only provider is the loopback model.
+    ``retry`` replaces the default of no retries (omp's ``retry`` settings);
+    ``settings`` adds to the rest of ``config.yml``."""
     directory = tempfile.mkdtemp(prefix="ember-loopback-agent-")
     models = {
         "providers": {
             PROVIDER: {
                 "baseUrl": "http://127.0.0.1:%d" % port,
-                "api": "openai-codex-responses",
+                "api": api,
                 "apiKey": TOKEN_ENV,
                 "models": [
                     {
@@ -193,7 +216,10 @@ def write_agent_dir(port):
     with open(os.path.join(directory, "models.yml"), "w") as handle:
         json.dump(models, handle)
     with open(os.path.join(directory, "config.yml"), "w") as handle:
-        json.dump({"retry": {"enabled": False, "modelFallback": False}}, handle)
+        json.dump(
+            {"retry": retry or {"enabled": False, "modelFallback": False}, **(settings or {})},
+            handle,
+        )
     return directory
 
 
