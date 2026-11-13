@@ -187,7 +187,11 @@ function fieldRow(name, entry, pending, product, options = {}) {
   if (options.configured) input.dataset.configured = "true";
   input.dataset.key = name;
   input.dataset.valueType = entry.type;
-  if (!entry.editable) input.disabled = true;
+  const lockedReason = entry.reason || "This setting cannot be changed here.";
+  if (!entry.editable) {
+    input.disabled = true;
+    input.title = lockedReason;
+  }
   row.appendChild(input);
   if (options.models) {
     const custom = document.createElement("input");
@@ -196,6 +200,7 @@ function fieldRow(name, entry, pending, product, options = {}) {
     custom.placeholder = "provider/model";
     custom.hidden = true;
     custom.disabled = !entry.editable;
+    if (!entry.editable) custom.title = lockedReason;
     input.addEventListener("change", () => {
       custom.hidden = input.value !== "__other__";
     });
@@ -263,23 +268,14 @@ function modelSettingsBlock(payload, confirmRow = null) {
   const runtime = document.createElement("p");
   runtime.className = "setnote";
   const actual = controls.runtime;
+  const conversation = controls.session_id ? "A conversation is running." : "No conversation has started.";
   runtime.textContent = actual
     ? "Running now: " + [
       actual.backend, actual.provider, actual.model,
       actual.effort ? "effort " + actual.effort : null,
-    ].filter(Boolean).join(", ")
-    : "Running now: not reported.";
+    ].filter(Boolean).join(", ") + ". " + conversation
+    : "Running now: not reported. " + conversation;
   block.appendChild(runtime);
-  const runtimeHelp = document.createElement("p");
-  runtimeHelp.className = "sethelp";
-  runtimeHelp.textContent = actual
-    ? "As reported by the backend."
-    : "Saved selections are not a report of what is running.";
-  block.appendChild(runtimeHelp);
-  const session = document.createElement("p");
-  session.className = "setnote";
-  session.textContent = controls.session_id ? "A conversation is running." : "No conversation has started.";
-  block.appendChild(session);
 
   const profile = controls.profile;
   const profileEntry = profile && payload.settings[profile.key];
@@ -358,6 +354,9 @@ function modelSettingsBlock(payload, confirmRow = null) {
     const heading = document.createElement("h4");
     heading.textContent = title;
     block.appendChild(heading);
+    const fields = document.createElement("div");
+    fields.className = "setpair";
+    block.appendChild(fields);
     for (const kind of ["model", "effort"]) {
       const name = spec[kind];
       const entry = payload.settings[name];
@@ -366,7 +365,7 @@ function modelSettingsBlock(payload, confirmRow = null) {
       const choices = kind === "effort" && controls.efforts
         ? [...new Set([...controls.efforts, saved ? saved.value : entry.value].filter(Boolean))]
         : null;
-      block.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
+      fields.appendChild(fieldRow(name, choices ? { ...entry, choices, nullable: true } : entry,
         saved, payload.product || {}, {
           label: KIND_LABELS[kind], choiceKind: kind === "effort" ? "effort" : undefined,
           models: kind === "model" ? (controls.models || []) : null, inherits, configured: true, compact: true, live,
