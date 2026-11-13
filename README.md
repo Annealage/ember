@@ -702,6 +702,14 @@ unknown when its loading endpoint or model identity is unavailable. Callback
 errors end the run; the whole-run `timeout` still applies while the callback
 or model is loading. Without `work_timeout`, the callback is not called.
 
+`unknown_readiness_timeout` optionally bounds inactivity in seconds while
+readiness is unknown before that first model event. A session event or tool
+activity resets the interval; known loading pauses and resets it. Expiry uses
+the same `work_interval` interruption and recovery path as `work_timeout`.
+The default `None` leaves the unknown interval unbounded by inactivity, though
+the hard deadline still applies. This option only applies with both
+`work_timeout` and `model_readiness`.
+
 The OMP recovery path refuses new host tool calls, lets existing handlers
 **and their native tool results** settle before aborting, then requires an
 acknowledged abort, the original submission to settle and a true terminal turn

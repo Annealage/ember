@@ -52,8 +52,8 @@ cancelled it (``CancelledError``, after the session is closed).
 
 Model loading. An optional ``model_readiness`` callback can pause the inactivity
 window while the host reports that the model is loading. The whole-run deadline
-remains active. If readiness is unknown, the first model text or tool-use event
-starts the window; transport and startup events do not count as model output.
+remains active. Unknown readiness waits for the first model text or tool-use
+event unless the host supplies an initial inactivity bound.
 
 When a run ends early. An unrecovered timeout or a cancel ends the run: the
 broker refuses any further call, each tool handler starts refusing ("this run has ended") and
@@ -870,7 +870,9 @@ async def _timeout_callback(callback, context):
     return text
 
 
-async def _wait_while_active(settled, run: _Run, work_timeout, model_readiness=None) -> None:
+async def _wait_while_active(
+    settled, run: _Run, work_timeout, model_readiness=None, unknown_readiness_timeout=None
+) -> None:
     """Wait for settlement or an inactivity interval, accounting for model loading."""
     if work_timeout is None:
         await asyncio.wait({settled})
@@ -896,19 +898,22 @@ async def _wait_while_active(settled, run: _Run, work_timeout, model_readiness=N
     model_event = asyncio.create_task(run.model_activity.wait()) if poller else None
     changed_event = asyncio.create_task(changed.wait()) if poller else None
     run.last_active = time.monotonic()
-    was_paused = False
+    previous_mode = None
     try:
         while True:
             if poller and poller.done():
                 poller.result()
-            paused = readiness in ("pending", "loading") or (
-                readiness == "unknown" and not run.model_activity.is_set()
-            )
+            if readiness in ("pending", "loading"):
+                mode, interval = "paused", None
+            elif readiness == "unknown" and not run.model_activity.is_set():
+                mode, interval = "unknown", unknown_readiness_timeout
+            else:
+                mode, interval = "work", work_timeout
             now = time.monotonic()
-            if paused or was_paused or run._inflight or run._pending_calls:
+            if mode != previous_mode or interval is None or run._inflight or run._pending_calls:
                 run.last_active = now
-            was_paused = paused
-            remaining = None if paused else work_timeout - (now - run.last_active)
+            previous_mode = mode
+            remaining = None if interval is None else interval - (now - run.last_active)
             if remaining is not None and remaining <= 0:
                 return
             waiters = {settled}
@@ -940,6 +945,7 @@ async def _drive(
     *,
     work_timeout=None,
     model_readiness=None,
+    unknown_readiness_timeout=None,
     interrupt_timeout=10,
     on_timeout=None,
     max_timeout_recoveries=0,
@@ -1004,7 +1010,9 @@ async def _drive(
     try:
         while True:
             settled = asyncio.ensure_future(boundary())
-            await _wait_while_active(settled, run, work_timeout, model_readiness)
+            await _wait_while_active(
+                settled, run, work_timeout, model_readiness, unknown_readiness_timeout
+            )
             if not settled.done():
                 # Refuse new host calls while allowing successful writes already
                 # running to finish. Never cancel/replay them to recover time.
@@ -1282,6 +1290,7 @@ async def run_prompt(
     max_followups=0,
     work_timeout=None,
     model_readiness=None,
+    unknown_readiness_timeout=None,
     interrupt_timeout=10,
     on_timeout=None,
     max_timeout_recoveries=0,
@@ -1321,8 +1330,13 @@ async def run_prompt(
     ``"loading"``, ``"ready"`` or ``"unknown"``. It is polled every five seconds
     while a turn is active. Loading pauses the inactivity window; ready starts a
     fresh window. Unknown pauses it until the first model text or tool-use event,
-    ignoring startup and input acknowledgement events. Callback errors fail the
-    run. The hard total deadline remains in force, including during the callback.
+    ignoring startup and input acknowledgement events. ``unknown_readiness_timeout``
+    optionally bounds inactivity in seconds while readiness is unknown before that
+    first event. Entering loading resets this interval; expiry follows the normal
+    ``work_interval`` interruption path. Its default ``None`` leaves unknown
+    unbounded apart from the hard deadline. It only applies when ``work_timeout``
+    and ``model_readiness`` are set. Callback errors fail the run. The hard total
+    deadline remains in force, including during the callback.
 
     ``on_timeout(TimeoutContext) -> str | None`` may return a diagnostic user
     prompt ONLY after a ``work_interval`` with ``interruption="safe"``. At most
@@ -1492,8 +1506,12 @@ async def run_prompt(
         system,
         system_mode,
     )
-    for name, value in (("work_timeout", work_timeout), ("interrupt_timeout", interrupt_timeout)):
-        if value is None and name == "work_timeout":
+    for name, value in (
+        ("work_timeout", work_timeout),
+        ("unknown_readiness_timeout", unknown_readiness_timeout),
+        ("interrupt_timeout", interrupt_timeout),
+    ):
+        if value is None and name in ("work_timeout", "unknown_readiness_timeout"):
             continue
         if (
             isinstance(value, bool)
@@ -1657,6 +1675,7 @@ async def run_prompt(
                     max_followups,
                     work_timeout=work_timeout,
                     model_readiness=model_readiness,
+                    unknown_readiness_timeout=unknown_readiness_timeout,
                     interrupt_timeout=interrupt_timeout,
                     on_timeout=on_timeout,
                     max_timeout_recoveries=max_timeout_recoveries,

@@ -243,6 +243,114 @@ async def test_unknown_readiness_waits_for_model_output_not_input_events(monkeyp
     assert built.session.interrupted == 1 and contexts[0].kind == "work_interval"
 
 
+async def test_unknown_readiness_expires_as_work_interval_before_output(monkeypatch, tmp_path):
+    async def readiness():
+        return "unknown"
+
+    async def script(session):
+        pass
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            work_timeout=1,
+            unknown_readiness_timeout=0.03,
+            model_readiness=readiness,
+            on_timeout=contexts.append,
+        ),
+    )
+    assert result.timeout_kind == "work_interval" and result.error == "timeout"
+    assert built.session.interrupted == 1 and contexts[0].kind == "work_interval"
+
+
+async def test_session_activity_resets_unknown_inactivity_window(monkeypatch, tmp_path):
+    from annealage_ember.session.base import InputState
+
+    async def readiness():
+        return "unknown"
+
+    async def script(session):
+        for _ in range(3):
+            await asyncio.sleep(0.03)
+            session.emit(InputState("input", 1, "received"))
+        await finish(session, text=("completed",))
+
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            work_timeout=0.01,
+            unknown_readiness_timeout=0.06,
+            model_readiness=readiness,
+        ),
+    )
+    assert result.error is None and result.text == "completed"
+    assert built.session.interrupted == 0
+
+
+async def test_known_loading_resets_unknown_readiness_interval(monkeypatch, tmp_path):
+    monkeypatch.setattr(headless, "_MODEL_READINESS_POLL_SECONDS", 0.005)
+    mode = "unknown"
+
+    async def readiness():
+        return mode
+
+    async def script(session):
+        nonlocal mode
+        await asyncio.sleep(0.04)
+        mode = "loading"
+        await asyncio.sleep(0.12)
+        assert session.interrupted == 0
+        mode = "unknown"
+        await asyncio.sleep(0.04)
+        assert session.interrupted == 0
+        await finish(session, text=("completed",))
+
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            work_timeout=0.03,
+            unknown_readiness_timeout=0.08,
+            model_readiness=readiness,
+        ),
+    )
+    assert result.error is None and result.text == "completed"
+    assert built.session.interrupted == 0
+
+
+async def test_unknown_readiness_timeout_yields_to_output_and_work_window(monkeypatch, tmp_path):
+    async def readiness():
+        return "unknown"
+
+    async def script(session):
+        await asyncio.sleep(0.02)
+        session.emit(TextDelta(turn=1, text="first"))
+
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "go",
+        **make_args(
+            tmp_path,
+            work_timeout=0.03,
+            unknown_readiness_timeout=1,
+            model_readiness=readiness,
+        ),
+    )
+    assert result.timeout_kind == "work_interval" and built.session.interrupted == 1
+
+
+@pytest.mark.parametrize("value", (0, -1, float("inf"), float("nan"), True, "5"))
+async def test_unknown_readiness_timeout_rejects_invalid_values(tmp_path, value):
+    with pytest.raises(ValueError, match="unknown_readiness_timeout"):
+        await run_prompt("go", **make_args(tmp_path, unknown_readiness_timeout=value))
+
+
 @pytest.mark.parametrize("mode", ("loading", "unknown", "stalled_callback"))
 async def test_hard_deadline_wins_while_readiness_is_paused(monkeypatch, tmp_path, mode):
     async def readiness():
@@ -261,6 +369,7 @@ async def test_hard_deadline_wins_while_readiness_is_paused(monkeypatch, tmp_pat
             tmp_path,
             timeout=0.08,
             work_timeout=0.01,
+            unknown_readiness_timeout=0.01 if mode == "loading" else None,
             model_readiness=readiness,
             on_timeout=contexts.append,
         ),

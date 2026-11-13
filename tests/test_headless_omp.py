@@ -1057,7 +1057,9 @@ async def test_owned_abort_never_hides_failed_ack_missing_boundary_or_provider_e
         await native_submit(session, *args, **kwargs)
         submitted.set()
 
-    async def expire_after_submission(settled, run, window, model_readiness=None):
+    async def expire_after_submission(
+        settled, run, window, model_readiness=None, unknown_readiness_timeout=None
+    ):
         assert window == work_timeout
         await submitted.wait()
 
