@@ -16,7 +16,6 @@ import dataclasses
 import re
 
 import pytest
-from test_omp_session import FakeRpcClient, _tool_table
 from test_turn_frames import RecordingSocket, StubRegistry, _Conn, _logged
 from test_turn_images import FakeTransport, _png_bytes
 from toy_product import TOY
@@ -27,8 +26,6 @@ from annealage_ember.protocol import MAX_CONTEXT_BLOCKS, PROTOCOL_VERSION, valid
 from annealage_ember.session.base import AGENT_READY
 from annealage_ember.session.events import EventLog, render_transcript
 from annealage_ember.session.fake import FakeSession
-from annealage_ember.session.omp import OmpSession
-from annealage_ember.session.permissions import PermissionBroker
 from annealage_ember.session.sdk import SdkSession
 from annealage_ember.turn_context import ContextRefused, agent_blocks
 from annealage_ember.viewers import ViewerBus
@@ -308,6 +305,12 @@ async def test_the_claude_backend_receives_the_context_in_the_same_user_turn(
 
 @pytest.mark.asyncio
 async def test_the_omp_backend_receives_the_context_in_the_same_prompt(tmp_path, swap_product):
+    pytest.importorskip("omp_rpc")
+    from test_omp_session import FakeRpcClient, _tool_table
+
+    from annealage_ember.session.omp import OmpSession
+    from annealage_ember.session.permissions import PermissionBroker
+
     swap_product(dataclasses.replace(TOY, resolve_context=_resolver()))
     holder = {}
 
