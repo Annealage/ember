@@ -11,19 +11,16 @@
  * `agentTitles` lets the product say what keeps working without an agent,
  * which only it knows.
  *
- * Model text is never inserted as HTML. Every value that came from the
- * agent or from a tool, a tool name, a tool's JSON input, a tool's result
+ * Model text is never inserted as HTML unchecked. Every value that came from
+ * the agent or from a tool, a tool name, a tool's JSON input, a tool's result
  * text, a permission request's fields, a banner's text, is written with
  * `.textContent`, which cannot be interpreted as markup no matter what it
  * contains. The one exception is the assistant's own free-form turn text,
- * which is allowed a small, fixed set of inline styles; `renderModelText`
- * below is the only place this module ever assigns `.innerHTML`, and it
- * only ever does so after `escapeHtml` has run over the raw string first,
- * so every character that could open a tag has already become an entity
- * before any of the markdown-style regexes see it. Each regex wraps an
- * already-escaped substring in a fixed literal tag; none of them re-reads
- * or re-matches text a previous one inserted, so there is no path back
- * from "escaped text" to "text a later step interprets as markup".
+ * which `markdown.js` renders as markdown (tables, lists, headings, links,
+ * code) and as a fixed allowlist of HTML tags; `renderModelText` below is the
+ * only place this module ever assigns `.innerHTML`, and `markdown.js` explains
+ * why its output cannot carry anything the model wrote that is not escaped
+ * text or an allowlisted tag with rebuilt attributes.
  *
  * Reconciliation uses a Map keyed by a stable id
  * (turn number, tool_use_id, permission request_id) so a re-render updates
@@ -49,6 +46,7 @@ import { store } from "./store.js";
 import { discardDocument, startUploadAction, uploadDocument, uploadImage } from "./uploads.js";
 import { toast } from "./ui.js";
 import { appUrl } from "./url.js";
+import { renderMarkdown } from "./markdown.js";
 import { whoami, withToken } from "./ws.js";
 
 // The three image types the upload route accepts (files.py's
@@ -130,53 +128,7 @@ const OUTCOME_TEXT = Object.freeze({
 // running out of time or of viewers.
 const HUMAN_DECISIONS = new Set(["allow", "allow_always", "deny"]);
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-// Applies the non-fence inline styles (inline code, bold, italic, newline)
-// to a string that has already been through escapeHtml. Order matters:
-// inline code runs first so a literal `*` or `**` inside a code span is
-// never read as emphasis, and bold runs before italic so `**x**` is not
-// left as an unmatched pair of single asterisks once the double-asterisk
-// match is gone.
-function renderInline(escaped) {
-  return escaped
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\n/g, "<br>");
-}
-
-/**
- * Escapes `text`, then applies a fixed, small set of transforms: fenced
- * code blocks become `<pre>`, and within the rest, inline code, bold,
- * italic and newlines get their usual HTML equivalents. This is a
- * hand-written renderer over already-escaped text, not a markdown parser
- * and not `innerHTML` of the model's own output; see this module's header
- * comment for why that distinction is the whole point of it.
- */
-function renderModelText(text) {
-  const escaped = escapeHtml(text);
-  const fenceRe = /```[^\n`]*\n([\s\S]*?)```/g;
-  const segments = [];
-  let lastIndex = 0;
-  let m;
-  while ((m = fenceRe.exec(escaped))) {
-    segments.push({ code: false, text: escaped.slice(lastIndex, m.index) });
-    segments.push({ code: true, text: m[1] });
-    lastIndex = m.index + m[0].length;
-  }
-  segments.push({ code: false, text: escaped.slice(lastIndex) });
-  return segments
-    .map((seg) => (seg.code ? '<pre class="code">' + seg.text + "</pre>" : renderInline(seg.text)))
-    .join("");
-}
+const renderModelText = renderMarkdown;
 
 // Ordinary Claude Code tools (Bash, Edit, Write, ...) keep their plain
 // name; an in-process MCP tool arrives as `mcp__<server>__<tool>` and is
