@@ -23,6 +23,20 @@ def _resumable_sdk_id(state_project_dir, session_id):
     return info.sdk_session_id if info is not None else None
 
 
+def _scope_session_tools(bus, serve_dir):
+    """What ``Product.session_tools`` names for this omp session, as a frozenset
+    (``None`` when the product has no such hook or it says "everything"), and
+    ``bus.tool_scope`` set to admit exactly those names (``None`` for none)."""
+    hook = product.current().session_tools
+    names = hook(bus, serve_dir) if hook is not None else None
+    if names is None:
+        bus.tool_scope = None
+        return None
+    names = frozenset(names)
+    bus.tool_scope = names.__contains__
+    return names
+
+
 def build_session(
     backend,
     on_event,
@@ -137,9 +151,17 @@ def build_session(
     context_hook = product.current().session_context
     context = context_hook(bus, serve_dir) if context_hook is not None else None
     remote_instructions = bus.tools.remote_instructions if bus.tools is not None else None
+    # Product.omp_base_prompt: omp only. A text replaces omp's own base system
+    # prompt, the owner-wording rule first and the addition after it.
+    base_prompt = None
+    if backend == "omp":
+        base_prompt_hook = product.current().omp_base_prompt
+        base_prompt = base_prompt_hook(bus, serve_dir) if base_prompt_hook is not None else None
     instructions = "\n\n".join(
-        p for p in (product.OWNER_WORDING_RULE, context, remote_instructions) if p
+        p for p in (product.OWNER_WORDING_RULE, base_prompt, context, remote_instructions) if p
     )
+    # No tool scope unless the omp branch below sets one for this session.
+    bus.tool_scope = None
 
     if backend == "codex":
         # Imported only in this branch, per the module docstring's own
@@ -186,6 +208,7 @@ def build_session(
             sessions.set_omp_session_file(state_project_dir, session_id, path)
 
         info = sessions.get_session_info(state_project_dir, session_id) if resumed else None
+        session_tool_names = _scope_session_tools(bus, serve_dir)
         return OmpSession(
             on_event,
             cwd=serve_dir,
@@ -195,12 +218,16 @@ def build_session(
             thinking=settings["effort"],
             base_url=settings["omp_base_url"],
             api_key=settings["omp_api_key"],
+            # Product.omp_base_prompt replaces omp's own base prompt with the
+            # product's; ``instructions`` then already begins with it.
+            instructions_mode="replace" if base_prompt else "append",
             # Mirrors SdkSession's mcp_servers=bus.tools.mcp_servers:
             # a snapshot taken once, at construction, rather than a live
             # reference to the tool server this run already built. The
             # product's tools by their own names, each remote's as
-            # <remote>__<tool>.
-            tool_table=bus.tools.host_tool_table(),
+            # <remote>__<tool>; only the ones Product.session_tools named,
+            # when it named any (the same set is bus.tool_scope).
+            tool_table=bus.tools.host_tool_table(only=session_tool_names),
             on_sdk_session_id=_record_sdk_id,
             instructions=instructions,
             turn=getattr(bus, "turn", 0),

@@ -428,8 +428,10 @@ _XD_SETTINGS = {"tools": {"xdev": True, "xdevDocs": "catalog"}}
 #: profile's and the project's settings (a project's ``.omp/settings`` outranks the
 #: agent directory's ``config.yml``, so only the overlay holds). It is the second layer:
 #: omp runs in a directory of its own (the module docstring), where there is no project
-#: config to load.
-_BASE_SETTINGS = {"mcp": {"enableProjectConfig": False}}
+#: config to load. ``tools.intentTracing`` is omp's default-on ``i`` field, a free-text
+#: "intent" argument it adds to every tool schema (about 57 characters of schema per
+#: tool, in a table the model reads in every request); nothing here reads the answer.
+_BASE_SETTINGS = {"mcp": {"enableProjectConfig": False}, "tools": {"intentTracing": False}}
 
 # How long the ``compact`` request is waited for: it summarises the whole conversation, which
 # outlasts ``RpcClient``'s 30-second default for ordinary requests.
@@ -1008,7 +1010,10 @@ class OmpSession:
         """Register ``tool_table`` (``ToolServer.host_tool_table()``'s shape)
         as this session's host tools in place of the old set, through omp's
         ``set_host_tools``, which applies before the next model call. False
-        when `omp` is not running to take them. A ``deferred_tools`` session never
+        when `omp` is not running to take them. A product that scopes its tools
+        (``Product.session_tools``) hands over ``ToolServer.scoped_host_tool_table()``,
+        so the table stays inside ``bus.tool_scope``, which refuses a call outside it
+        at execute time regardless. A ``deferred_tools`` session never
         takes them: its guard holds the device names it was launched with, so a device
         added later would be refused and one removed would stay allowed. The table is
         left as launched, before or after the session starts, and the tools arrive with

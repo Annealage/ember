@@ -159,6 +159,36 @@ parentheses are Annealage Mesh's, as an example:
     rule. The
     ``initialize`` instructions of each remote MCP server the tool server
     reached follow it, each under a heading naming the server.
+``session_tools``
+    ``session_tools(bus, serve_dir) -> Collection[str] | None``: the tools this
+    session's agent is to be given, by host name (the product's own tools by
+    their bare names, a remote's as ``<remote>__<tool>``: the keys of
+    ``ToolServer.host_tool_table()``), when the product does not want the
+    whole table in front of every agent. Called once per omp session by
+    ``launch.build_session``, after the tool server exists, in the same place
+    ``session_context`` is. The session is then handed
+    ``ToolServer.host_tool_table(only=...)``, and ``bus.tool_scope`` is set to
+    that name set, so a call to a tool outside it (``/mcp``, history that
+    names a removed tool) is refused at execute time instead of run, and a
+    remote reached late (``app.retry_remotes``) is handed to the session
+    only if the set names it. Names that are not tools are ignored.
+    ``None`` (the default, and what the hook returns for "everything") keeps
+    the whole table and no scope. Only omp takes it: a Claude session's SDK
+    servers and a Codex session's bridge are fixed whole when they start, so
+    those backends ignore the hook. A sub-agent a product runs on the same
+    wrapped handlers has a scope of its own: ``tools.with_scope``.
+``omp_base_prompt``
+    ``omp_base_prompt(bus, serve_dir) -> str | None``: a base system prompt
+    that replaces omp's own (which runs to several thousand tokens, most of it
+    guidance for the built-in tools and a tool inventory a host-tools-only
+    session does not use). Called once per omp session by
+    ``launch.build_session`` beside ``session_context``. A text makes the
+    session's whole system prompt, ``OWNER_WORDING_RULE`` first, then this
+    text, then ``session_context`` and the remote servers' instructions, and
+    launches omp with ``--system-prompt`` instead of ``--append-system-prompt``
+    (``instructions_mode="replace"``). The product then owns what omp's prompt
+    said about how to act. ``None`` (the default) leaves omp's prompt and
+    appends the addition. Claude and Codex ignore it.
 ``resolve_context``
     ``resolve_context(bus, serve_dir, data) -> ResolvedContext``: what one
     context attachment means to the agent. A product page attaches context to
@@ -243,6 +273,8 @@ class Product:
     doctor_command: Optional[str] = None
     codex_install_hint: Optional[str] = None
     session_context: Optional[Callable[..., Any]] = None
+    session_tools: Optional[Callable[..., Any]] = None
+    omp_base_prompt: Optional[Callable[..., Any]] = None
     resolve_context: Optional[Callable[..., Any]] = None
 
     # Whether a browser may change the run's backend/model/effort through

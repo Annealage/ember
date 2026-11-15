@@ -2044,7 +2044,9 @@ def _omp_launch(tmp_path, recorder, *, resumed, base_url, effort=None):
     sid = sessions.resolve_continue(tmp_path) if resumed else sessions.create_session(tmp_path)
     sessions.record_last_session(tmp_path, sid)
     tools = SimpleNamespace(
-        host_tool_table=_tool_table, never_remembered=(), remote_instructions=None
+        host_tool_table=lambda only=None: _tool_table(),
+        never_remembered=(),
+        remote_instructions=None,
     )
     return launch.build_session(
         "omp",
@@ -3624,7 +3626,7 @@ async def test_a_deferred_session_launches_omp_with_the_settings_it_needs_outran
         overlay = Path(args[args.index("--config") + 1])
         assert json.loads(overlay.read_text()) == {
             "mcp": {"enableProjectConfig": False},
-            "tools": {"xdev": True, "xdevDocs": "catalog"},
+            "tools": {"intentTracing": False, "xdev": True, "xdevDocs": "catalog"},
         }
         assert "--no-extensions" in args and "-e" in args
     finally:
@@ -3710,5 +3712,204 @@ async def test_a_replaced_prompt_is_given_the_generic_xd_guidance_and_an_appende
             assert "lookup" not in omp_module.XD_REPLACE_NOTE
         else:
             assert client.kwargs["append_system_prompt"] == "Be a reviewer."
+    finally:
+        await session.close()
+
+
+# ---------------------------------------------------------------------------
+# Product.session_tools, Product.omp_base_prompt, tools.intentTracing
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTools:
+    """The tool server's surface ``launch.build_session`` reads, recording the
+    ``only`` it was asked for."""
+
+    never_remembered = ()
+    remote_instructions = "## Instructions from the fake MCP server\n\nUse lookup."
+
+    def __init__(self):
+        self.only_seen = []
+
+    def host_tool_table(self, only=None):
+        self.only_seen.append(None if only is None else frozenset(only))
+        table = _tool_table()
+        return table if only is None else {n: s for n, s in table.items() if n in only}
+
+
+def _hook_launch(tmp_path, swap_product, backend="omp", **hooks):
+    """``launch.build_session`` over a toy product carrying ``hooks``."""
+    from toy_product import TOY
+
+    swap_product(dataclasses.replace(TOY, **hooks))
+    sid = sessions.create_session(tmp_path)
+    tools = _RecordingTools()
+    bus = SimpleNamespace(tools=tools, broker=None, url="http://127.0.0.1:8765/")
+    session = launch.build_session(
+        backend,
+        EventRecorder(),
+        bus=bus,
+        serve_dir=tmp_path,
+        session_id=sid,
+        resumed=False,
+        settings={
+            "model": None,
+            "effort": None,
+            "omp_base_url": "http://127.0.0.1:11434/v1",
+            "omp_api_key": None,
+            "approval_timeout": 300,
+            "permission_mode": "default",
+        },
+        mcp_host="127.0.0.1",
+        mcp_port=8765,
+        agent_token="agent-token",
+    )
+    return session, bus, tools
+
+
+def test_a_product_with_no_session_tools_hook_gets_the_whole_table_and_no_scope(
+    tmp_path, swap_product
+):
+    session, bus, tools = _hook_launch(tmp_path, swap_product)
+    assert tools.only_seen == [None]
+    assert bus.tool_scope is None
+    assert set(session._tool_table) == {"get_view", "add_note"}
+    assert session._instructions_mode == "append"
+
+
+def test_session_tools_scopes_the_omp_table_and_sets_the_bus_scope(tmp_path, swap_product):
+    calls = []
+
+    def session_tools(bus, serve_dir):
+        calls.append((bus, serve_dir))
+        return ["get_view", "not_a_tool"]
+
+    session, bus, tools = _hook_launch(tmp_path, swap_product, session_tools=session_tools)
+    assert calls == [(bus, tmp_path)]
+    assert tools.only_seen == [frozenset({"get_view", "not_a_tool"})]
+    assert set(session._tool_table) == {"get_view"}
+    assert bus.tool_scope("get_view") is True
+    assert bus.tool_scope("add_note") is False
+
+
+def test_session_tools_returning_none_means_everything(tmp_path, swap_product):
+    session, bus, tools = _hook_launch(tmp_path, swap_product, session_tools=lambda b, d: None)
+    assert tools.only_seen == [None]
+    assert bus.tool_scope is None
+    assert set(session._tool_table) == {"get_view", "add_note"}
+
+
+def test_session_tools_is_omp_only_and_a_later_backend_clears_the_scope(tmp_path, swap_product):
+    from toy_product import TOY
+
+    def session_tools(bus, serve_dir):
+        raise AssertionError("only an omp session takes a tool scope")
+
+    swap_product(dataclasses.replace(TOY, session_tools=session_tools))
+    sid = sessions.create_session(tmp_path)
+    bus = SimpleNamespace(
+        tools=SimpleNamespace(
+            mcp_servers={},
+            pre_allowed=(),
+            never_remembered=(),
+            remote_instructions=None,
+            remotes=(),
+        ),
+        broker=None,
+        url="http://127.0.0.1:8765/",
+        tool_scope=lambda name: False,
+    )
+    swap_product(dataclasses.replace(TOY, session_tools=session_tools))
+    launch.build_session(
+        "claude",
+        EventRecorder(),
+        bus=bus,
+        serve_dir=tmp_path,
+        session_id=sid,
+        resumed=False,
+        settings={
+            "model": None,
+            "effort": None,
+            "permission_mode": "default",
+            "approval_timeout": 300,
+        },
+        mcp_host="127.0.0.1",
+        mcp_port=8765,
+        agent_token="agent-token",
+    )
+    assert bus.tool_scope is None
+
+
+@pytest.mark.asyncio
+async def test_omp_base_prompt_replaces_omps_prompt_with_the_rule_first(tmp_path, swap_product):
+    from annealage_ember.product import OWNER_WORDING_RULE
+
+    session, _bus, _tools = _hook_launch(
+        tmp_path,
+        swap_product,
+        omp_base_prompt=lambda bus, serve_dir: "You are the short product prompt.",
+        session_context=lambda bus, serve_dir: "The design under review is X.",
+    )
+    built = []
+
+    def factory(**kwargs):
+        built.append(FakeRpcClient(**kwargs))
+        return built[-1]
+
+    session._client_factory = factory
+    await session.start()
+    try:
+        (client,) = built
+        assert "append_system_prompt" not in client.kwargs
+        args = client.kwargs["extra_args"]
+        text = Path(args[args.index("--system-prompt") + 1]).read_text()
+        assert text.startswith(
+            "\n\n".join(
+                (
+                    OWNER_WORDING_RULE,
+                    "You are the short product prompt.",
+                    "The design under review is X.",
+                )
+            )
+        )
+        assert "Use lookup." in text  # the remote's instructions still follow
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_without_omp_base_prompt_the_addition_is_appended_to_omps_prompt(
+    tmp_path, swap_product
+):
+    session, _bus, _tools = _hook_launch(
+        tmp_path, swap_product, session_context=lambda bus, serve_dir: "The design is X."
+    )
+    built = []
+
+    def factory(**kwargs):
+        built.append(FakeRpcClient(**kwargs))
+        return built[-1]
+
+    session._client_factory = factory
+    await session.start()
+    try:
+        (client,) = built
+        assert "The design is X." in client.kwargs["append_system_prompt"]
+        assert "--system-prompt" not in client.kwargs["extra_args"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_every_omp_run_turns_intent_tracing_off_through_the_overlay():
+    assert omp_module._BASE_SETTINGS["tools"] == {"intentTracing": False}
+    session, fake, _recorder, _broker = await _started_session()
+    try:
+        args = fake.kwargs["extra_args"]
+        overlay = Path(args[args.index("--config") + 1])
+        assert json.loads(overlay.read_text()) == {
+            "mcp": {"enableProjectConfig": False},
+            "tools": {"intentTracing": False},
+        }
     finally:
         await session.close()

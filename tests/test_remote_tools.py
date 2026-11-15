@@ -820,6 +820,72 @@ def _unreachable_at_first(monkeypatch, fake, tmp_path):
     return bus, tools
 
 
+# ---------------------------------------------------------------------------
+# a per-session tool scope over a remote's tools
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_host_tool_table_only_is_an_allow_list_over_a_remotes_tools(fake, bus, tmp_path):
+    tools = _tools(bus, tmp_path, _fake(fake))
+    table = tools.host_tool_table(only={"fake__lookup", "fake__focus", "list_notes", "lookup"})
+    # Remote tools are named by their host name; a bare remote name is not one.
+    assert set(table) == {"fake__lookup", "fake__focus", "list_notes"}
+    assert tools.host_tool_table(only={"list_notes"}).keys() == {"list_notes"}
+    assert {"fake__%s" % name for name in PROXIED} <= set(tools.host_tool_table())
+
+
+@pytest.mark.asyncio
+async def test_hosted_mode_drops_remote_tools_the_declaration_has_no_operation_for(
+    fake, bus, tmp_path
+):
+    bus.hosted_mode = True
+    bus.hosted_tool_ops = {
+        "mcp__toy__list_notes": "project.read",
+        "mcp__fake__lookup": "project.read",
+    }
+    tools = _tools(bus, tmp_path, _fake(fake))
+    assert set(tools.host_tool_table()) == {"list_notes", "fake__lookup"}
+    # The bare-name routes (/mcp/<remote>) are not the host table.
+    assert PROXIED <= set(tools.remote_tables()["fake"])
+
+
+@pytest.mark.asyncio
+async def test_a_remote_tool_outside_the_scope_is_refused_and_never_called(fake, bus, tmp_path):
+    tools = _tools(bus, tmp_path, _fake(fake))
+    bus.tool_scope = frozenset({"list_notes", "fake__lookup"}).__contains__
+    refused = await tools.remote_tables()["fake"]["picture"].handler({})
+    assert refused["is_error"] is True
+    text = _text(refused)
+    assert "fake__picture" in text and "not part of this agent's work" in text
+    allowed = await tools.remote_tables()["fake"]["lookup"].handler({"query": "RP2040"})
+    assert not allowed.get("is_error")
+    assert "picture" not in fake.calls and "lookup" in fake.calls
+
+
+@pytest.mark.asyncio
+async def test_retry_hands_an_omp_session_only_the_tools_the_scope_admits(
+    fake, tmp_path, monkeypatch
+):
+    from annealage_ember import app as app_module
+
+    class _OmpLike:
+        def __init__(self):
+            self.tables = []
+
+        async def set_tool_table(self, table):
+            self.tables.append(table)
+            return True
+
+    bus, tools = _unreachable_at_first(monkeypatch, fake, tmp_path)
+    bus.tool_scope = frozenset({"list_notes", "fake__lookup", "no_such_tool"}).__contains__
+    session = _OmpLike()
+    bus.first_turn.set()
+    await asyncio.wait_for(app_module.retry_remotes(tools, bus, session, interval=60), 15)
+    (table,) = session.tables
+    assert set(table) == {"list_notes", "fake__lookup"}
+
+
 @pytest.mark.asyncio
 async def test_a_remote_unreachable_at_startup_is_reached_by_reconnect(
     fake, tmp_path, monkeypatch, capsys

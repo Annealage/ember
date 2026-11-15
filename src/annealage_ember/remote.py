@@ -106,6 +106,7 @@ from .tools import (
     _record_stage,
     _wrap,
     fail,
+    host_tool_name,
     namespaced,
 )
 
@@ -387,6 +388,7 @@ def connect(
                     trusted_schema=False,
                     call_recorder=call_recorder,
                     server_name=server.name,
+                    scope_name=host_tool_name(server.name, tool.name),
                 )
             )
         tools = tuple(tools)

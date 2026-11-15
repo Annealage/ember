@@ -707,6 +707,44 @@ def _verify(tools, grading):
 
 
 _SDK_CALL = contextvars.ContextVar("ember_sdk_call", default=None)
+
+
+# What the current tool call's ``execute`` reads as the tool scope instead of
+# ``bus.tool_scope`` (``with_scope``). The unset marker is "use the bus's".
+_UNSET = object()
+_SCOPE_OVERRIDE = contextvars.ContextVar("ember_tool_scope", default=_UNSET)
+
+
+def with_scope(handler, scope):
+    """``handler`` (a ``_wrap``-ped tool handler) made to run under ``scope``
+    instead of ``bus.tool_scope``: ``None`` for no restriction, else a
+    ``name -> bool`` callable over host tool names.
+
+    The scope belongs to a consumer, not to the bus: the session agent's calls
+    are judged by ``bus.tool_scope``, but a sub-agent a product runs on the
+    same wrapped handlers (Loom's children) holds a different set of tools,
+    and its calls must be judged by that set, not by the session agent's."""
+
+    async def scoped(args):
+        token = _SCOPE_OVERRIDE.set(scope)
+        try:
+            return await handler(args)
+        finally:
+            _SCOPE_OVERRIDE.reset(token)
+
+    return scoped
+
+
+def scope_refusal(name):
+    """What a call to ``name`` is told when it is outside the tool scope."""
+    return (
+        "%s is not part of this agent's work, so it was not run: it is not one of "
+        "the tools you were given for this role or stage. Do the work with the "
+        "tools you have; if it cannot be done without %s, say so to the product "
+        "owner." % (name, name)
+    )
+
+
 _CALL_RECORD = contextvars.ContextVar("ember_call_record", default=None)
 
 
@@ -809,6 +847,7 @@ def _wrap(
     trusted_schema=True,
     call_recorder=None,
     server_name=None,
+    scope_name=None,
 ):
     """Apply the pause gate and the failure mapping to one tool.
 
@@ -831,8 +870,15 @@ def _wrap(
     the product's to say. A callable is asked at the time of the call, for a
     message that depends on what the server turned out to hold (which remote
     MCP servers it reached, say).
+
+    ``scope_name`` is the name ``bus.tool_scope`` (or a ``with_scope`` override)
+    is asked about: the tool's host name (``ToolServer.host_tool_table``), the
+    bare name for a product tool and ``<remote>__<tool>`` for a remote's. A
+    call outside the scope is refused before anything else, the hosted check
+    included, and never reaches the handler.
     """
     call_recorder = _call_recorder(call_recorder)
+    scope_name = scope_name or tool_def.name
     name = product.current().name
     schema = _tool_json_schema(tool_def.input_schema)
     validator, names = _compile_schema(schema)
@@ -841,6 +887,12 @@ def _wrap(
         return _input_diagnostic(validator, names, args, trusted_schema=trusted_schema)
 
     async def execute(args):
+        scope = _SCOPE_OVERRIDE.get()
+        if scope is _UNSET:
+            scope = getattr(bus, "tool_scope", None)
+        if scope is not None and not scope(scope_name):
+            _record_stage("scope", "rejected")
+            return fail(scope_refusal(scope_name))
         if getattr(bus, "hosted_mode", False):
             operation = bus.hosted_tool_ops.get(hosted_key)
             if (
@@ -1333,15 +1385,49 @@ class ToolServer:
         bare tool name: what ``/mcp/<remote>`` serves."""
         return {r.name: _table(r.tools, r.grading) for r in self.remotes}
 
-    def host_tool_table(self):
+    def host_tool_table(self, only=None):
         """``tool_table()`` with every remote's tools added under
-        ``host_tool_name``: the one tool set omp registers as host tools."""
-        table = self.tool_table()
+        ``host_tool_name``: the one tool set omp registers as host tools.
+
+        ``only`` (a collection of host names: a product tool's bare name,
+        ``<remote>__<tool>`` for a remote's) restricts the table to those
+        names, in the table's own order; a name that is not a tool here is
+        ignored. ``None`` is every tool, so a product that scopes nothing
+        gets what it always did. A remote's allow-list is simply its tools'
+        host names in ``only``.
+
+        In hosted mode (``bus.hosted_mode``) a tool the declared
+        ``bus.hosted_tool_ops`` has no operation for is dropped either way:
+        the worker refuses its call at execute time, so its schema would be
+        sent to the model for nothing."""
+        allowed = None if only is None else frozenset(only)
+        hosted_ops = self._bus.hosted_tool_ops if getattr(self._bus, "hosted_mode", False) else None
+        table = {}
+
+        def offer(host_name, key, spec):
+            if allowed is not None and host_name not in allowed:
+                return
+            if hosted_ops is not None and key not in hosted_ops:
+                return
+            table[host_name] = spec
+
+        for name, spec in self.tool_table().items():
+            offer(name, namespaced(self.name, name), spec)
         for server_name, remote_table in self.remote_tables().items():
-            table.update(
-                (host_tool_name(server_name, name), spec) for name, spec in remote_table.items()
-            )
+            for name, spec in remote_table.items():
+                offer(host_tool_name(server_name, name), namespaced(server_name, name), spec)
         return table
+
+    def scoped_host_tool_table(self):
+        """``host_tool_table(only=...)`` for the tools ``bus.tool_scope``
+        admits (every tool when it is ``None``): what a session that already
+        runs under a scope is handed again when its table grows (a remote
+        reached late). The scope, not the table, is the source of truth."""
+        table = self.host_tool_table()
+        scope = getattr(self._bus, "tool_scope", None)
+        if scope is None:
+            return table
+        return {name: spec for name, spec in table.items() if scope(name)}
 
 
 def instructions_of(remotes):

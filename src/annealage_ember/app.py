@@ -727,6 +727,10 @@ def create_app(
     bus.upload_actions = upload_actions
     bus.hosted_mode = hosted_mode
     bus.hosted_tool_ops = dict(hosted_tool_ops or {})
+    # Which tools the session's agent may call (host names), or None for all of them:
+    # set per omp session by launch.build_session from Product.session_tools, read by
+    # tools._wrap's execute and ToolServer.scoped_host_tool_table.
+    bus.tool_scope = None
     bus.hosted_turn_ops = ()
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
@@ -1372,7 +1376,12 @@ async def retry_remotes(tools, bus, session, interval=REMOTE_RETRY_INTERVAL):
         names = ", ".join(r.name for r in pending)
         set_tool_table = getattr(session, "set_tool_table", None)
         try:
-            taken = set_tool_table is not None and await set_tool_table(tools.host_tool_table())
+            # Under the session's tool scope (bus.tool_scope; every tool when the
+            # product set none), so a remote reached late brings only the tools the
+            # product allowed this session, and the table cannot drift from the scope.
+            taken = set_tool_table is not None and await set_tool_table(
+                tools.scoped_host_tool_table()
+            )
         except Exception as exc:
             sys.stderr.write(
                 "warning: could not give the agent %s's tools yet, trying again: %r\n"
