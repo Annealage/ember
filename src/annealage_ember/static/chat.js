@@ -246,10 +246,8 @@ function renderUserContexts(container, blocks, onPick) {
     });
 }
 
-const AGENT_LABEL = {
-  connecting: "Connecting…", ready: "Ready", idle: "Idle", unavailable: "Unavailable", closed: "Closed",
-};
-// The generic tooltips; `initChat`'s `agentTitles` replaces any of them.
+// The generic tooltips, by agent status and by activity state; `initChat`'s
+// `agentTitles` replaces any of them.
 const AGENT_TITLE = {
   connecting: "The agent process is starting; a message sent now is delivered once it is up.",
   ready: "The agent is ready to receive a message.",
@@ -260,7 +258,134 @@ const AGENT_TITLE = {
   interrupt_idle: "No turn is running.",
   unavailable:
     "The agent is not available right now. Sending a message tries to start it again; the rest of the page keeps working regardless.",
+  working: "The agent is working on your message.",
+  waiting: "The agent is waiting for you: an approval to answer or a question.",
+  paused: "The agent is paused. Resume it from the More menu.",
 };
+
+// Tells the window something about the pane without any message text in it.
+// A listener is the page's business and can never break the pane.
+function emitWindowEvent(name, detail) {
+  if (typeof window.dispatchEvent !== "function" || typeof CustomEvent !== "function") return;
+  try {
+    window.dispatchEvent(new CustomEvent(name, { detail }));
+  } catch (err) {
+    // reporting must never break the pane it reports on
+  }
+}
+
+const diag = (event, fields = {}) => emitWindowEvent("ember:diag", { event, ...fields });
+
+// An agent_closed reason that is a failure, with the words for it when the
+// event carries no detail of its own. The other reasons (idle, stop, cancel,
+// replaced) are the agent ending on purpose.
+const CLOSE_FAILURE = Object.freeze({
+  child_exited: "the agent process exited",
+  other: "the agent stopped unexpectedly",
+});
+
+// The tool the open turn is waiting on, for the status line's detail.
+function runningDetail(openTurns) {
+  for (let i = openTurns.length - 1; i >= 0; i--) {
+    const segments = openTurns[i].segments;
+    for (let j = segments.length - 1; j >= 0; j--) {
+      if (segments[j].kind !== "tools") continue;
+      const tool = segments[j].tools.find((t) => !t.result);
+      if (tool) return shortToolName(tool.name);
+    }
+  }
+  return null;
+}
+
+/**
+ * What the agent is doing, from the store's state alone: the one answer the
+ * header's status line draws and nothing else writes. `state` is
+ * `"starting" | "working" | "waiting" | "paused" | "idle" | "stopped"`;
+ * `startedAt` (working) and `finishedAt` (idle, stopped) are epoch ms or null;
+ * `detail` is the running tool (working), `reason` why it stopped. `starts`
+ * optionally maps a turn number to the time this page first saw it running,
+ * for a turn whose `user_turn` carried no time.
+ *
+ * A hosted job that has ended is never working, whatever turn the transcript
+ * still holds open: the history that closes it is still being read.
+ */
+export function agentActivity(state, starts = null) {
+  const chat = state.chat;
+  const job = state.hostedJob || { state: "none", reason: null, at: null };
+  const none = { startedAt: null, finishedAt: null, detail: null, reason: null };
+  const open = chat.turns.filter((t) => !t.complete);
+  let lastEnd = null;
+  for (const t of chat.turns) {
+    if (typeof t.endedAt === "number" && (lastEnd === null || t.endedAt > lastEnd)) lastEnd = t.endedAt;
+  }
+  if (state.starting) return { ...none, state: "starting" };
+  if (job.state === "failed" || job.state === "lost") {
+    return {
+      ...none, state: "stopped", finishedAt: job.at,
+      reason: job.reason || (job.state === "lost" ? "the agent was lost" : "the agent failed"),
+    };
+  }
+  const jobEnded = job.state === "succeeded";
+  if (!jobEnded && chat.agentStatus !== "ready") {
+    if (chat.closed && Object.hasOwn(CLOSE_FAILURE, chat.closed.reason)) {
+      return {
+        ...none, state: "stopped", finishedAt: chat.closed.at,
+        reason: chat.closed.detail || CLOSE_FAILURE[chat.closed.reason],
+      };
+    }
+    if (chat.agentStatus === "unavailable" && chat.banner && chat.banner.source === "agent") {
+      return { ...none, state: "stopped", finishedAt: lastEnd, reason: chat.banner.text || null };
+    }
+  }
+  if (!jobEnded) {
+    if (job.state === "starting") return { ...none, state: "starting" };
+    if (chat.pending.length || (chat.banner && chat.banner.kind === "attention")) {
+      return { ...none, state: "waiting" };
+    }
+    if (state.paused) return { ...none, state: "paused" };
+    if (open.length) {
+      let startedAt = null;
+      for (const t of open) {
+        const at = starts && starts.has(t.turn) ? starts.get(t.turn) : t.startedAt;
+        if (typeof at === "number" && (startedAt === null || at < startedAt)) startedAt = at;
+      }
+      return { ...none, state: "working", startedAt, detail: runningDetail(open) };
+    }
+    if (chat.agentStatus === "connecting") return { ...none, state: "starting" };
+  }
+  return { ...none, state: "idle", finishedAt: lastEnd ?? (jobEnded ? job.at : null) };
+}
+
+// "10:36" in the reader's own time, with the date in front when it is not
+// today's.
+function localTime(ms, now) {
+  const date = new Date(ms);
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return date.toDateString() === new Date(now).toDateString()
+    ? time : date.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + time;
+}
+
+function elapsedText(startedAt, now) {
+  const s = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+// The status line's words for an activity.
+function activityText(activity, now) {
+  switch (activity.state) {
+    case "starting": return "Starting";
+    case "working":
+      return ["Working" + (activity.startedAt !== null ? " " + elapsedText(activity.startedAt, now) : ""),
+        activity.detail].filter(Boolean).join(" \u00b7 ");
+    case "waiting": return "Waiting for you";
+    case "paused": return "Paused";
+    case "stopped":
+      return "Stopped" + (activity.finishedAt !== null ? " " + localTime(activity.finishedAt, now) : "")
+        + (activity.reason ? ": " + activity.reason : "");
+    default:
+      return activity.finishedAt !== null ? "Finished " + localTime(activity.finishedAt, now) : "Idle";
+  }
+}
 
 // The ids the pane's elements have in the markup a page copies, by role.
 // `pane` is the whole pane (the file drop target); `exportButton` is the one
@@ -993,6 +1118,116 @@ export function initChat({
 
   }
 
+  // Whether the pane reads as busy: a message on its way, or a turn open. A
+  // message that failed (handed back to the composer) is neither.
+  function isBusy(chat) {
+    return chat.pendingUser.some((p) => p.state !== "failed") || chat.turns.some((t) => !t.complete);
+  }
+
+  // The messages this tab has sent that the server has not logged, as "You"
+  // rows at the end of the feed from the moment of sending. Keyed by the
+  // frame's client_id: when the server's user_turn for it arrives the store
+  // retires the entry in the same change that adds the turn, so the confirmed
+  // row replaces this one in the same draw, in the same place.
+  const pendingRows = new Map();
+
+  function buildPendingRow(entry) {
+    const row = document.createElement("div");
+    row.className = "turn pendingturn";
+    row.dataset.clientId = entry.clientId;
+    const userEl = document.createElement("div");
+    userEl.className = "msg user sending";
+    const textEl = document.createElement("div");
+    textEl.className = "text";
+    textEl.textContent = blocksToText(entry.blocks);
+    const attachmentsEl = document.createElement("div");
+    attachmentsEl.className = "attachthumbs";
+    renderUserAttachments(attachmentsEl, entry.blocks);
+    const contextsEl = document.createElement("div");
+    contextsEl.className = "contextchips";
+    renderUserContexts(contextsEl, entry.blocks, (block) => pickContext(block, null));
+    const markEl = document.createElement("div");
+    markEl.className = "sendmark";
+    userEl.append(textEl, attachmentsEl, contextsEl, markEl);
+    row.appendChild(userEl);
+    return { row, userEl, markEl, state: null, reason: null };
+  }
+
+  function updatePendingRow(rec, entry) {
+    if (rec.state === entry.state && rec.reason === entry.reason) return;
+    rec.state = entry.state;
+    rec.reason = entry.reason;
+    const failed = entry.state === "failed";
+    rec.userEl.className = "msg user " + (failed ? "notsent" : "sending");
+    rec.markEl.title = failed ? entry.reason || "" : "";
+    if (!failed) {
+      rec.markEl.textContent = "Sending";
+      return;
+    }
+    rec.markEl.textContent = "Not sent ";
+    const retryBtn = document.createElement("button");
+    retryBtn.type = "button";
+    retryBtn.className = "retry";
+    retryBtn.textContent = "Retry";
+    retryBtn.addEventListener("click", () => retryPending(entry.clientId));
+    rec.markEl.appendChild(retryBtn);
+  }
+
+  // A message that was not sent, sent again from its row under a new
+  // client_id (the server never had the first).
+  function retryPending(clientId) {
+    const entry = store.getState().chat.pendingUser.find((p) => p.clientId === clientId);
+    if (!entry || entry.state !== "failed") return;
+    const nextId = makeClientId();
+    diag("msg_send", { client_id: nextId });
+    if (!send({ type: "turn", blocks: entry.blocks, client_id: nextId })) {
+      toast("Not connected, so the message was not sent", false);
+      return;
+    }
+    store.batch(() => {
+      store.dropChatUserTurn(clientId);
+      store.queueChatUserTurn(nextId, entry.blocks);
+    });
+  }
+
+  // Keeps the pending rows after everything else in the feed, in the order
+  // they were sent, moving them only when something was drawn after them.
+  function keepPendingAtEnd() {
+    const rows = Array.from(pendingRows.values(), (rec) => rec.row);
+    let tail = chatLogEl.lastElementChild;
+    let inPlace = true;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (tail !== rows[i]) {
+        inPlace = false;
+        break;
+      }
+      tail = tail.previousElementSibling;
+    }
+    if (!inPlace) rows.forEach((row) => chatLogEl.appendChild(row));
+  }
+
+  function renderPendingRows(chat) {
+    const seen = new Set();
+    for (const entry of chat.pendingUser) {
+      seen.add(entry.clientId);
+      let rec = pendingRows.get(entry.clientId);
+      if (!rec) {
+        rec = buildPendingRow(entry);
+        pendingRows.set(entry.clientId, rec);
+        chatLogEl.appendChild(rec.row);
+        diag("msg_shown", { client_id: entry.clientId });
+      }
+      updatePendingRow(rec, entry);
+    }
+    for (const [id, rec] of pendingRows) {
+      if (!seen.has(id)) {
+        rec.row.remove();
+        pendingRows.delete(id);
+      }
+    }
+    keepPendingAtEnd();
+  }
+
   function renderTurns(chat) {
     const following = stickToBottom;
     const scrollTop = chatLogEl.scrollTop;
@@ -1031,6 +1266,7 @@ export function initChat({
         turnEls.delete(turn);
       }
     }
+    renderPendingRows(chat);
     if (following) chatLogEl.scrollTop = chatLogEl.scrollHeight;
     else if (anchor?.isConnected) {
       chatLogEl.scrollTop = scrollTop + anchor.getBoundingClientRect().top - anchorTop;
@@ -1170,10 +1406,34 @@ export function initChat({
     }
   }
 
-  function renderAgentStatus(chat) {
-    agentStatusEl.textContent = AGENT_LABEL[chat.agentStatus] || chat.agentStatus;
-    agentStatusEl.title = titles[chat.agentStatus] || "";
-    agentStatusEl.dataset.state = chat.agentStatus;
+  // The one writer of the status line: every word on it comes from
+  // `agentActivity`, so no other path can contradict it. While the agent
+  // works the elapsed time ticks inside it.
+  let statusTicker = null;
+  function activityTitle(activity, chat) {
+    switch (activity.state) {
+      case "starting": return titles.connecting;
+      case "working": return titles.working;
+      case "waiting": return titles.waiting;
+      case "paused": return titles.paused;
+      case "stopped": return chat.agentStatus === "unavailable" ? titles.unavailable : titles.closed;
+      default: return viewerOnly ? titles.viewer_only : (titles[chat.agentStatus] || titles.idle);
+    }
+  }
+
+  function renderAgentStatus(activity, chat) {
+    const text = activityText(activity, Date.now());
+    if (agentStatusEl.textContent !== text) agentStatusEl.textContent = text;
+    agentStatusEl.title = activityTitle(activity, chat) || "";
+    agentStatusEl.dataset.state = activity.state;
+    const ticking = activity.state === "working" && activity.startedAt !== null;
+    if (ticking && statusTicker === null) {
+      statusTicker = setInterval(() => renderPaneState(store.getState().chat), 1000);
+      if (typeof statusTicker.unref === "function") statusTicker.unref();
+    } else if (!ticking && statusTicker !== null) {
+      clearInterval(statusTicker);
+      statusTicker = null;
+    }
   }
 
   function renderUsage(chat) {
@@ -1331,7 +1591,7 @@ export function initChat({
   function renderSendButton(chat) {
     const ready = chat.agentStatus === "ready";
     const uploading = chat.attachments.some((a) => a.state === "uploading");
-    const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
+    const busy = isBusy(chat);
     const steering = steers && busy && ready;
     const queueing = !steers && busy && ready;
     gate(chatInputEl, viewerOnly ? titles.viewer_only : "");
@@ -1346,7 +1606,39 @@ export function initChat({
           : (queueing ? "This message will be queued until the current turn ends" : "")));
   }
 
+  // A failure the page cannot recover from by itself (`store.connectionFailure`)
+  // is drawn in the banner with the one action that fixes it. The pane does not
+  // act on it: it tells the window (`ember:failure-action`) and the page does.
+  const FAILURE_ACTION_LABEL = Object.freeze({
+    sign_in: "Sign in", reload: "Reload", retry: "Retry now", try_again: "Try again",
+  });
+  const failureActionBtn = document.createElement("button");
+  failureActionBtn.type = "button";
+  failureActionBtn.className = "action";
+  failureActionBtn.hidden = true;
+  let failureAction = "none";
+  failureActionBtn.addEventListener("click", () => {
+    emitWindowEvent("ember:failure-action", { action: failureAction });
+  });
+  bannerTextEl.after(failureActionBtn);
+
   function renderBanner(chat) {
+    const failure = store.getState().connectionFailure;
+    if (failure) {
+      bannerEl.hidden = false;
+      bannerEl.dataset.kind = "error";
+      bannerTextEl.textContent = failure.message;
+      bannerDetailEl.hidden = true;
+      failureAction = failure.action;
+      const label = FAILURE_ACTION_LABEL[failure.action] || "";
+      failureActionBtn.textContent = label;
+      failureActionBtn.hidden = !label;
+      // It clears when the page recovers, not when it is dismissed.
+      bannerCloseBtn.hidden = true;
+      return;
+    }
+    failureActionBtn.hidden = true;
+    bannerCloseBtn.hidden = false;
     if (chat.banner) {
       bannerEl.hidden = false;
       bannerEl.dataset.kind = chat.banner.kind;
@@ -1366,18 +1658,19 @@ export function initChat({
   }
 
   function renderInterrupt(chat) {
-    const busy = chat.pendingUser.length > 0 || chat.turns.some((t) => !t.complete);
+    const busy = isBusy(chat);
     gate(chatInterruptBtn, viewerOnly ? titles.viewer_only : (busy ? "" : titles.interrupt_idle));
   }
 
-  // When each running turn started, in epoch ms, by turn number. The event
-  // log carries no times, so a turn's start is when this page first saw it
-  // running: for a live user_turn that is the moment it arrived, which is
-  // when the server began the turn. A page that connects mid-turn first sees
-  // it in the replay, so there the time is when this page connected, later
-  // than the true start by however long the turn had already run. A page
-  // that reconnects keeps the time it recorded before the drop, since the
-  // turn keeps its number.
+  // When each running turn started, in epoch ms, by turn number. A turn's own
+  // start is its `user_turn`'s `at`, the server's clock, so a replayed turn
+  // times right. A turn whose log carries no `at` (an older log) is timed from
+  // when this page first saw it running: for a live user_turn that is the
+  // moment it arrived, but a page that connects mid-turn first sees it in the
+  // replay, so there the time is when this page connected, later than the true
+  // start by however long the turn had already run. A page that reconnects
+  // keeps the time it recorded before the drop, since the turn keeps its
+  // number.
   const turnStarts = new Map();
 
   // The pane's state for a stylesheet, on the pane element: `data-working`
@@ -1389,24 +1682,28 @@ export function initChat({
   function renderPaneState(chat) {
     const running = chat.turns.filter((t) => !t.complete);
     const now = Date.now();
+    const starts = new Map();
     for (const t of running) {
-      if (!turnStarts.has(t.turn)) turnStarts.set(t.turn, now);
+      starts.set(t.turn, typeof t.startedAt === "number" ? t.startedAt : (turnStarts.get(t.turn) ?? now));
     }
     // A steer does not restart the work. omp's steer logs the new turn first
     // and then ends the running one as "steered", so the steered turn's start
     // passes to the next running turn before the ended one is forgotten.
     for (const t of chat.turns) {
-      if (t.stopReason !== "steered" || !turnStarts.has(t.turn)) continue;
+      if (t.stopReason !== "steered") continue;
+      const own = typeof t.startedAt === "number" ? t.startedAt : turnStarts.get(t.turn);
       const next = running.find((r) => r.turn > t.turn);
-      if (next) {
-        turnStarts.set(next.turn, Math.min(turnStarts.get(next.turn), turnStarts.get(t.turn)));
-      }
+      if (own !== undefined && next) starts.set(next.turn, Math.min(starts.get(next.turn), own));
     }
-    for (const turn of turnStarts.keys()) {
-      if (!running.some((t) => t.turn === turn)) turnStarts.delete(turn);
-    }
+    turnStarts.clear();
+    for (const [turn, at] of starts) turnStarts.set(turn, at);
+    const activity = agentActivity(store.getState(), turnStarts);
+    renderAgentStatus(activity, chat);
+    // The bar along the header breathes while a turn runs, unless the agent
+    // has stopped or finished under it (a hosted job that ended while the
+    // transcript still holds the turn open).
     const data = chatPaneEl.dataset;
-    if (running.length) {
+    if (running.length && activity.state !== "idle" && activity.state !== "stopped") {
       data.working = "";
       // The earliest running turn, should more than one be open at once.
       data.turnStarted = String(turnStarts.get(running[0].turn));
@@ -1419,13 +1716,15 @@ export function initChat({
 
   let turnsFrame = null;
   let drawnTurns = null;
+  let drawnPending = null;
   function scheduleTurns(chat) {
-    if (chat.turns === drawnTurns || turnsFrame !== null) return;
+    if ((chat.turns === drawnTurns && chat.pendingUser === drawnPending) || turnsFrame !== null) return;
     const draw = () => {
       turnsFrame = null;
       const current = store.getState().chat;
       renderTurns(current);
       drawnTurns = current.turns;
+      drawnPending = current.pendingUser;
     };
     if (typeof requestAnimationFrame === "function") {
       turnsFrame = requestAnimationFrame(draw);
@@ -1456,8 +1755,8 @@ export function initChat({
     scheduleTurns(chat);
     reportContexts(chat);
     renderPending(chat);
-    renderAgentStatus(chat);
     renderActionResults(chat);
+    keepPendingAtEnd();
     renderFileAccept();
     renderUsage(chat);
     renderModel(chat);
@@ -1469,15 +1768,21 @@ export function initChat({
   }
 
   store.subscribe("chat", render);
+  // The status line and the banner read more than the chat slice.
+  for (const key of ["hostedJob", "starting", "paused", "connectionFailure"]) {
+    store.subscribe(key, render);
+  }
   render();
 
   // One message out through the turn frame: `blocks` as the composer or a
   // product built them. False, and nothing queued, when the socket is down.
   function sendBlocks(blocks) {
     const clientId = makeClientId();
+    diag("msg_send", { client_id: clientId });
     if (!send({ type: "turn", blocks, client_id: clientId })) return false;
-    // Held as pending, not drawn: the server's `user_turn` for it, which
-    // every tab receives, is what shows the message.
+    // Held as pending, and drawn at once as a "You" row marked sending: the
+    // server's `user_turn` for it, which every tab receives, replaces that row
+    // with the logged message.
     store.queueChatUserTurn(clientId, blocks);
     return true;
   }
@@ -1639,7 +1944,16 @@ export function initChat({
     settleTimer = null;
     const lost = [];
     for (const clientId of unconfirmed) {
-      const blocks = store.dropChatUserTurn(clientId);
+      const entry = store.getState().chat.pendingUser.find((p) => p.clientId === clientId);
+      if (!entry || entry.state === "failed") continue;
+      // The replay shows the server never logged it. Sent once more on this
+      // connection under the same client_id: the server drops a duplicate, so
+      // a message that did arrive is not doubled. A second drop hands it back.
+      if (!entry.resent && send({ type: "turn", blocks: entry.blocks, client_id: clientId })) {
+        store.markChatUserTurnResent(clientId);
+        continue;
+      }
+      const blocks = store.failChatUserTurn(clientId, "The connection dropped before it arrived");
       if (blocks) lost.push(...blocks);
     }
     unconfirmed = new Set();
@@ -1682,7 +1996,8 @@ export function initChat({
     }
     // What this pane sent over an earlier connection is settled by the replay
     // that follows (see `unconfirmed`).
-    unconfirmed = new Set(store.getState().chat.pendingUser.map((p) => p.clientId).filter((id) => !adopted.has(id)));
+    unconfirmed = new Set(store.getState().chat.pendingUser
+      .filter((p) => p.state !== "failed" && !adopted.has(p.clientId)).map((p) => p.clientId));
     adopted.clear();
     clearTimeout(settleTimer);
     settleTimer = unconfirmed.size ? setTimeout(settleUnconfirmed, SETTLE_MS) : null;
@@ -1694,6 +2009,7 @@ export function initChat({
       store.resetChatTurns();
       // Another conversation's cards: nobody is waiting on them any more.
       store.clearChatPending();
+      store.clearChatFailedUserTurns();
       activityTurn = 0;
       resetHistory();
       stickToBottom = true;
@@ -1709,6 +2025,8 @@ export function initChat({
     sessionId = nextSessionId;
     viewerOnly = sessionId === "viewer-only";
     steers = !!(session && session.steers);
+    // The status line's tooltip depends on viewerOnly, set only now.
+    renderPaneState(store.getState().chat);
     renderSendButton(store.getState().chat);
     renderModel(store.getState().chat);
     renderInterrupt(store.getState().chat);
@@ -1781,12 +2099,22 @@ export function initChat({
       || (event.kind === "text_delta" && !!event.text)
       || event.kind === "tool_use";
     if (!replayed && recovered) clearAgentErrorBanner();
+    // A message this tab sent, now logged by the server.
+    const loggedClientId = event.kind === "user_turn" && event.client_id
+      && store.getState().chat.pendingUser.some((p) => p.clientId === event.client_id)
+      ? event.client_id : null;
+    // Anything the agent does after it closed says it is running again.
+    if (!olderHistory
+        && (event.kind === "user_turn" || event.kind === "text_delta" || event.kind === "tool_use")) {
+      store.setChatClosed(null);
+    }
     switch (event.kind) {
       case "user_turn":
         store.setChatUserTurn(
           event.turn, event.blocks, event.client_id || null, event.automation_source || null,
-          event.redelivery_of ?? null,
+          event.redelivery_of ?? null, event.at ?? null,
         );
+        if (loggedClientId) diag("msg_logged", { client_id: loggedClientId });
         // Only a human answering can clear an attention prompt.
         if (!meta.history && !event.automation_source) {
           const banner = store.getState().chat.banner;
@@ -1818,6 +2146,7 @@ export function initChat({
           event.tokens || null,
           event.usage_epoch ?? null,
           event.usage_source || null,
+          event.at ?? null,
         );
         break;
       case "usage":
@@ -1870,7 +2199,10 @@ export function initChat({
         // connection was accepted; a live event is what keeps it current.
         if (!replayed) {
           store.setChatAgentStatus(event.status);
-          if (event.status === "ready") clearAgentErrorBanner();
+          if (event.status === "ready") {
+            clearAgentErrorBanner();
+            store.setChatClosed(null);
+          }
         }
         break;
       case "agent_model_changed":
@@ -1897,11 +2229,18 @@ export function initChat({
         stickToBottom = true;
         store.clearChatPending();
         store.resetChatTurns();
+        store.setChatClosed(null);
+        store.clearChatFailedUserTurns();
         activityTurn = 0;
         // The old conversation's usage is not the new one's; the hello of a
         // later connection says so too.
         if (!replayed) store.setChatUsage(null);
         if (!replayed) store.setChatBanner("reset", event.reason);
+        break;
+      case "agent_closed":
+        if (!olderHistory) {
+          store.setChatClosed({ reason: event.reason, detail: event.detail, at: event.at ?? null });
+        }
         break;
       case "agent_error":
         // What to do, and under it the backend's own words, which are often
@@ -2001,7 +2340,9 @@ export function initChat({
   // model change that has not actually failed.
   function handleRefused(reason, clientId = null) {
     if (clientId) {
-      const blocks = store.dropChatUserTurn(clientId);
+      // Kept as a failed row ("Not sent", with Retry) as well as handed back
+      // to the composer.
+      const blocks = store.failChatUserTurn(clientId, reason || "The message was not sent");
       if (blocks) {
         const complete = restoreToComposer(blocks);
         toast(restoredText(reason || "The message was not sent", complete), false);

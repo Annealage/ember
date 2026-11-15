@@ -19,7 +19,6 @@ PAGE_LEVEL = {
     "toast",
     "err",
     "connIndicator",
-    "chatWorkingTime",
     "chatMore",
     "sessionStart",
 }
@@ -40,6 +39,12 @@ def test_the_page_has_every_element_the_shared_modules_look_up():
     missing = (pane_ids() | PAGE_LEVEL) - ids_in(page)
     assert not missing
     assert re.search(r'<textarea id="chatInput"[^>]*\sdata-palette-ignore[\s>]', page)
+
+
+def test_the_status_line_carries_the_elapsed_time_and_the_working_bar_has_no_text():
+    page = embed.render_agent_page(product="x", title="X")
+    assert "chatWorkingTime" not in page
+    assert '<span class="working" aria-hidden="true"><span class="bar"></span></span>' in page
 
 
 def test_a_pane_without_a_model_control_drops_only_that_row():

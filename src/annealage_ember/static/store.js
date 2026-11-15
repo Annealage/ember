@@ -35,16 +35,41 @@
  *                 the change: the flag is enforced in the server, where the
  *                 tools it gates run, so a local value could show "paused"
  *                 while they were still running.
- *   connection    'connecting' | 'live' | 'polling' | 'refused'
+ *   connection    'connecting' | 'live' | 'polling' | 'idle' | 'refused' | 'failed'
  *                 ws.js's view of the /ws socket, read by the topbar
  *                 indicator. 'live' means updates arrive by push; 'polling'
  *                 means ws.js has handed over to the product's fallback poll
  *                 (its `onFallback` hook), whether because the socket has not
  *                 yet reconnected or because it never will again this page
- *                 load (a protocol-version mismatch); 'refused' means a
- *                 pre-handshake 403 was confirmed, most likely a stale token
- *                 from a server restart, and the fallback runs under this
- *                 state too.
+ *                 load (a protocol-version mismatch); 'idle' means a hosted
+ *                 worker ended normally after a finished turn and a message
+ *                 resumes it; 'refused' means a pre-handshake 403 was
+ *                 confirmed, most likely a stale token from a server
+ *                 restart, and the fallback runs under this state too;
+ *                 'failed' means the page has been visible for a while
+ *                 without getting back to live, or a definite failure
+ *                 (`connectionFailure` says which). 'connecting', 'live' and
+ *                 'polling' are not announced: reconnecting is invisible.
+ *   hostedJob     {state, reason, at}
+ *                 the hosted agent job as the page's host sees it, set by
+ *                 `setHostedJob`: `state` is 'none' | 'starting' | 'running' |
+ *                 'succeeded' | 'failed' | 'lost', `reason` words for a failure
+ *                 (or null) and `at` when the state was reached, epoch ms (or
+ *                 null). A page with no hosted job leaves it at 'none'.
+ *                 `agentActivity` (chat.js) reads it: a job that has ended is
+ *                 never "working", whatever turn the transcript still holds
+ *                 open.
+ *   starting      boolean
+ *                 true while the page is starting the agent to send a message
+ *                 (start-on-send), set by `setStarting`.
+ *   connectionFailure
+ *                 null, or `{kind, message, action}` set by
+ *                 `setConnectionFailure`: `kind` is 'signed_out' | 'protocol' |
+ *                 'unreachable' | 'offline' | 'job_failed', `action` what the
+ *                 banner offers, 'sign_in' | 'reload' | 'retry' | 'try_again'
+ *                 | 'none'. chat.js draws it in the banner and dispatches
+ *                 `ember:failure-action` on `window` when the button is
+ *                 pressed; the host acts on it. Cleared with null.
  *   chat          {turns, pendingUser, pending, agentStatus, model, models,
  *                  banner, attachments, usage}
  *                 the whole chat pane's state.
@@ -62,16 +87,26 @@
  *                 (a history from before the server logged them).
  *                 `errors` retains `{remediation, stderr}` records on their
  *                 original turn, including replay, independently of the banner.
- *                 `pendingUser` is `[{clientId, blocks}]`, the turns this
- *                 tab has sent that the server has neither logged (a
- *                 `user_turn` with the same `client_id`) nor refused (a
- *                 `refused` frame naming it). It is what makes the pane
- *                 read as busy between Send and the turn appearing, and
- *                 what a refusal hands back to the composer; it is never
- *                 drawn. An entry still here when a new connection opens is
- *                 settled by that connection's replay: its user_turn retires
- *                 it, and one the replay does not have never reached the
- *                 server and goes back to the composer (chat.js).
+ *                 `pendingUser` is `[{clientId, blocks, state, reason, resent,
+ *                 sentAt}]`, the turns this tab has sent that the server has
+ *                 neither logged (a `user_turn` with the same `client_id`)
+ *                 nor refused (a `refused` frame naming it). `state` is
+ *                 'sending' (the default) or 'failed' (`reason` says why; the
+ *                 message was handed back to the composer and its row offers
+ *                 a retry). Only 'sending' entries make the pane read as
+ *                 busy. chat.js draws every entry as a "You" row at the end of
+ *                 the feed from the moment of sending, and the row becomes
+ *                 the confirmed one when the `user_turn` arrives. An entry
+ *                 still sending when a new connection opens is settled by
+ *                 that connection's replay: its user_turn retires it, and
+ *                 one the replay does not have is sent once more on the new
+ *                 connection with the same `client_id` (`resent`; the server
+ *                 drops a duplicate).
+ *                 A turn also carries `clientId`, `startedAt` (its
+ *                 `user_turn`'s `at`, epoch ms, or null) and `endedAt` (its
+ *                 `turn_end`'s `at`, or null); older logs have no `at`.
+ *                 `closed` is the last `agent_closed` event, `{reason,
+ *                 detail, at}`, until the agent does anything again, or null.
  *                 `pending` is outstanding permission requests, one entry
  *                 per live `request_id`, `{request_id, tool, input,
  *                 suggestions}`; a replayed duplicate of a still-unanswered
@@ -144,9 +179,13 @@ let state = Object.freeze({
   paused: false,
   connection: "connecting",
   toolCardsCollapsed: true,
+  hostedJob: Object.freeze({ state: "none", reason: null, at: null }),
+  starting: false,
+  connectionFailure: null,
   chat: Object.freeze({
     turns: Object.freeze([]),
     pendingUser: Object.freeze([]),
+    closed: null,
     pending: Object.freeze([]),
     agentStatus: "connecting",
     model: null,
@@ -310,6 +349,44 @@ function setConnection(v) {
   }, ["connection"]);
 }
 
+const HOSTED_JOB_STATES = new Set(["none", "starting", "running", "succeeded", "failed", "lost"]);
+
+function setHostedJob({ state: jobState = "none", reason = null, at = null } = {}) {
+  const next = Object.freeze({
+    state: HOSTED_JOB_STATES.has(jobState) ? jobState : "none",
+    reason: reason || null,
+    at: typeof at === "number" && Number.isFinite(at) ? at : null,
+  });
+  const now = state.hostedJob;
+  if (now.state === next.state && now.reason === next.reason && now.at === next.at) return;
+  commit(() => {
+    state = { ...state, hostedJob: next };
+  }, ["hostedJob"]);
+}
+
+function setStarting(starting) {
+  if (state.starting === !!starting) return;
+  commit(() => {
+    state = { ...state, starting: !!starting };
+  }, ["starting"]);
+}
+
+function setConnectionFailure(failure) {
+  const next = failure
+    ? Object.freeze({
+      kind: String(failure.kind),
+      message: String(failure.message || ""),
+      action: failure.action || "none",
+    })
+    : null;
+  const now = state.connectionFailure;
+  if (now === next || (now && next && now.kind === next.kind
+      && now.message === next.message && now.action === next.action)) return;
+  commit(() => {
+    state = { ...state, connectionFailure: next };
+  }, ["connectionFailure"]);
+}
+
 function setPaused(v) {
   commit(() => {
     state = { ...state, paused: !!v };
@@ -334,6 +411,9 @@ function ensureTurn(chat, turn) {
     usageEpoch: null,
     usageSource: null,
     complete: turn === 0,
+    clientId: null,
+    startedAt: null,
+    endedAt: null,
     inputState: null,
     inputDetail: null,
   });
@@ -368,13 +448,18 @@ function withoutPending(pendingUser, clientId) {
 
 // A `user_turn` event: a human-authored turn or an explicitly sourced
 // automatic turn. Its origin is retained beside the blocks through replay.
-function setChatUserTurn(turn, blocks, clientId = null, automationSource = null, redeliveryOf = null) {
+function setChatUserTurn(
+  turn, blocks, clientId = null, automationSource = null, redeliveryOf = null, at = null,
+) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx
-        ? Object.freeze({ ...t, user: blocks, automationSource, redeliveryOf })
+        ? Object.freeze({
+          ...t, user: blocks, automationSource, redeliveryOf, clientId,
+          startedAt: typeof at === "number" ? at : t.startedAt,
+        })
         : t)),
     );
     const pendingUser = withoutPending(chat.pendingUser, clientId);
@@ -493,7 +578,7 @@ function setChatToolResult(toolUseId, isError, text) {
 }
 
 function endChatTurn(
-  turn, stopReason, costUsd, tokens = null, usageEpoch = null, usageSource = null,
+  turn, stopReason, costUsd, tokens = null, usageEpoch = null, usageSource = null, at = null,
 ) {
   commit(() => {
     const chat = state.chat;
@@ -509,6 +594,7 @@ function endChatTurn(
             usageEpoch,
             usageSource,
             complete: true,
+            endedAt: typeof at === "number" ? at : t.endedAt,
           })
           : t
       )),
@@ -534,11 +620,23 @@ function completeChatHistory(turnNumbers) {
 function queueChatUserTurn(clientId, blocks) {
   commit(() => {
     const chat = state.chat;
-    const entry = Object.freeze({ clientId, blocks });
+    const entry = Object.freeze({
+      clientId, blocks, state: "sending", reason: null, resent: false, sentAt: Date.now(),
+    });
     state = {
       ...state,
       chat: Object.freeze({ ...chat, pendingUser: Object.freeze([...chat.pendingUser, entry]) }),
     };
+  }, ["chat"]);
+}
+
+// Replaces the entry for `clientId` with `change(entry)`.
+function changePending(clientId, change) {
+  commit(() => {
+    const chat = state.chat;
+    const pendingUser = Object.freeze(chat.pendingUser.map(
+      (p) => (p.clientId === clientId ? Object.freeze({ ...p, ...change(p) }) : p)));
+    state = { ...state, chat: Object.freeze({ ...chat, pendingUser }) };
   }, ["chat"]);
 }
 
@@ -558,6 +656,49 @@ function dropChatUserTurn(clientId) {
     }, ["chat"]);
   }
   return entry ? entry.blocks : null;
+}
+
+// A turn the server will not take (refused, or its start failed): the entry
+// stays, marked failed with `reason`, so its row can say "Not sent" and offer a
+// retry. Its blocks come back to the caller, null when this tab holds no such
+// entry (or it had already failed), so the message can go back in the composer.
+function failChatUserTurn(clientId, reason) {
+  const entry = state.chat.pendingUser.find((p) => p.clientId === clientId) || null;
+  if (!entry || entry.state === "failed") return null;
+  changePending(clientId, () => ({ state: "failed", reason: reason || null }));
+  return entry.blocks;
+}
+
+// The entry was sent once more on a new connection.
+function markChatUserTurnResent(clientId) {
+  changePending(clientId, () => ({ resent: true }));
+}
+
+// Failed entries go (another conversation's, or dismissed).
+function clearChatFailedUserTurns() {
+  if (!state.chat.pendingUser.some((p) => p.state === "failed")) return;
+  commit(() => {
+    const chat = state.chat;
+    const pendingUser = Object.freeze(chat.pendingUser.filter((p) => p.state !== "failed"));
+    state = { ...state, chat: Object.freeze({ ...chat, pendingUser }) };
+  }, ["chat"]);
+}
+
+// The agent session closed (`agent_closed`), or null once it does anything.
+function setChatClosed(closed) {
+  if (!closed && !state.chat.closed) return;
+  commit(() => {
+    state = {
+      ...state,
+      chat: Object.freeze({
+        ...state.chat,
+        closed: closed ? Object.freeze({
+          reason: closed.reason || "other", detail: closed.detail || null,
+          at: typeof closed.at === "number" ? closed.at : null,
+        }) : null,
+      }),
+    };
+  }, ["chat"]);
 }
 
 // Adds a permission_request to the pending list unless its request_id is
@@ -873,6 +1014,9 @@ export const store = Object.freeze({
   batch,
   setToolCardsCollapsed,
   setConnection,
+  setHostedJob,
+  setStarting,
+  setConnectionFailure,
   setPaused,
   setChatUserTurn,
   setChatInputState,
@@ -885,6 +1029,10 @@ export const store = Object.freeze({
   completeChatHistory,
   queueChatUserTurn,
   dropChatUserTurn,
+  failChatUserTurn,
+  markChatUserTurnResent,
+  clearChatFailedUserTurns,
+  setChatClosed,
   addChatPermissionRequest,
   markChatPermissionSubmitted,
   clearChatPermissionSubmitted,

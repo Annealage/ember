@@ -82,8 +82,7 @@ def chat_markup(
     return (
         "<aside %s>\n"
         '<header><h1>%s</h1><span id="agentStatus" class="agentstatus">%s</span>\n'
-        '<span class="working" role="status"><span class="bar" aria-hidden="true"></span>\n'
-        'Working <b id="chatWorkingTime"></b></span>\n'
+        '<span class="working" aria-hidden="true"><span class="bar"></span></span>\n'
         '<span class="spacer"></span>\n'
         '<span id="connIndicator" class="conn"></span>\n'
         "%s\n"

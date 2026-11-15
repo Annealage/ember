@@ -34,27 +34,6 @@ function byId(root, id) {
   return root.querySelector ? root.querySelector("#" + id) : root.getElementById(id);
 }
 
-// The header's "Working m:ss": chat.js keeps data-working and
-// data-turn-started on the pane, the clock is drawn here.
-function workingClock(pane, clock) {
-  if (!pane || !clock) return;
-  let ticker = null;
-  function tick() {
-    const started = Number(pane.dataset.turnStarted);
-    const s = started ? Math.max(0, Math.floor((Date.now() - started) / 1000)) : 0;
-    clock.textContent = started ? Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0") : "";
-  }
-  new MutationObserver(() => {
-    tick();
-    const working = "working" in pane.dataset;
-    if (working && !ticker) ticker = setInterval(tick, 1000);
-    else if (!working && ticker) {
-      clearInterval(ticker);
-      ticker = null;
-    }
-  }).observe(pane, { attributes: true, attributeFilter: ["data-working", "data-turn-started"] });
-}
-
 // The header's More menu closes on a pick, an outside click and Escape.
 function moreMenu(root, more) {
   if (!more) return;
@@ -106,10 +85,8 @@ export function bootstrapAgentPage({
   liveWaitMs = 15000,
   gapMs = 2000,
 } = {}) {
-  const pane = byId(root, "chat");
   const errorEl = byId(root, "err");
   const button = byId(root, "sessionStart");
-  workingClock(pane, byId(root, "chatWorkingTime"));
   moreMenu(root, byId(root, "chatMore"));
 
   let socket = null;
@@ -206,6 +183,7 @@ export function bootstrapAgentPage({
         live = true;
         idle = false;
         clearTimeout(liveTimer);
+        store.setStarting(false);
         settleResume(null);
         if (review) review.onLive();
         setButton(restartLabel, { hidden: true });
@@ -227,7 +205,11 @@ export function bootstrapAgentPage({
           workerEndedNormally(3, gapMs).then((ended) => {
             if (live) return;
             if (ended) {
+              // The worker finished on purpose: the status line says when,
+              // from the job and the last turn's end.
               idle = true;
+              store.setStarting(false);
+              store.setHostedJob({ state: "succeeded", reason: null, at: Date.now() });
               store.setChatAgentStatus("idle");
               store.setConnection("idle");
               return;
@@ -235,6 +217,11 @@ export function bootstrapAgentPage({
             const c = store.getState().chat;
             if (c.agentStatus === "unavailable") {
               const why = c.banner && c.banner.text ? ": " + c.banner.text : "";
+              store.setStarting(false);
+              store.setHostedJob({
+                state: "failed", reason: (c.banner && c.banner.text) || "the session could not start",
+                at: Date.now(),
+              });
               showError("Could not start the session" + why + ". Use Resume session to retry.");
             }
           });
@@ -266,6 +253,8 @@ export function bootstrapAgentPage({
     connecting = true;
     setButton("Starting…", { disabled: true });
     showError("");
+    store.setStarting(true);
+    if (hosted) store.setHostedJob({ state: "none", reason: null, at: null });
     try {
       if (hosted) {
         await ensureSession({ url: sessionUrl || appUrl("agent/session"), fetcher });
@@ -275,6 +264,7 @@ export function bootstrapAgentPage({
       // onFallback offers Resume when hosted), since a send before then is
       // refused. Same for a standalone page started from its button.
       if (live) {
+        store.setStarting(false);
         setButton(restartLabel, { hidden: true });
         idle = false;
         settleResume(null);
@@ -283,12 +273,16 @@ export function bootstrapAgentPage({
         clearTimeout(liveTimer);
         liveTimer = setTimeout(() => {
           if (live) return;
+          store.setStarting(false);
           setButton(restartLabel);
           settleResume("The session did not come back in time");
         }, liveWaitMs);
       }
     } catch (failure) {
-      showError(failure instanceof Error ? failure.message : String(failure));
+      const message = failure instanceof Error ? failure.message : String(failure);
+      showError(message);
+      store.setStarting(false);
+      if (hosted) store.setHostedJob({ state: "failed", reason: message, at: Date.now() });
       setButton("Resume connection");
       settleResume("The session could not be resumed");
     } finally {

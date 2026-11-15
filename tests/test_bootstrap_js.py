@@ -112,15 +112,14 @@ results.hungPoll = await hung([starting("0.1"), "hang"], 400);
 
 // bootstrap.js, imports replaced
 const source = readFileSync(dir + "/bootstrap.js", "utf8").replace(/^import .*;$/gm, "");
-const log = { ws: 0, admissions: [], chat: 0, status: [], conn: [], sent: [], refused: [] };
+const log = { ws: 0, admissions: [], chat: 0, status: [], conn: [], sent: [], refused: [], job: [], starting: [] };
 function element(id) {
   const listeners = {};
   return { id, hidden: false, disabled: false, textContent: "", dataset: {}, listeners,
     addEventListener(n, f) { listeners[n] = f; }, click() { return listeners.click && listeners.click({ target: this }); } };
 }
-const elements = Object.fromEntries(["chat", "err", "sessionStart", "pauseBtn", "chatWorkingTime", "chatMore"].map((i) => [i, element(i)]));
+const elements = Object.fromEntries(["chat", "err", "sessionStart", "pauseBtn", "chatMore"].map((i) => [i, element(i)]));
 globalThis.document = { addEventListener() {}, querySelector: (s) => elements[s.slice(1)] || null };
-globalThis.MutationObserver = class { observe() {} };
 const handlersOf = {};
 const noTurns = { turns: [], pendingUser: [], agentStatus: "ready", banner: null };
 const ok = { turn: 1, complete: true, errors: [], stopReason: "end" };
@@ -133,7 +132,11 @@ const stubs = {
   initReview: () => ({ onEvent: {}, onLive() {}, onFallback() {} }),
   initSettings: () => ({ load() {} }),
   appUrl: (r) => "/p/a/" + r,
-  store: { getState: () => ({ chat: stubs.chat }), setChatAgentStatus: (v) => log.status.push(v), setConnection: (v) => log.conn.push(v) },
+  store: {
+    getState: () => ({ chat: stubs.chat }), setChatAgentStatus: (v) => log.status.push(v),
+    setConnection: (v) => log.conn.push(v), setStarting: (v) => log.starting.push(v),
+    setHostedJob: (j) => log.job.push(j.state + (j.reason ? ":" + j.reason : "")),
+  },
   initWs: (h) => { log.ws++; Object.assign(handlersOf, h); return { send: (f) => { log.sent.push(f); return true; } }; },
   ensureHostedSession: async ({ url }) => { log.admissions.push(url); if (stubs.fail) throw new Error(stubs.fail); },
 };
@@ -168,12 +171,13 @@ stubs.fail = null; stubs.chat = { ...noTurns, turns: [ok] };
 const turn = { type: "turn", blocks: [], client_id: "c1" };
 async function idleSession() {
   log.status.length = 0; log.conn.length = 0; log.sent.length = 0; log.refused.length = 0;
+  log.job.length = 0; log.starting.length = 0;
   const p = re.bootstrapAgentPage({ hosted: true, liveWaitMs: 80, gapMs: 5, fetcher: serverFetcher });
   p.connect(); await flush(); handlersOf.onLive(); handlersOf.onFallback(); await new Promise((r) => setTimeout(r, 40));
   return p;
 }
 await idleSession();
-results.idle = { status: [...log.status], conn: [...log.conn] };
+results.idle = { status: [...log.status], conn: [...log.conn], job: [...log.job], starting: [...log.starting] };
 const before = log.admissions.length;
 results.idleSendReturned = log.chatSend(turn);
 await flush();
@@ -194,7 +198,7 @@ stubs.fail = null;
 const caseOf = async (chat, ended = true) => {
   stubs.chat = { ...noTurns, ...chat }; globalThis.jobEnded = ended;
   await idleSession();
-  return { status: [...log.status], conn: [...log.conn], err: elements.err.textContent };
+  return { status: [...log.status], conn: [...log.conn], job: [...log.job], err: elements.err.textContent };
 };
 results.midTurn = await caseOf({ turns: [{ complete: false, errors: [] }] });
 results.zeroTurns = await caseOf({ turns: [], agentStatus: "unavailable", banner: { text: "RuntimeError: shapes changed" } });
@@ -352,20 +356,28 @@ def test_a_request_that_never_answers_ends_at_the_deadline(results):
 
 
 def test_a_finished_turn_then_a_closed_relay_is_idle_and_not_a_failure(results):
-    assert results["idle"] == {"status": ["idle"], "conn": ["idle"]}
+    idle = results["idle"]
+    assert idle["status"] == ["idle"] and idle["conn"] == ["idle"]
+    # The status line is told by inputs, not written: starting while it
+    # connects, then the job as it ended.
+    assert idle["job"] == ["none", "succeeded"]
+    assert idle["starting"][0] is True and idle["starting"][-1] is False
     # an unfinished turn lost with the relay is still the failure it was
     for name in ("midTurn", "errorTurn", "rejectedTurn", "noJobEnded"):
         assert results[name]["status"] == [] and results[name]["conn"] == [], name
+        assert results[name]["job"] == ["none"], name
 
 
 def test_the_workers_own_unavailable_on_exit_after_a_good_turn_is_still_idle(results):
     r = results["exitedUnavailable"]
     assert r["status"] == ["idle"] and r["conn"] == ["idle"] and r["err"] == ""
+    assert r["job"] == ["none", "succeeded"]
 
 
 def test_a_failed_start_stays_an_explicit_error_with_the_reason_and_a_retry(results):
     r = results["zeroTurns"]
     assert r["status"] == [] and r["conn"] == []
+    assert r["job"] == ["none", "failed:RuntimeError: shapes changed"]
     assert r["err"] == (
         "Could not start the session: RuntimeError: shapes changed. Use Resume session to retry."
     )

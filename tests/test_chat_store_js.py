@@ -93,6 +93,49 @@ store.appendChatTextDelta(6, "Answer.");
 store.appendChatThinkingDelta(6, "later");
 out.thinkingSegments = turn(6).segments;
 
+// A turn carries the server's times; older logs have none.
+store.setChatUserTurn(7, text("timed"), "c-timed", null, null, 1700000000000);
+store.endChatTurn(7, "end", 0, null, null, null, 1700000009000);
+store.setChatUserTurn(8, text("untimed"), null);
+out.turnTimes = [7, 8].map((n) => [turn(n).startedAt, turn(n).endedAt, turn(n).clientId]);
+
+// A refusal keeps the entry as failed, handing the blocks back once; a resend
+// is marked; only failed entries are cleared together.
+store.queueChatUserTurn("c-fail", text("will fail"));
+out.queuedEntry = (({ clientId, state, reason, resent }) => ({ clientId, state, reason, resent }))(chat().pendingUser[0]);
+out.failHandedBack = store.failChatUserTurn("c-fail", "no agent");
+out.failedAgain = store.failChatUserTurn("c-fail", "again");
+out.failedEntry = (({ state, reason }) => ({ state, reason }))(chat().pendingUser[0]);
+store.queueChatUserTurn("c-keep", text("keep"));
+store.markChatUserTurnResent("c-keep");
+store.clearChatFailedUserTurns();
+out.afterClearFailed = chat().pendingUser.map((p) => [p.clientId, p.state, p.resent]);
+store.dropChatUserTurn("c-keep");
+
+// The inputs the status line and the banner read.
+const seen = [];
+store.subscribe("hostedJob", () => seen.push("job"));
+store.subscribe("starting", () => seen.push("starting"));
+store.subscribe("connectionFailure", () => seen.push("failure"));
+out.initialInputs = [store.getState().hostedJob, store.getState().starting, store.getState().connectionFailure];
+store.setHostedJob({ state: "failed", reason: "no credit", at: 1700000000000 });
+store.setHostedJob({ state: "failed", reason: "no credit", at: 1700000000000 });
+store.setHostedJob({ state: "bogus", at: "soon" });
+out.jobInputs = [store.getState().hostedJob];
+store.setStarting(true);
+store.setStarting(true);
+store.setConnectionFailure({ kind: "offline", message: "You're offline.", action: "none" });
+store.setConnectionFailure({ kind: "offline", message: "You're offline.", action: "none" });
+out.failureInput = store.getState().connectionFailure;
+store.setConnectionFailure(null);
+out.notified = seen;
+out.closed = (() => {
+  store.setChatClosed({ reason: "child_exited", detail: "exit code 1", at: 5 });
+  const set = chat().closed;
+  store.setChatClosed(null);
+  return [set, chat().closed];
+})();
+
 console.log(JSON.stringify(out));
 """
 
@@ -164,3 +207,38 @@ def test_thinking_is_its_own_segment_kept_in_event_order(observed):
     assert [s["kind"] for s in segments] == ["thinking", "text", "thinking"]
     assert segments[0] == {"kind": "thinking", "text": "ab", "truncated": True}
     assert segments[2]["truncated"] is False
+
+
+def test_a_turn_carries_the_server_s_times_when_the_log_has_them(observed):
+    assert observed["turnTimes"] == [[1700000000000, 1700000009000, "c-timed"], [None, None, None]]
+
+
+def test_a_failed_message_stays_as_an_entry_and_is_handed_back_once(observed):
+    assert observed["queuedEntry"] == {
+        "clientId": "c-fail",
+        "state": "sending",
+        "reason": None,
+        "resent": False,
+    }
+    assert observed["failHandedBack"] == [{"type": "text", "text": "will fail"}]
+    assert observed["failedAgain"] is None
+    assert observed["failedEntry"] == {"state": "failed", "reason": "no agent"}
+    assert observed["afterClearFailed"] == [["c-keep", "sending", True]]
+
+
+def test_the_status_and_banner_inputs_notify_only_when_they_change(observed):
+    assert observed["initialInputs"] == [{"state": "none", "reason": None, "at": None}, False, None]
+    assert observed["jobInputs"] == [{"state": "none", "reason": None, "at": None}]
+    assert observed["failureInput"] == {
+        "kind": "offline",
+        "message": "You're offline.",
+        "action": "none",
+    }
+    assert observed["notified"] == ["job", "job", "starting", "failure", "failure"]
+
+
+def test_an_agent_close_is_kept_until_cleared(observed):
+    assert observed["closed"] == [
+        {"reason": "child_exited", "detail": "exit code 1", "at": 5},
+        None,
+    ]

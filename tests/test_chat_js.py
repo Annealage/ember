@@ -34,6 +34,8 @@ globalThis.history = { replaceState() {} };
 globalThis.Node = { ELEMENT_NODE: 1 };
 globalThis.CSS = { escape: (s) => s };
 globalThis.addEventListener = () => {};
+const windowEvents = [];
+globalThis.dispatchEvent = (event) => { windowEvents.push([event.type, event.detail]); return true; };
 
 class El {
   constructor(tag) {
@@ -46,7 +48,7 @@ class El {
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   appendChild(child) { this.children.push(child); return child; }
   append(...kids) { this.children.push(...kids); }
-  remove() {}
+  remove() { this.removed = true; }
   before(...nodes) { (this.inserted ||= []).push(...nodes); }
   after(...nodes) { (this.inserted ||= []).push(...nodes); }
   replaceChildren(...kids) { this.children = [...kids]; }
@@ -81,7 +83,7 @@ globalThis.document = {
 };
 
 const dir = process.argv[2];
-const { initChat, usageSummary } = await import(pathToFileURL(dir + "/chat.js").href);
+const { initChat, usageSummary, agentActivity } = await import(pathToFileURL(dir + "/chat.js").href);
 const { store } = await import(pathToFileURL(dir + "/store.js").href);
 
 const sent = [];
@@ -133,26 +135,71 @@ chat.handleEvent({ kind: "attention", title: "demo: schematic checkpoint", body:
 chat.handleEvent({ kind: "user_turn", turn: 9, blocks: [{ type: "text", text: "done" }] }, { replayed: true });
 out.afterReplayedAnswer = store.getState().chat.banner;
 
-// Ready: a message is sent, and refused after the human started another.
+// Ready: a message is sent. It is a "You" row marked sending from the moment
+// of sending, and is refused after the human started another.
 chat.handleHello({ id: "s", agent: "ready" });
+const liveRows = () => [...new Set(el("chatLog").children)]
+  .filter((r) => (r.className || "").includes("pendingturn") && !r.removed);
+const rowInfo = () => liveRows().map((r) => ({
+  cls: r.children[0].className, text: r.children[0].children[0].textContent,
+  mark: r.children[0].children[3].textContent, markTitle: r.children[0].children[3].title,
+  retry: r.children[0].children[3].children.map((b) => b.textContent),
+}));
+const pendingStates = () => store.getState().chat.pendingUser.map((p) => p.state);
 sendMessage("first");
+const firstId = sent[0].client_id;
 out.clearedOnSend = input.value;
+out.sendingRow = rowInfo();
 input.value = "draft";
-chat.handleRefused("the agent is connecting, so this message was not sent", sent[0].client_id);
+chat.handleRefused("the agent is connecting, so this message was not sent", firstId);
 out.afterRefusal = input.value;
 out.refusalToast = el("toast").textContent;
+// The row stays, marked "Not sent" with the reason and a Retry; the pane is
+// no longer busy for it.
+out.refusedRow = rowInfo();
+out.refusedStates = pendingStates();
+out.refusedBusy = el("chatSend").textContent;
+// Retry sends it again under a new client id and the row is sending again.
+const framesAtRetry = sent.length;
+liveRows()[0].children[0].children[3].children[0].listeners.click[0]();
+const retryId = sent[sent.length - 1].client_id;
+out.retried = { frames: sent.length - framesAtRetry, type: sent[sent.length - 1].type,
+  newId: retryId !== firstId, rows: rowInfo(), states: pendingStates() };
+// The server logs it: the confirmed row replaces the pending one, once.
+chat.handleEvent({ kind: "user_turn", turn: 77, blocks: [{ type: "text", text: "first" }],
+  client_id: retryId, at: 5000 }, { replayed: false });
+out.afterLogged = { rows: rowInfo(), states: pendingStates(), startedAt: store.getState().chat.turns.find((t) => t.turn === 77).startedAt };
+chat.handleEvent({ kind: "turn_end", turn: 77, stop_reason: "end_turn", cost_usd: 0, at: 9000 }, { replayed: false });
+out.endedAt = store.getState().chat.turns.find((t) => t.turn === 77).endedAt;
+out.diagForMessage = windowEvents
+  .filter(([type, d]) => type === "ember:diag" && (d.client_id === firstId || d.client_id === retryId))
+  .map(([, d]) => d.event + ":" + (d.client_id === firstId ? "first" : "retry"));
 
 // A message lost as the connection dropped: the next hello's replay has no
-// user_turn for it, so once the first live event arrives it comes back.
+// user_turn for it, so once the first live event arrives it is sent once more
+// on the new connection under the same client id.
 input.value = "";
 sendMessage("lost one");
+const lostId = sent[sent.length - 1].client_id;
+out.lostRowSending = rowInfo();
+const framesBeforeDrop = sent.length;
 chat.handleHello({ id: "s", agent: "ready" });
 chat.handleEvent({ kind: "text_delta", turn: 1, text: "old" }, { replayed: true });
-out.beforeReplayEnds = input.value;
+out.beforeReplayEnds = { composer: input.value, resent: sent.length - framesBeforeDrop };
 chat.handleEvent({ kind: "viewer_primary" }, { replayed: false });
-out.afterReplayEnds = input.value;
+out.afterReplayEnds = {
+  composer: input.value, toast: el("toast").textContent, states: pendingStates(),
+  resent: sent.slice(framesBeforeDrop).map((f) => [f.type, f.client_id === lostId, f.blocks[0].text]),
+};
+// Resent once only: a second drop with it still unanswered hands it back,
+// with the reason, and its row says it was not sent.
+chat.handleHello({ id: "s", agent: "ready" });
+chat.handleEvent({ kind: "viewer_primary" }, { replayed: false });
 out.lostToast = el("toast").textContent;
-out.pending = store.getState().chat.pendingUser.length;
+out.lostComposer = input.value;
+out.lostRow = rowInfo();
+out.pending = pendingStates();
+out.framesAfterSecondDrop = sent.length - framesBeforeDrop;
 
 // A held message released at live goes out after the connection began: its
 // hello cannot vouch for it either way, so it is not "lost".
@@ -162,7 +209,7 @@ chat.adoptSent(sent[sent.length - 1].client_id);
 chat.handleHello({ id: "s", agent: "ready" });
 chat.handleEvent({ kind: "viewer_primary" }, { replayed: false });
 out.heldRestored = input.value;
-out.heldPending = store.getState().chat.pendingUser.length;
+out.heldPending = store.getState().chat.pendingUser.filter((p) => p.state === "sending").length;
 
 // Usage, before the agent status: from the hello, then from live events only.
 const usageChip = el("agentStatus").inserted.find((n) => n.className === "chatusage");
@@ -559,6 +606,114 @@ out.thinkingBlocks = {
   noteHidden: thinkingNodes[0].children[2].hidden,
   bannerKept: store.getState().chat.banner && store.getState().chat.banner.text,
 };
+// The status line: one answer from the store, drawn in one place.
+const T0 = 1800000000000;
+clock = T0;
+const hhmm = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const dated = (ms) => new Date(ms).toLocaleDateString([], { day: "numeric", month: "short" }) + " " + hhmm(ms);
+const status = () => ({
+  text: el("agentStatus").textContent, state: el("agentStatus").dataset.state, title: el("agentStatus").title,
+});
+const hi = [{ type: "text", text: "hi" }];
+const fresh = { replayed: false };
+store.clearChatBanner();
+chat.handleHello({ id: "st1", agent: "ready" });
+out.statusNoLog = status();
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: hi, at: T0 - 252000 }, fresh);
+out.statusWorking = status();
+out.statusTurnStarted = el("chat").dataset.turnStarted;
+chat.handleEvent({ kind: "tool_use", turn: 1, tool_use_id: "t1", name: "mcp__loom__stage_review", input: {} }, fresh);
+out.statusTool = status().text;
+chat.handleEvent({ kind: "tool_result", tool_use_id: "t1", is_error: false, text: "ok" }, fresh);
+out.statusToolDone = status().text;
+clock = T0 + 60000;
+chat.handleEvent({ kind: "text_delta", turn: 1, text: "x" }, fresh);
+out.statusLater = status().text;
+chat.handleEvent({ kind: "permission_request", request_id: "pr_s", tool: "t", input: {} }, fresh);
+out.statusWaiting = status();
+chat.handleEvent({ kind: "permission_resolved", request_id: "pr_s", outcome: "allow" }, fresh);
+store.setPaused(true);
+out.statusPaused = status();
+store.setPaused(false);
+store.setStarting(true);
+out.statusStarting = status();
+store.setStarting(false);
+out.statusBackToWorking = status().state;
+chat.handleEvent({ kind: "turn_end", turn: 1, stop_reason: "end_turn", cost_usd: 0, at: T0 + 5000 }, fresh);
+out.statusFinished = { ...status(), expected: "Finished " + hhmm(T0 + 5000), paneWorking: "working" in el("chat").dataset };
+clock = T0 + 3 * 86400000;
+store.setStarting(true);
+store.setStarting(false);
+out.statusFinishedOtherDay = { text: status().text, expected: "Finished " + dated(T0 + 5000) };
+
+// A job that ended while the transcript still holds a turn open is never working.
+clock = T0;
+chat.handleHello({ id: "st2", agent: "ready" });
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: hi, at: T0 - 5000 }, fresh);
+store.setHostedJob({ state: "succeeded", reason: null, at: T0 + 9000 });
+out.statusJobEndedOpenTurn = {
+  ...status(), expected: "Finished " + hhmm(T0 + 9000), paneWorking: "working" in el("chat").dataset,
+};
+store.setHostedJob({ state: "failed", reason: "ran out of credit", at: T0 + 9000 });
+out.statusJobFailed = { ...status(), expected: "Stopped " + hhmm(T0 + 9000) + ": ran out of credit" };
+store.setHostedJob({ state: "lost", reason: null, at: null });
+out.statusJobLost = status().text;
+store.setHostedJob({ state: "running", reason: null, at: null });
+out.statusJobRunning = status().state;
+store.setHostedJob({ state: "none", reason: null, at: null });
+
+// The agent closing: an error stops it, the ordinary reasons do not.
+chat.handleHello({ id: "st3", agent: "unavailable" });
+chat.handleEvent({ kind: "agent_closed", reason: "child_exited", detail: "exit code 1", at: T0 + 2000 }, fresh);
+out.statusClosedError = { ...status(), expected: "Stopped " + hhmm(T0 + 2000) + ": exit code 1" };
+chat.handleEvent({ kind: "agent_closed", reason: "idle", detail: null, at: T0 + 3000 }, fresh);
+out.statusClosedNormal = status();
+chat.handleHello({ id: "viewer-only", agent: "unavailable" });
+out.statusViewerOnly = status();
+
+// No combination of inputs shows an idle or stopped agent with a timer, or a
+// working one with no open turn.
+const base = store.getState();
+const openTurn = { turn: 1, complete: false, segments: [], startedAt: 1000, endedAt: null };
+const doneTurn = { turn: 1, complete: true, segments: [], startedAt: 1000, endedAt: 2000 };
+const violations = [];
+for (const job of ["none", "starting", "running", "succeeded", "failed", "lost"]) {
+  for (const turns of [[], [openTurn], [doneTurn]]) {
+    for (const starting of [false, true]) {
+      for (const paused of [false, true]) {
+        for (const agentStatus of ["connecting", "ready", "unavailable", "idle", "closed"]) {
+          const a = agentActivity({ ...base, starting, paused, hostedJob: { state: job, reason: null, at: 3000 },
+            chat: { ...base.chat, turns, agentStatus, pending: [], banner: null, closed: null } });
+          const label = JSON.stringify([job, turns.length && turns[0].complete, starting, paused, agentStatus, a.state]);
+          if (a.state !== "working" && a.startedAt !== null) violations.push("timer " + label);
+          if (a.state === "working" && !turns.some((t) => !t.complete)) violations.push("no turn " + label);
+          if (["succeeded", "failed", "lost"].includes(job) && !starting && a.state === "working") violations.push("ended " + label);
+        }
+      }
+    }
+  }
+}
+out.activityViolations = violations;
+
+// A failure the page cannot recover from is the banner, with its action.
+chat.handleHello({ id: "st4", agent: "ready" });
+store.clearChatBanner();
+out.bannerBefore = el("chatBanner").hidden;
+store.setConnectionFailure({ kind: "unreachable", message: "Can't reach the agent. Retrying\u2026", action: "retry" });
+const failureButton = el("chatBannerText").inserted[0];
+out.failureBanner = {
+  hidden: el("chatBanner").hidden, kind: el("chatBanner").dataset.kind, text: el("chatBannerText").textContent,
+  action: failureButton.textContent, actionHidden: failureButton.hidden, closeHidden: el("chatBannerClose").hidden,
+};
+failureButton.listeners.click[0]();
+out.failureActions = windowEvents.filter(([type]) => type === "ember:failure-action").map(([, d]) => d.action);
+store.setConnectionFailure({ kind: "offline", message: "You're offline. Messages send when you're back.", action: "none" });
+out.offlineBanner = { text: el("chatBannerText").textContent, actionHidden: failureButton.hidden };
+store.setConnectionFailure(null);
+out.failureCleared = {
+  hidden: el("chatBanner").hidden, actionHidden: failureButton.hidden, closeHidden: el("chatBannerClose").hidden,
+};
+
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -624,11 +779,164 @@ def test_a_refused_message_goes_back_in_front_of_what_was_typed_since(observed):
     )
 
 
-def test_a_message_lost_in_a_drop_comes_back_when_the_replay_ends(observed):
-    assert observed["beforeReplayEnds"] == ""
-    assert observed["afterReplayEnds"] == "lost one"
+def test_a_message_is_a_row_marked_sending_from_the_moment_of_sending(observed):
+    sending = {
+        "cls": "msg user sending",
+        "text": "first",
+        "mark": "Sending",
+        "markTitle": "",
+        "retry": [],
+    }
+    assert observed["sendingRow"] == [sending]
+    # Refused: the row stays as "Not sent" with the reason and a Retry, and the
+    # message is also back in the composer.
+    assert observed["refusedRow"] == [
+        {
+            "cls": "msg user notsent",
+            "text": "first",
+            "mark": "Not sent ",
+            "markTitle": "the agent is connecting, so this message was not sent",
+            "retry": ["Retry"],
+        }
+    ]
+    assert observed["refusedStates"] == ["failed"]
+
+
+def test_retry_sends_the_message_again_and_the_server_s_user_turn_replaces_its_row(observed):
+    retried = observed["retried"]
+    assert (retried["frames"], retried["type"], retried["newId"]) == (1, "turn", True)
+    assert retried["rows"] == [
+        {
+            "cls": "msg user sending",
+            "text": "first",
+            "mark": "Sending",
+            "markTitle": "",
+            "retry": [],
+        }
+    ]
+    assert retried["states"] == ["sending"]
+    # Logged: the confirmed row takes its place, no duplicate pending row, and
+    # the turn carries the server's own times.
+    assert observed["afterLogged"] == {"rows": [], "states": [], "startedAt": 5000}
+    assert observed["endedAt"] == 9000
+
+
+def test_the_hops_of_a_message_are_reported_by_client_id_and_never_its_text(observed):
+    assert observed["diagForMessage"] == [
+        "msg_send:first",
+        "msg_shown:first",
+        "msg_send:retry",
+        "msg_shown:retry",
+        "msg_logged:retry",
+    ]
+
+
+def test_a_message_lost_in_a_drop_is_sent_once_more_on_the_new_connection(observed):
+    assert observed["lostRowSending"][0]["text"] == "lost one"
+    assert observed["beforeReplayEnds"] == {"composer": "", "resent": 0}
+    after = observed["afterReplayEnds"]
+    # The same client id, so the server can drop a duplicate; nothing restored.
+    assert after["resent"] == [["turn", True, "lost one"]]
+    assert after["composer"] == "" and after["states"] == ["sending"]
+    assert "never arrived" not in after["toast"]
+
+
+def test_a_message_still_unanswered_after_its_resend_goes_back_with_a_not_sent_row(observed):
+    assert observed["lostComposer"] == "lost one"
     assert "never arrived; it is back in the box" in observed["lostToast"]
-    assert observed["pending"] == 0
+    assert observed["framesAfterSecondDrop"] == 1, "resent once, not on every connection"
+    assert observed["pending"] == ["failed"]
+    assert observed["lostRow"] == [
+        {
+            "cls": "msg user notsent",
+            "text": "lost one",
+            "mark": "Not sent ",
+            "markTitle": "The connection dropped before it arrived",
+            "retry": ["Retry"],
+        }
+    ]
+
+
+def test_the_status_line_says_what_the_agent_is_doing_and_nothing_else_writes_it(observed):
+    assert observed["statusNoLog"]["text"] == "Idle"
+    assert observed["statusNoLog"]["state"] == "idle"
+    # An open turn: the elapsed time runs from the server's time for it, and
+    # the running tool is the detail.
+    assert (observed["statusWorking"]["text"], observed["statusWorking"]["state"]) == (
+        "Working 4:12",
+        "working",
+    )
+    assert observed["statusTurnStarted"] == str(1800000000000 - 252000)
+    assert observed["statusTool"] == "Working 4:12 \u00b7 loom: stage_review"
+    assert observed["statusToolDone"] == "Working 4:12"
+    assert observed["statusLater"] == "Working 5:12"
+    assert (observed["statusWaiting"]["text"], observed["statusWaiting"]["state"]) == (
+        "Waiting for you",
+        "waiting",
+    )
+    assert (observed["statusPaused"]["text"], observed["statusPaused"]["state"]) == (
+        "Paused",
+        "paused",
+    )
+    assert (observed["statusStarting"]["text"], observed["statusStarting"]["state"]) == (
+        "Starting",
+        "starting",
+    )
+    assert observed["statusBackToWorking"] == "working"
+
+
+def test_a_finished_turn_shows_its_end_as_a_local_time_with_the_date_when_not_today(observed):
+    finished = observed["statusFinished"]
+    assert finished["text"] == finished["expected"] and finished["state"] == "idle"
+    assert finished["paneWorking"] is False
+    other = observed["statusFinishedOtherDay"]
+    assert other["text"] == other["expected"]
+    assert other["text"] != finished["text"]
+
+
+def test_a_job_that_ended_never_reads_as_working_whatever_the_transcript_holds(observed):
+    ended = observed["statusJobEndedOpenTurn"]
+    assert ended["text"] == ended["expected"] and ended["state"] == "idle"
+    assert ended["paneWorking"] is False
+    failed = observed["statusJobFailed"]
+    assert failed["text"] == failed["expected"] and failed["state"] == "stopped"
+    assert observed["statusJobLost"] == "Stopped: the agent was lost"
+    assert observed["statusJobRunning"] == "working"
+    assert observed["activityViolations"] == []
+
+
+def test_an_agent_that_closed_with_an_error_is_stopped_and_an_ordinary_close_is_not(observed):
+    closed = observed["statusClosedError"]
+    assert closed["text"] == closed["expected"] and closed["state"] == "stopped"
+    assert (observed["statusClosedNormal"]["text"], observed["statusClosedNormal"]["state"]) == (
+        "Idle",
+        "idle",
+    )
+    assert observed["statusViewerOnly"]["text"] == "Idle"
+    assert observed["statusViewerOnly"]["title"].startswith("This server runs viewer-only")
+
+
+def test_a_failure_shows_in_the_banner_with_its_action_and_clears_with_the_failure(observed):
+    assert observed["bannerBefore"] is True
+    assert observed["failureBanner"] == {
+        "hidden": False,
+        "kind": "error",
+        "text": "Can't reach the agent. Retrying\u2026",
+        "action": "Retry now",
+        "actionHidden": False,
+        "closeHidden": True,
+    }
+    # The pane only tells the window; the page acts on it.
+    assert observed["failureActions"] == ["retry"]
+    assert observed["offlineBanner"] == {
+        "text": "You're offline. Messages send when you're back.",
+        "actionHidden": True,
+    }
+    assert observed["failureCleared"] == {
+        "hidden": True,
+        "actionHidden": True,
+        "closeHidden": False,
+    }
 
 
 def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_events(observed):
