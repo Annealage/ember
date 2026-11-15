@@ -82,6 +82,24 @@
  * `pause_changed` event, so its caller has one path to reconcile rather than
  * two; a replayed one is not passed on, since the hello already said what the
  * flag is now.
+ *
+ * Recovery is silent. The page's lifecycle (`visibilitychange` to visible,
+ * `pageshow`, `resume`, `online`) checks the socket at once: one that is not
+ * open, or that has heard nothing for twice the server's ping interval (a tab
+ * the phone froze), is closed and reopened immediately with the backoff reset,
+ * and a hosted page with no worker asks the gate again at once. Nothing about
+ * this is shown. A failure is entered (`store.setConnectionFailure`) only once
+ * the page has been visible for 10 s without being live (hidden time does not
+ * count), or at once for a definite one: the sign-in is refused (a probe 403,
+ * a front 401) or the protocol has moved on. It clears when the socket is live
+ * again or the gate is closed (no worker, which is not a failure). The
+ * `ember:failure-action` window event with action `retry` reconnects now. The
+ * fallback poll runs underneath regardless, unannounced.
+ *
+ * Transport diagnostics for the page's own log go out as `ember:diag` window
+ * events (`page_hidden`, `page_shown`, `page_frozen`, `page_resumed`,
+ * `page_online`, `page_offline`, and `msg_written` for each `turn` frame
+ * `send` handles, with the socket's `ready_state` and `buffered` bytes).
  */
 
 import { store } from "./store.js";
@@ -124,6 +142,23 @@ const SIGN_IN_MESSAGE =
 const MISMATCH_MESSAGE =
   "This page is running an older build than the server now speaks. " +
   "Reload the page to pick up the current one.";
+
+// The server's ping cadence (http/ws.py PING_INTERVAL). A socket that has
+// heard nothing for twice this is dead, whatever its readyState still says.
+const PING_INTERVAL_MS = 5000;
+const STALE_AFTER_MS = 2 * PING_INTERVAL_MS;
+// How long the page must be visible and not live before a failure is shown.
+const FAILURE_VISIBLE_MS = 10000;
+// Lifecycle events arrive together (visibilitychange, pageshow, online); one
+// reconnect serves them all.
+const KICK_DEBOUNCE_MS = 1000;
+
+const FAILURES = {
+  signed_out: { message: "You're signed out.", action: "sign_in" },
+  protocol: { message: "Loom has been updated.", action: "reload" },
+  unreachable: { message: "Can't reach the agent. Retrying…", action: "retry" },
+  offline: { message: "You're offline. Messages send when you're back.", action: "none" },
+};
 
 /**
  * Reads and consumes the per-run token from location.hash: "#t=<token>"
@@ -213,12 +248,14 @@ const TOKEN = await extractToken();
 // refused: a stale link, or a login this server does not take.
 const REFUSED = TOKEN ? REFUSED_MESSAGE : SIGN_IN_MESSAGE;
 
+// Recovery is invisible: connecting, live and polling carry no label.
 const CONN_LABEL = {
-  connecting: "Connecting…",
-  live: "Live",
-  polling: "Polling",
+  connecting: "",
+  live: "",
+  polling: "",
   idle: "Idle",
   refused: TOKEN ? "Reopen URL" : "Sign in",
+  failed: "",
 };
 // The generic tooltips; a product names what "live" and "polling" mean for
 // it through `initWs`'s `connTitles`.
@@ -359,6 +396,17 @@ export function initWs({
   let historyFloor = 0;
   const delivered = new Map();
   let gateClosed = false; // whether the last gate answer was false, so gate_closed is reported once per episode
+  let connectEpoch = 0; // bumped by reconnectNow: a gate answer or probe already in flight from before it is ignored
+  let lastRx = Date.now(); // when this socket last delivered anything
+  let lastKick = -Infinity;
+  let hiddenFlag = false;
+  // The failure model: visible time spent not live, the failure shown (null
+  // for none), and the timer that will show one.
+  let downActive = false;
+  let downMs = 0;
+  let downSince = null; // when the page last became visible during this episode; null while hidden
+  let failureTimer = null;
+  let failureKind = null;
 
   function diag(event, detail = {}) {
     try {
@@ -368,6 +416,89 @@ export function initWs({
     }
   }
 
+  function emit(event, detail = {}) {
+    try {
+      if (typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
+        window.dispatchEvent(new CustomEvent("ember:diag", { detail: { event, ...detail } }));
+      }
+    } catch (err) {
+      // a reporter must never break the transport it reports on
+    }
+  }
+
+  const pageVisible = () => document.visibilityState !== "hidden";
+
+  function clearFailure() {
+    if (failureKind === null) return;
+    failureKind = null;
+    store.setConnectionFailure(null);
+  }
+
+  function failNow(kind) {
+    if (failureKind === kind) return;
+    failureKind = kind;
+    clearTimeout(failureTimer);
+    failureTimer = null;
+    if (kind === "unreachable" || kind === "offline") store.setConnection("failed");
+    store.setConnectionFailure({ kind, ...FAILURES[kind] });
+  }
+
+  function visibleElapsed() {
+    return downMs + (downSince === null ? 0 : Date.now() - downSince);
+  }
+
+  function armFailureTimer() {
+    clearTimeout(failureTimer);
+    failureTimer = null;
+    if (!downActive || failureKind !== null || downSince === null) return;
+    failureTimer = setTimeout(onDownTimeout, Math.max(0, FAILURE_VISIBLE_MS - visibleElapsed()));
+  }
+
+  function onDownTimeout() {
+    failureTimer = null;
+    if (!downActive || stopped || failureKind !== null) return;
+    if (visibleElapsed() < FAILURE_VISIBLE_MS) {
+      armFailureTimer();
+      return;
+    }
+    const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+    failNow(offline ? "offline" : "unreachable");
+  }
+
+  // The page has stopped being live: from here visible time counts.
+  function startDown() {
+    if (downActive || stopped) return;
+    downActive = true;
+    downMs = 0;
+    downSince = pageVisible() ? Date.now() : null;
+    armFailureTimer();
+  }
+
+  // No more failure timing, whatever is shown stays (a terminal failure).
+  function settleDown() {
+    downActive = false;
+    downMs = 0;
+    downSince = null;
+    clearTimeout(failureTimer);
+    failureTimer = null;
+  }
+
+  // Live again, or nothing to connect to: not a failure any more.
+  function endDown() {
+    settleDown();
+    clearFailure();
+  }
+
+  // Same episode, but the ten seconds start over (the network came back, or
+  // the failure shown was a different one).
+  function restartDown() {
+    clearFailure();
+    if (!downActive) return;
+    downMs = 0;
+    downSince = pageVisible() ? Date.now() : null;
+    armFailureTimer();
+  }
+
   // A Map rather than the object itself, so an event kind can never resolve
   // to something the object inherited ("constructor", "toString").
   const productHandlers = new Map(Object.entries(onEvent));
@@ -375,7 +506,9 @@ export function initWs({
 
   function applyConnIndicator(state) {
     if (!indicator) return;
-    indicator.textContent = CONN_LABEL[state.connection] || state.connection;
+    const label = Object.hasOwn(CONN_LABEL, state.connection)
+      ? CONN_LABEL[state.connection] : state.connection;
+    indicator.textContent = label;
     indicator.title = titles[state.connection] || "";
     indicator.dataset.state = state.connection;
   }
@@ -405,11 +538,20 @@ export function initWs({
       historyBefore = frame.before;
       if (frame.before === null) initialHistoryExpected = true;
     }
+    let written = false;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ ...frame, v: PROTOCOL_VERSION }));
-      return true;
+      written = true;
     }
-    return false;
+    if (frame.type === "turn") {
+      emit("msg_written", {
+        client_id: typeof frame.client_id === "string" ? frame.client_id : null,
+        ready_state: ws ? ws.readyState : 3,
+        buffered: (ws && ws.bufferedAmount) || 0,
+        ok: written,
+      });
+    }
+    return written;
   }
 
   function clearLiveness() {
@@ -444,9 +586,11 @@ export function initWs({
     if (stopped) return;
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+    if (!gateClosed) startDown();
     if (beforeConnect) {
+      const epoch = connectEpoch;
       Promise.resolve().then(beforeConnect).then((allowed) => {
-        if (stopped) return;
+        if (stopped || epoch !== connectEpoch) return;
         const banner = document.getElementById("err");
         if (gateError && banner?.textContent === gateError) {
           banner.textContent = "";
@@ -460,9 +604,16 @@ export function initWs({
           scheduleGateRetry();
         }
       }, (error) => {
-        if (stopped) return;
+        if (stopped || epoch !== connectEpoch) return;
         gateError = `Live connection unavailable: ${error?.message || String(error)}`;
-        showError(gateError);
+        if (error?.status === 401 || error?.status === 403) {
+          // The front says this page's login is not (or no longer) good:
+          // the banner names the fix, and the retry goes on beneath it.
+          failNow("signed_out");
+        } else {
+          if (failureKind === "signed_out") restartDown();
+          showError(gateError);
+        }
         diag("gate_error", { message: String(error?.message || error).slice(0, 200) });
         scheduleRetry();
       });
@@ -471,10 +622,28 @@ export function initWs({
     openSocket();
   }
 
-  function openSocket() {
+  // Drops the current socket without its close event meaning anything: every
+  // handler below checks it is still the live socket.
+  function dropSocket() {
+    const old = ws;
+    ws = null;
     opened = false;
+    clearLiveness();
+    if (old) {
+      try {
+        old.close();
+      } catch (err) {
+        // already closing or closed
+      }
+    }
+  }
+
+  function openSocket() {
+    dropSocket();
+    startDown();
+    let sock;
     try {
-      ws = new WebSocket(wsUrl());
+      sock = new WebSocket(wsUrl());
     } catch (err) {
       // Malformed URL or a browser that refuses to construct a WebSocket
       // (e.g. mixed content); nothing to learn from this beyond "try again
@@ -482,14 +651,16 @@ export function initWs({
       probeRefusal();
       return;
     }
+    ws = sock;
+    lastRx = Date.now();
     resetLiveness();
-    ws.addEventListener("open", handleOpen);
-    ws.addEventListener("message", handleMessage);
-    ws.addEventListener("close", handleClose);
+    sock.addEventListener("open", (event) => { if (ws === sock) handleOpen(event); });
+    sock.addEventListener("message", (event) => { if (ws === sock) handleMessage(event); });
+    sock.addEventListener("close", (event) => { if (ws === sock) handleClose(event); });
     // No separate handling in "error": the WebSocket spec fires close right
     // after error for every failure mode, and close is where readyState and
     // the close code are both available, so all decisions are made there.
-    ws.addEventListener("error", () => {});
+    sock.addEventListener("error", () => {});
   }
 
   function handleOpen() {
@@ -513,6 +684,7 @@ export function initWs({
     // alive; this is the one reset shared by the "never got a hello"
     // and "went idle after hello" halves of the liveness deadline.
     resetLiveness();
+    lastRx = Date.now();
     let frame;
     try {
       frame = JSON.parse(event.data);
@@ -631,6 +803,7 @@ export function initWs({
     fallbackFired = false;
     clearTimeout(fallbackTimer);
     fallbackTimer = null;
+    endDown();
     store.setConnection("live");
     if (recovered) diag("live", { recovered: true });
     // The product's resync, on every (re)connect: it stops its fallback poll
@@ -721,6 +894,7 @@ export function initWs({
 
   function handleProtocolMismatch() {
     stopped = true;
+    settleDown();
     clearLiveness();
     clearTimeout(fallbackTimer);
     clearTimeout(reconnectTimer);
@@ -734,6 +908,7 @@ export function initWs({
     showError(MISMATCH_MESSAGE);
     diag("protocol_mismatch");
     store.setConnection("polling");
+    failNow("protocol");
     onFallback();
   }
 
@@ -761,6 +936,7 @@ export function initWs({
       // the fallback never fires at all: the page then shows a live socket
       // and runs neither the push nor the poll, which is the exact outcome
       // the fallback exists to prevent.
+      startDown();
       store.setConnection("connecting");
       scheduleRetry();
       return;
@@ -778,8 +954,10 @@ export function initWs({
 
   async function probeRefusal() {
     if (stopped) return;
+    const epoch = connectEpoch;
     try {
       const res = await fetch(wsPath(), { cache: "no-store" });
+      if (stopped || epoch !== connectEpoch) return;
       diag("probe", { status: res.status });
       if (res.status === 403) {
         // Confirmed: this exact request, over a channel that does expose
@@ -802,14 +980,20 @@ export function initWs({
         // with no token too.)
         diag("refused");
         stopped = true;
+        settleDown();
         clearTimeout(fallbackTimer);
         fallbackTimer = null;
         store.setConnection("refused");
         showError(REFUSED);
+        failNow("signed_out");
         onFallback();
         return;
       }
+      // The front's own sign-in refusal: not terminal, since signing in
+      // again lets the retry through, but named now rather than after 10 s.
+      if (res.status === 401) failNow("signed_out");
     } catch (err) {
+      if (stopped || epoch !== connectEpoch) return;
       diag("probe", { status: 0, message: String(err?.message || err).slice(0, 200) });
       // The probe failed too (offline, DNS, TLS): no more information than
       // the WebSocket attempt already gave. Falls through to the ordinary
@@ -822,6 +1006,8 @@ export function initWs({
   // downtime started is the product's to stop (`onGated`).
   function scheduleGateRetry() {
     if (stopped) return;
+    endDown();
+    clearTimeout(reconnectTimer);
     clearTimeout(fallbackTimer);
     fallbackTimer = null;
     fallbackFired = false;
@@ -836,6 +1022,7 @@ export function initWs({
 
   function scheduleRetry() {
     if (stopped) return;
+    clearTimeout(reconnectTimer);
     if (!fallbackFired && fallbackTimer === null) {
       // Only armed once per downtime episode: repeated failures before it
       // fires must not stack a second timer that fires again later and
@@ -853,6 +1040,101 @@ export function initWs({
     attempt++;
   }
 
+  // Reconnect now, whatever state the transport is in: the socket (if any)
+  // is dropped, the backoff forgotten, and the gate asked again at once.
+  function reconnectNow(source, force = false) {
+    if (stopped) return;
+    const now = Date.now();
+    if (!force && now - lastKick < KICK_DEBOUNCE_MS) return;
+    lastKick = now;
+    connectEpoch++;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    dropSocket();
+    attempt = 0;
+    connect();
+  }
+
+  // The page is back (visible, shown, resumed, online): a socket that is
+  // open and has been heard from recently is left alone, anything else is
+  // replaced now rather than after its own timers notice.
+  function wake(source) {
+    if (stopped) return;
+    const healthy = ws && opened && ws.readyState === WebSocket.OPEN
+      && Date.now() - lastRx <= STALE_AFTER_MS;
+    if (healthy) return;
+    reconnectNow(source);
+  }
+
+  function markHidden(source) {
+    if (downActive && downSince !== null) {
+      downMs += Date.now() - downSince;
+      downSince = null;
+      clearTimeout(failureTimer);
+      failureTimer = null;
+    }
+    if (!hiddenFlag) {
+      hiddenFlag = true;
+      emit("page_hidden", { source });
+    }
+  }
+
+  function markShown(source) {
+    if (!pageVisible()) return;
+    if (downActive && downSince === null) {
+      downSince = Date.now();
+      armFailureTimer();
+    }
+    if (hiddenFlag) {
+      hiddenFlag = false;
+      emit("page_shown", { source });
+    }
+  }
+
+  function listenToPage() {
+    const doc = typeof document !== "undefined" ? document : null;
+    if (doc && typeof doc.addEventListener === "function") {
+      doc.addEventListener("visibilitychange", () => {
+        if (pageVisible()) {
+          markShown("visibilitychange");
+          wake("visibilitychange");
+        } else {
+          markHidden("visibilitychange");
+        }
+      });
+      doc.addEventListener("freeze", () => {
+        emit("page_frozen");
+        markHidden("freeze");
+      });
+      doc.addEventListener("resume", () => {
+        emit("page_resumed");
+        markShown("resume");
+        wake("resume");
+      });
+    }
+    if (typeof window.addEventListener !== "function") return;
+    window.addEventListener("pagehide", () => markHidden("pagehide"));
+    window.addEventListener("pageshow", () => {
+      markShown("pageshow");
+      wake("pageshow");
+    });
+    window.addEventListener("offline", () => emit("page_offline"));
+    window.addEventListener("online", () => {
+      emit("page_online");
+      // The ten seconds of an offline failure were spent with no network,
+      // which says nothing about the server: start them over.
+      if (failureKind === "offline") {
+        restartDown();
+        if (store.getState().connection === "failed") store.setConnection("connecting");
+      }
+      wake("online");
+    });
+    window.addEventListener("ember:failure-action", (event) => {
+      if (event.detail && event.detail.action === "retry") reconnectNow("retry", true);
+    });
+  }
+
+  listenToPage();
   connect();
 
   // `send` is the only capability this module hands back: chat.js's turn,
