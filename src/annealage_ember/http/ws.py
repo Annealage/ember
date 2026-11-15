@@ -793,6 +793,9 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
     # the lock. A context that will not resolve refuses the message, with the
     # product's reason, before anything is logged.
     agent_blocks = None
+    if _is_duplicate_turn(event_log, frame):
+        _note_turn(frame.get("client_id"), "duplicate")
+        return
     if turn_context.has_context(frame["blocks"]):
         try:
             agent_blocks = await turn_context.agent_blocks(
@@ -800,6 +803,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
             )
         except turn_context.ContextRefused as exc:
             await ws.send(json.dumps(protocol.build_refused(str(exc), frame.get("client_id"))))
+            _note_turn(frame.get("client_id"), "refused:context")
             return
     if bus is not None:
         async with bus.turn_submission_lock:
@@ -902,6 +906,13 @@ async def _submit_turn_locked(
     scheduled, so the page receives events in seq order even when a steer
     lands mid-stream.
 
+    A frame whose ``client_id`` already has a ``user_turn`` in this session's
+    log (``EventLog.has_user_turn``) is a resend of a message the server did
+    get, so it is dropped first of all, before the admission checks (hosted
+    admission would refuse it as "another turn running") and without an error
+    frame: the replay already carries the turn. Only a turn that was logged is
+    indexed, so a refused one can be sent again.
+
     ``agent_blocks``, when given, is what the agent receives in place of the
     frame's blocks: the same message with its ``context`` blocks resolved
     (``turn_context.agent_blocks``). The log keeps the frame's own blocks.
@@ -909,6 +920,9 @@ async def _submit_turn_locked(
     blocks = frame["blocks"]
     sent_blocks = blocks if agent_blocks is None else agent_blocks
     client_id = frame.get("client_id")
+    if _is_duplicate_turn(event_log, frame):
+        _note_turn(client_id, "duplicate")
+        return
     holder = getattr(bus, "agent_holder", None)
     hosted_principal = None
     hosted_generation = None
@@ -921,16 +935,19 @@ async def _submit_turn_locked(
         turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)
     )
     if blocked_reason is not None:
+        _note_turn(client_id, "refused:%s" % blocked_reason)
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
         return
     if bus is not None and getattr(bus, "hosted_mode", False):
         if hosted_authority.fenced_out():
             # This frame waited for the lock while an interrupt cancelled it.
+            _note_turn(client_id, "refused:fenced")
             return
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
         refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
+            _note_turn(client_id, "refused:%s" % refusal)
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
         hosted_principal = bus.hosted_turn_principal
@@ -942,6 +959,7 @@ async def _submit_turn_locked(
             events.note(conn.human)
     if on_admitted is not None:
         on_admitted()
+    _note_turn(client_id, "admitted")
     turn = None
     if bus is not None:
         blocks_to_send = bus.begin_turn(sent_blocks, by=conn.human)
@@ -961,6 +979,7 @@ async def _submit_turn_locked(
                 review_notification_ids=frame.get("review_notification_ids"),
             ),
         )
+        _note_turn_logged(client_id, turn)
         bus.mark_turn_submitted(turn)
         if records is not None:
             # Before the session sees the turn, so the durable copy of what
@@ -1018,6 +1037,43 @@ def _pending_tool(bus, request_id):
     except Exception:
         pass
     return None
+
+
+def _note_turn(client_id, outcome):
+    """One INFO line when a ``turn`` frame has been decided: ``outcome`` is
+    ``admitted``, ``refused:<reason>`` or ``duplicate``. With ``_note_turn_logged``
+    it lets a message that "didn't show" be placed hop by hop. Only the page's
+    own ``client_id`` and the outcome, never the message, whose text must not
+    reach a log."""
+    sys.stderr.write(
+        "info: turn received client_id=%s outcome=%s\n"
+        % (client_id if client_id is not None else "-", " ".join(str(outcome).split()))
+    )
+
+
+def _note_turn_logged(client_id, turn):
+    """One INFO line when the frame's ``user_turn`` has been appended."""
+    sys.stderr.write(
+        "info: turn logged client_id=%s turn=%s\n"
+        % (client_id if client_id is not None else "-", turn)
+    )
+
+
+def _is_duplicate_turn(event_log, frame):
+    """Whether ``frame`` is a ``turn`` this session's log already holds: a
+    ``client_id`` with a ``user_turn`` and no ``redelivery_of``. A page that
+    resends a message the replay showed the server never got sends the same
+    ``client_id``; when the first did arrive, the replay already carries the
+    turn, so the resend changes nothing and is answered with nothing. A
+    redelivery (``AgentHolder._redeliver``) is the server's own turn, which
+    reuses its original's ``client_id`` by design and never comes through
+    here, but a frame that says it is one is exempt all the same."""
+    client_id = frame.get("client_id")
+    return (
+        client_id is not None
+        and frame.get("redelivery_of") is None
+        and event_log.has_user_turn(client_id)
+    )
 
 
 def _publish(event_log, registry, event):

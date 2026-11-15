@@ -110,8 +110,13 @@ async def test_the_human_s_own_message_is_logged_and_broadcast_before_the_sessio
         "client_id": "c-1",
         "viewer": "tab-1",
     }
+    # The server stamps ``at`` once; the logged and broadcast copies carry the same.
+    logged_at = seen_at_submit[0][0].pop("at")
+    assert isinstance(logged_at, int)
     assert seen_at_submit == [[expected]]
-    assert [frame["event"] for frame in registry.broadcasts] == [expected]
+    (broadcast,) = (frame["event"] for frame in registry.broadcasts)
+    assert broadcast.pop("at") == logged_at
+    assert [broadcast] == [expected]
     # The session still got the note; only the log leaves it out.
     assert "requirements.md" in session.submitted_turns[0][0][0]["text"]
 

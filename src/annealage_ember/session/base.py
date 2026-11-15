@@ -23,6 +23,7 @@ test with no event log and no registry in play at all, and what will let
 from __future__ import annotations
 
 import dataclasses
+import time
 from typing import ClassVar, Optional, Protocol, Tuple, runtime_checkable
 
 # session.agent values for the hello frame (plan section 3.3): the SDK
@@ -98,6 +99,16 @@ class UnknownRequest(Exception):
     reply that their click did not decide anything, which is the one outcome a
     silently swallowed exception makes indistinguishable from success.
     """
+
+
+def stamp_ms() -> int:
+    """The server's clock as epoch milliseconds: the ``at`` of the events a
+    page shows a time for (``UserTurn``, ``TurnEnd``, ``AgentClosed``). It is a
+    dataclass default factory, so the time is taken once, when the event is
+    built; the persisted log and every live frame call ``to_wire()`` on that
+    same event and carry the same value. A log written before ``at`` existed
+    is read as plain dicts and simply lacks it."""
+    return time.time_ns() // 1_000_000
 
 
 class AgentEvent:
@@ -321,6 +332,8 @@ class TurnEnd(AgentEvent):
     tokens: Optional[dict] = None
     usage_epoch: Optional[int] = None
     usage_source: Optional[str] = None
+    #: When the turn ended, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -497,6 +510,7 @@ class AgentClosed(AgentEvent):
     reason: str
     detail: Optional[str] = None
     viewer: Optional[str] = None
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -713,6 +727,8 @@ class UserTurn(AgentEvent):
     #: ``client_id``. A transcript shows it as a note, not a second human
     #: message, and a turn that already carries it is never re-sent again.
     redelivery_of: Optional[int] = None
+    #: When the server logged it, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 #: Every event kind the agent layer emits itself. A product's own event

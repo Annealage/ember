@@ -179,6 +179,9 @@ class EventLog:
         #: reported and never stops the append.
         self.observers: list = []
         self._request_usage: dict = {}
+        #: The ``client_id`` of every ``user_turn`` in this session's log, for
+        #: ``has_user_turn``; kept by ``_index_history``.
+        self._user_turn_ids: set = set()
         if self._path is not None:
             self._seq = self._recover_seq()
             self._fd = os.open(str(self._path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -295,6 +298,14 @@ class EventLog:
         """
         return self._seq
 
+    def has_user_turn(self, client_id) -> bool:
+        """Whether this session's log already holds a ``user_turn`` carrying
+        ``client_id``: the page's own name for one message it sent. A turn
+        that was refused never logged one, so its id is not here. The index
+        is built as events are appended and when an existing file is read,
+        and a ``session_reset`` empties it with the history it indexed."""
+        return client_id in self._user_turn_ids
+
     def append(self, event) -> int:
         """Assign the next seq to ``event`` and record it. Returns that seq.
 
@@ -337,7 +348,12 @@ class EventLog:
 
     def _index_history(self, seq: int, event: dict, offset: int) -> None:
         kind = event.get("kind")
+        if kind == "user_turn":
+            client_id = event.get("client_id")
+            if isinstance(client_id, str):
+                self._user_turn_ids.add(client_id)
         if kind == "session_reset":
+            self._user_turn_ids.clear()
             self._history_groups.clear()
             self._history_boundaries.clear()
             self._history_turns.clear()
