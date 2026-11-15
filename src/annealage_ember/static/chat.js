@@ -352,6 +352,9 @@ export function agentActivity(state, starts = null) {
       }
       return { ...none, state: "working", startedAt, detail: runningDetail(open) };
     }
+    // A message on its way with no turn open yet: the agent is about to work
+    // on it, so neither idle nor "Finished" (the previous turn's end) is true.
+    if (chat.pendingUser.some((p) => p.state !== "failed")) return { ...none, state: "starting" };
     // "Connecting" is the agent starting only once something has said so; the
     // store's default before any hello is no news (signed out, refused, or the
     // socket not up yet), shown neutrally.

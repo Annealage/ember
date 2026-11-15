@@ -625,6 +625,18 @@ const status = () => ({
 });
 const hi = [{ type: "text", text: "hi" }];
 const fresh = { replayed: false };
+// A message sent and not yet logged, with no turn open: starting, never the
+// idle or "Finished" of the turn before it; once logged it is working.
+for (const p of store.getState().chat.pendingUser) store.dropChatUserTurn(p.clientId);
+chat.handleHello({ id: "st0", agent: "ready" });
+chat.handleEvent({ kind: "user_turn", turn: 1, blocks: hi, at: T0 - 9000 }, { replayed: false });
+chat.handleEvent({ kind: "turn_end", turn: 1, stop_reason: "end_turn", cost_usd: 0, at: T0 - 1000 }, { replayed: false });
+out.statusAfterPrevious = status();
+sendMessage("again");
+out.statusSending = status();
+chat.handleEvent({ kind: "user_turn", turn: 2, blocks: hi, at: T0, client_id: sent[sent.length - 1].client_id },
+  { replayed: false });
+out.statusLogged = status();
 store.clearChatBanner();
 chat.handleHello({ id: "st1", agent: "ready" });
 out.statusNoLog = status();
@@ -904,6 +916,16 @@ def test_a_finished_turn_shows_its_end_as_a_local_time_with_the_date_when_not_to
     other = observed["statusFinishedOtherDay"]
     assert other["text"] == other["expected"]
     assert other["text"] != finished["text"]
+
+
+def test_a_message_not_yet_logged_is_starting_never_idle_or_the_previous_turns_finish(observed):
+    assert observed["statusAfterPrevious"]["text"].startswith("Finished ")
+    assert (observed["statusSending"]["text"], observed["statusSending"]["state"]) == (
+        "Starting",
+        "starting",
+    )
+    # Logged: its turn is open, so it is working.
+    assert observed["statusLogged"]["state"] == "working"
 
 
 def test_the_agent_is_not_starting_before_anything_has_said_so(observed):
