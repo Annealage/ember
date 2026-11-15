@@ -11,10 +11,11 @@ import pytest
 pytest.importorskip("omp_rpc")
 
 from omp_rpc import (
+    MessageEndEvent,  # noqa: E402
     RpcClient,  # noqa: E402
     RpcError,  # noqa: E402
+    parse_notification,  # noqa: E402
 )
-from omp_rpc.protocol import MessageEndEvent, parse_notification  # noqa: E402
 
 from annealage_ember import observability  # noqa: E402
 from annealage_ember.session.rpc_client import (  # noqa: E402
@@ -122,9 +123,9 @@ def test_a_listener_still_receives_every_update_with_its_full_content():
     for payload in _stream(3):
         notification = parse_notification(payload)
         client._dispatch_listeners(
-            "typed_event",
+            "typed",
             "message_update",
-            client._typed_event_listeners["message_update"],
+            client._typed_listeners["message_update"],
             notification,
         )
         client._append_event(payload)

@@ -194,6 +194,9 @@ class FakeRpcClient:
     def on_auto_retry_end(self, listener):
         self._listeners["auto_retry_end"] = listener
 
+    def on_unknown_notification(self, listener):
+        self._listeners["unknown_notification"] = listener
+
     def on_ui_request(self, listener):
         self._listeners["ui_request"] = listener
 
@@ -224,6 +227,11 @@ class FakeRpcClient:
             SimpleNamespace(
                 attempt=attempt, max_attempts=10, delay_ms=2000, error_message=error_message
             )
+        )
+
+    def push_unknown(self, payload):
+        self._listeners["unknown_notification"](
+            SimpleNamespace(type="unknown", payload=payload, parse_error="rejected")
         )
 
     def push_auto_retry_end(self, success, attempt=1, final_error=None):
@@ -1910,6 +1918,38 @@ async def test_an_error_omp_retried_and_recovered_from_is_never_published():
             for e in recorder.all
             if isinstance(e, AgentRetrying)
         ] == [("waiting", 1, 10, 2000), ("recovered", None, None, None)]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_announced_with_a_fractional_delay_still_drops_the_held_error():
+    # omp 18.20.2 sends delayMs as a fraction, which omp-rpc hands over as an unknown frame.
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 5, "output": 0}, errorMessage=STALL))
+        fake.push_agent_end(is_terminal=False)
+        fake.push_unknown({"type": "other_frame", "delayMs": 1.5})
+        fake.push_unknown(
+            {
+                "type": "auto_retry_start",
+                "attempt": 2,
+                "maxAttempts": 10,
+                "delayMs": 1234.5,
+                "errorMessage": STALL,
+            }
+        )
+        fake.push_message_end(_assistant({"input": 9, "output": 3}, stopReason="stop"))
+        fake.push_auto_retry_end(True)
+        fake.push_agent_end()
+        await _next_of(recorder, TurnEnd)
+        assert _errors(recorder) == []
+        assert [
+            (e.state, e.attempt, e.max_attempts, e.delay_ms)
+            for e in recorder.all
+            if isinstance(e, AgentRetrying)
+        ] == [("waiting", 2, 10, 1235), ("recovered", None, None, None)]
     finally:
         await session.close()
 

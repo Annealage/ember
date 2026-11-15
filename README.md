@@ -33,7 +33,7 @@ It isn't published yet. Once it is:
 
 The Claude Agent SDK is a base dependency and its wheel bundles the Claude Code CLI, so an install pulls about 90 MB. The omp backend's client isn't on PyPI, so it isn't an extra either. Install it from the commit this package was verified against:
 
-    pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+    pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@7c49c11aa5bbaf3f418406583096168ad5b8c6dc#subdirectory=sdk/python/omp-rpc"
 
 On Linux the Claude backend's shell sandbox needs `bubblewrap` and `socat` (`apt install bubblewrap socat`). macOS has its sandbox built in.
 
@@ -916,7 +916,7 @@ In hosted agent mode the front controls the worker's session over HTTP, each cal
 ## Development
 
     uv sync --extra dev --extra codex
-    uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+    uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@7c49c11aa5bbaf3f418406583096168ad5b8c6dc#subdirectory=sdk/python/omp-rpc"
     uv run --extra dev --extra codex pytest -q
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers why omp-rpc is installed separately (and what to do on Python 3.10, where it isn't available), the live `integration` tier and the pre-commit hooks. The suite runs as a small made-up product (`tests/toy_product.py`). The front end has no browser suite of its own, because only a product has a page: Annealage Mesh's end-to-end suite drives these modules in Chromium, so run it too after changing them. [RELEASING.md](RELEASING.md) covers publishing.

@@ -59,7 +59,7 @@ jobs:
         run: >-
           uv run --extra dev --extra codex python -c "" &&
           uv pip install
-          "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+          "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@7c49c11aa5bbaf3f418406583096168ad5b8c6dc#subdirectory=sdk/python/omp-rpc"
 
       - name: run tests
         # --extra codex: tests/test_codex_session.py and

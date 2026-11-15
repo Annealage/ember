@@ -23,7 +23,7 @@ python3 tools/verifygitlog.py origin/main..HEAD
 
 ```
 uv sync --extra dev --extra codex
-uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9#subdirectory=python/omp-rpc"
+uv pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@7c49c11aa5bbaf3f418406583096168ad5b8c6dc#subdirectory=sdk/python/omp-rpc"
 uv run --extra dev --extra codex pytest -q
 ```
 

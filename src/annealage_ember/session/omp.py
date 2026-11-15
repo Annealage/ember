@@ -6,12 +6,12 @@
 both fail with "not found in the package registry"; already checked and
 documented in `planning/tickets/phase4_omp-session.md`'s revalidated stamp).
 The package's real, MIT-licensed source lives in the upstream ``oh-my-pi``
-monorepo at ``python/omp-rpc`` (github.com/can1357/oh-my-pi), which
+monorepo at ``sdk/python/omp-rpc`` (github.com/can1357/oh-my-pi), which
 ``omp://rpc.md`` itself names as "the bundled `omp-rpc` distribution", and
 installs cleanly as an ordinary wheel build via
 ``pip install "omp-rpc @ git+https://github.com/can1357/oh-my-pi.git@<sha>
-#subdirectory=python/omp-rpc"`` (verified against commit
-``71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9``). This is deliberately *not*
+#subdirectory=sdk/python/omp-rpc"`` (verified against commit
+``7c49c11aa5bbaf3f418406583096168ad5b8c6dc``, tag v18.20.2). This is deliberately *not*
 declared as a `pyproject.toml` optional extra the way `codex` is: hatchling
 refuses to build metadata for a direct (VCS) reference at all unless
 ``tool.hatch.metadata.allow-direct-references`` is set, and even with that
@@ -303,6 +303,7 @@ import contextvars
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -1966,6 +1967,7 @@ class OmpSession:
         client.on_agent_end(self._on_agent_end)
         client.on_auto_retry_start(self._on_auto_retry_start)
         client.on_auto_retry_end(self._on_auto_retry_end)
+        client.on_unknown_notification(self._on_unknown_notification)
         client.on_ui_request(self._on_ui_request)
         client.on_protocol_error(self._on_protocol_error)
 
@@ -2077,6 +2079,31 @@ class OmpSession:
             AgentRetrying(
                 state="waiting", attempt=attempt, max_attempts=max_attempts, delay_ms=delay_ms
             )
+        )
+
+    def _on_unknown_notification(self, notification) -> None:
+        """Reader thread. omp-rpc turns a frame it cannot parse into an unknown notification
+        and nothing more, and omp 18.20.2 sends ``auto_retry_start`` with a fractional
+        ``delayMs`` (its retry back-off) where the wire schema, and so omp-rpc's decoder,
+        says integer. Without this the announcement is lost: the failed request's error is
+        then held until the turn ends and published as the turn's error although omp
+        retried and recovered. The frame is read here for its three numbers, the delay
+        rounded up to whole milliseconds, and nothing else unknown is acted on."""
+        payload = notification.payload
+        if payload.get("type") != "auto_retry_start":
+            return
+        attempt, max_attempts, delay = (
+            payload.get("attempt"),
+            payload.get("maxAttempts"),
+            payload.get("delayMs"),
+        )
+        if not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            for v in (attempt, max_attempts, delay)
+        ):
+            return
+        self._loop.call_soon_threadsafe(
+            self._retry_announced, int(attempt), int(max_attempts), math.ceil(delay)
         )
 
     def _on_auto_retry_end(self, event) -> None:

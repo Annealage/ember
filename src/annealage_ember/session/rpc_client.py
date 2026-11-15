@@ -37,8 +37,8 @@ commit (``PINNED_OMP_RPC``). This subclass reaches these names of it and no othe
 ``_events`` (``limit``, ``items``, ``offset``, ``clear``, ``current_index``,
 ``snapshot``, ``snapshot_from``, as ``_BoundedHistory`` has them), ``_event_condition``,
 ``_state_lock``, ``_pending``, ``_pending_host_tool_calls``,
-``_pending_host_uri_requests``, ``_process`` and the listener lists in
-``LISTENER_ATTRS``. ``__init__`` refuses, with a clear error, when any is missing or
+``_pending_host_uri_requests``, ``_process``, ``_pgid`` and the listener lists in
+``LISTENER_ATTRS`` plus the ``_typed_listeners`` dict. ``__init__`` refuses, with a clear error, when any is missing or
 the wrong shape, rather than archiving nothing or everything, and the unit tests read
 the same names. Re-read ``omp_rpc/client.py`` against this file when the pin moves.
 """
@@ -58,24 +58,24 @@ from omp_rpc.client import RpcProcessExitError, _clone_json_object
 
 from .. import observability
 
-#: The omp-rpc commit this was written against (CI's install line in test.yml).
-PINNED_OMP_RPC = "71c5eec978b0e7ce9ff057eb4e311f67f4f03eb9"
+#: The omp-rpc commit this was written against (CI's install line in test.yml; the package lives
+#: at ``sdk/python/omp-rpc`` of the oh-my-pi repo, tag v18.20.2).
+PINNED_OMP_RPC = "7c49c11aa5bbaf3f418406583096168ad5b8c6dc"
 
 #: The notification type this client does not archive.
 UNARCHIVED_EVENT = "message_update"
 
-#: ``RpcClient``'s list-valued listener registries (``_typed_event_listeners`` is a dict of lists).
+#: ``RpcClient``'s list-valued listener registries (``_typed_listeners`` is a dict of lists, one
+#: per notification type, which the generated ``on_<type>`` methods and ``on_unknown_notification``
+#: append to).
 LISTENER_ATTRS = (
     "_notification_listeners",
     "_event_listeners",
-    "_ready_listeners",
-    "_unknown_notification_listeners",
-    "_ui_request_listeners",
-    "_extension_error_listeners",
     "_protocol_error_listeners",
     "_listener_error_listeners",
+    "_host_tool_completed_listeners",
 )
-_TYPED_LISTENERS = "_typed_event_listeners"
+_TYPED_LISTENERS = "_typed_listeners"
 _HISTORY_METHODS = (
     "limit",
     "items",
@@ -294,9 +294,11 @@ class LeanRpcClient(RpcClient):
             self._events.append(archived, size)
             self._event_condition.notify_all()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """``RpcClient.stop``'s result (``False`` when a child outlived teardown), and the
+        archive and listeners emptied either way."""
         try:
-            super().stop()
+            return super().stop()
         finally:
             with self._event_condition:
                 self._events.clear()
