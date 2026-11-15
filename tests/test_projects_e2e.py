@@ -1,4 +1,4 @@
-"""The project list, title bar and history (``static/project.js``, ``project.css``)
+"""The project list, title bar and history (``static/project.js``)
 in a real Chromium, against the real routes (``projects.py``) over the fake
 store (``fake_project_store.py``), served by the real app on a loopback socket.
 
@@ -49,7 +49,6 @@ TOKEN = "projects-e2e-token"
 
 DEMO_PAGE = """<!doctype html>
 <meta charset="utf-8"><title>projects</title>
-<link rel="stylesheet" href="/agent/static/project.css">
 <div id="toast" hidden></div>
 <div id="header"></div>
 <div id="history"></div>
