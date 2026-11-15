@@ -30,7 +30,7 @@ from typing import Callable, Optional
 
 #: The model a login helper is started with. It only has to let omp start with
 #: an empty profile; nothing is ever asked of it.
-BOOT_MODEL = "anthropic/claude-sonnet-4-5"
+BOOT_MODEL = "anthropic/claude-sonnet-5-5"
 
 #: omp gives a login this long; the helper is given a little more.
 LOGIN_SECONDS = 600.0
