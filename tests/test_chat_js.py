@@ -693,7 +693,7 @@ chat.handleHello({ id: "viewer-only", agent: "unavailable" });
 out.statusViewerOnly = status();
 
 // No combination of inputs shows an idle or stopped agent with a timer, or a
-// working one with no open turn.
+// working one with no open turn, bar a start (the process starting is shown as working, never as its own state).
 const base = store.getState();
 const openTurn = { turn: 1, complete: false, segments: [], startedAt: 1000, endedAt: null };
 const doneTurn = { turn: 1, complete: true, segments: [], startedAt: 1000, endedAt: 2000 };
@@ -707,7 +707,7 @@ for (const job of ["none", "starting", "running", "succeeded", "failed", "lost"]
             chat: { ...base.chat, turns, agentStatus, pending: [], banner: null, closed: null } });
           const label = JSON.stringify([job, turns.length && turns[0].complete, starting, paused, agentStatus, a.state]);
           if (a.state !== "working" && a.startedAt !== null) violations.push("timer " + label);
-          if (a.state === "working" && !turns.some((t) => !t.complete)) violations.push("no turn " + label);
+          if (a.state === "working" && !starting && job !== "starting" && agentStatus !== "connecting" && !turns.some((t) => !t.complete)) violations.push("no turn " + label);
           if (["succeeded", "failed", "lost"].includes(job) && !starting && a.state === "working") violations.push("ended " + label);
         }
       }
@@ -903,8 +903,8 @@ def test_the_status_line_says_what_the_agent_is_doing_and_nothing_else_writes_it
         "paused",
     )
     assert (observed["statusStarting"]["text"], observed["statusStarting"]["state"]) == (
-        "Starting",
-        "starting",
+        "Working",
+        "working",
     )
     assert observed["statusBackToWorking"] == "working"
 
@@ -918,11 +918,11 @@ def test_a_finished_turn_shows_its_end_as_a_local_time_with_the_date_when_not_to
     assert other["text"] != finished["text"]
 
 
-def test_a_message_not_yet_logged_is_starting_never_idle_or_the_previous_turns_finish(observed):
+def test_a_message_not_yet_logged_is_working_never_idle_or_the_previous_turns_finish(observed):
     assert observed["statusAfterPrevious"]["text"].startswith("Finished ")
     assert (observed["statusSending"]["text"], observed["statusSending"]["state"]) == (
-        "Starting",
-        "starting",
+        "Working",
+        "working",
     )
     # Logged: its turn is open, so it is working.
     assert observed["statusLogged"]["state"] == "working"
@@ -932,7 +932,7 @@ def test_the_agent_is_not_starting_before_anything_has_said_so(observed):
     for case in ("statusBeforeHello", "statusSignedOut"):
         assert observed[case] == {"text": "Not connected", "state": "idle"}, case
     # Only a hello or an agent_status that says "connecting" is the agent starting.
-    assert observed["connectingBeforeAndAfterHello"] == [["idle", True], ["starting", False]]
+    assert observed["connectingBeforeAndAfterHello"] == [["idle", True], ["working", False]]
 
 
 def test_a_job_that_ended_never_reads_as_working_whatever_the_transcript_holds(observed):

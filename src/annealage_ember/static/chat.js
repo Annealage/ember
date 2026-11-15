@@ -301,7 +301,7 @@ function runningDetail(openTurns) {
 /**
  * What the agent is doing, from the store's state alone: the one answer the
  * header's status line draws and nothing else writes. `state` is
- * `"starting" | "working" | "waiting" | "paused" | "idle" | "stopped"`;
+ * `"working" | "waiting" | "paused" | "idle" | "stopped"`;
  * `startedAt` (working) and `finishedAt` (idle, stopped) are epoch ms or null;
  * `detail` is the running tool (working), `reason` why it stopped. `starts`
  * optionally maps a turn number to the time this page first saw it running,
@@ -319,7 +319,7 @@ export function agentActivity(state, starts = null) {
   for (const t of chat.turns) {
     if (typeof t.endedAt === "number" && (lastEnd === null || t.endedAt > lastEnd)) lastEnd = t.endedAt;
   }
-  if (state.starting) return { ...none, state: "starting" };
+  if (state.starting) return { ...none, state: "working" };
   if (job.state === "failed" || job.state === "lost") {
     return {
       ...none, state: "stopped", finishedAt: job.at,
@@ -339,7 +339,7 @@ export function agentActivity(state, starts = null) {
     }
   }
   if (!jobEnded) {
-    if (job.state === "starting") return { ...none, state: "starting" };
+    if (job.state === "starting") return { ...none, state: "working" };
     if (chat.pending.length || (chat.banner && chat.banner.kind === "attention")) {
       return { ...none, state: "waiting" };
     }
@@ -354,12 +354,12 @@ export function agentActivity(state, starts = null) {
     }
     // A message on its way with no turn open yet: the agent is about to work
     // on it, so neither idle nor "Finished" (the previous turn's end) is true.
-    if (chat.pendingUser.some((p) => p.state !== "failed")) return { ...none, state: "starting" };
+    if (chat.pendingUser.some((p) => p.state !== "failed")) return { ...none, state: "working" };
     // "Connecting" is the agent starting only once something has said so; the
     // store's default before any hello is no news (signed out, refused, or the
     // socket not up yet), shown neutrally.
     if (chat.agentStatus === "connecting") {
-      return chat.agentKnown ? { ...none, state: "starting" } : { ...none, state: "idle", notConnected: true };
+      return chat.agentKnown ? { ...none, state: "working" } : { ...none, state: "idle", notConnected: true };
     }
   }
   return { ...none, state: "idle", finishedAt: lastEnd ?? (jobEnded ? job.at : null) };
@@ -382,7 +382,6 @@ function elapsedText(startedAt, now) {
 // The status line's words for an activity.
 function activityText(activity, now) {
   switch (activity.state) {
-    case "starting": return "Starting";
     case "working":
       return ["Working" + (activity.startedAt !== null ? " " + elapsedText(activity.startedAt, now) : ""),
         activity.detail].filter(Boolean).join(" \u00b7 ");
@@ -1422,7 +1421,6 @@ export function initChat({
   let statusTicker = null;
   function activityTitle(activity, chat) {
     switch (activity.state) {
-      case "starting": return titles.connecting;
       case "working": return titles.working;
       case "waiting": return titles.waiting;
       case "paused": return titles.paused;
