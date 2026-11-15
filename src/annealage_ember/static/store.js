@@ -112,7 +112,10 @@
  *                 suggestions}`; a replayed duplicate of a still-unanswered
  *                 request is not added twice.
  *                 `agentStatus` mirrors the hello frame's `session.agent`
- *                 ('connecting' | 'ready' | 'unavailable'). `banner` is the most
+ *                 ('connecting' | 'ready' | 'unavailable'), `agentKnown` being
+ *                 false until a hello or an `agent_status` has set it (before
+ *                 then 'connecting' is only the default, and `agentActivity`
+ *                 shows "Not connected" rather than "Starting"). `banner` is the most
  *                 recent `session_reset`, `agent_error` or `attention` event
  *                 (or an info line the pane raised itself) as
  *                 `{kind, text, detail, source}`, or null once dismissed; an
@@ -188,6 +191,9 @@ let state = Object.freeze({
     closed: null,
     pending: Object.freeze([]),
     agentStatus: "connecting",
+    // Whether anything has said what the agent's status is (a hello or an
+    // agent_status event). Until then `agentStatus` is only its default.
+    agentKnown: false,
     model: null,
     models: Object.freeze([]),
     banner: null,
@@ -779,7 +785,10 @@ function removeChatPermissionRequest(requestId) {
 
 function setChatAgentStatus(status) {
   commit(() => {
-    state = { ...state, chat: Object.freeze({ ...state.chat, agentStatus: status }) };
+    state = {
+      ...state,
+      chat: Object.freeze({ ...state.chat, agentStatus: status, agentKnown: true }),
+    };
   }, ["chat"]);
 }
 

@@ -92,6 +92,15 @@ const chat = initChat({ send: (frame) => { if (!online) return false; sent.push(
 const input = el("chatInput");
 const sendMessage = (text) => { input.value = text; el("chatSend").listeners.click[0](); };
 const out = {};
+// Before any hello nothing has said the agent is starting: signed out, refused
+// or just not up yet reads "Not connected", with or without a failure banner.
+const statusNow = () => ({ text: el("agentStatus").textContent, state: el("agentStatus").dataset.state });
+out.statusBeforeHello = statusNow();
+store.setConnection("refused");
+store.setConnectionFailure({ kind: "signed_out", message: "You're signed out.", action: "sign_in" });
+out.statusSignedOut = statusNow();
+store.setConnectionFailure(null);
+store.setConnection("connecting");
 
 // A page opened while the agent is down: the hello says why.
 chat.handleHello({ id: "s", agent: "unavailable",
@@ -694,6 +703,9 @@ for (const job of ["none", "starting", "running", "succeeded", "failed", "lost"]
   }
 }
 out.activityViolations = violations;
+out.connectingBeforeAndAfterHello = [false, true].map((agentKnown) => agentActivity({
+  ...base, chat: { ...base.chat, turns: [], agentStatus: "connecting", agentKnown, banner: null, closed: null },
+})).map((a) => [a.state, !!a.notConnected]);
 
 // A failure the page cannot recover from is the banner, with its action.
 chat.handleHello({ id: "st4", agent: "ready" });
@@ -892,6 +904,13 @@ def test_a_finished_turn_shows_its_end_as_a_local_time_with_the_date_when_not_to
     other = observed["statusFinishedOtherDay"]
     assert other["text"] == other["expected"]
     assert other["text"] != finished["text"]
+
+
+def test_the_agent_is_not_starting_before_anything_has_said_so(observed):
+    for case in ("statusBeforeHello", "statusSignedOut"):
+        assert observed[case] == {"text": "Not connected", "state": "idle"}, case
+    # Only a hello or an agent_status that says "connecting" is the agent starting.
+    assert observed["connectingBeforeAndAfterHello"] == [["idle", True], ["starting", False]]
 
 
 def test_a_job_that_ended_never_reads_as_working_whatever_the_transcript_holds(observed):

@@ -261,6 +261,7 @@ const AGENT_TITLE = {
   working: "The agent is working on your message.",
   waiting: "The agent is waiting for you: an approval to answer or a question.",
   paused: "The agent is paused. Resume it from the More menu.",
+  not_connected: "Not connected to the agent yet.",
 };
 
 // Tells the window something about the pane without any message text in it.
@@ -351,7 +352,12 @@ export function agentActivity(state, starts = null) {
       }
       return { ...none, state: "working", startedAt, detail: runningDetail(open) };
     }
-    if (chat.agentStatus === "connecting") return { ...none, state: "starting" };
+    // "Connecting" is the agent starting only once something has said so; the
+    // store's default before any hello is no news (signed out, refused, or the
+    // socket not up yet), shown neutrally.
+    if (chat.agentStatus === "connecting") {
+      return chat.agentKnown ? { ...none, state: "starting" } : { ...none, state: "idle", notConnected: true };
+    }
   }
   return { ...none, state: "idle", finishedAt: lastEnd ?? (jobEnded ? job.at : null) };
 }
@@ -383,6 +389,7 @@ function activityText(activity, now) {
       return "Stopped" + (activity.finishedAt !== null ? " " + localTime(activity.finishedAt, now) : "")
         + (activity.reason ? ": " + activity.reason : "");
     default:
+      if (activity.notConnected) return "Not connected";
       return activity.finishedAt !== null ? "Finished " + localTime(activity.finishedAt, now) : "Idle";
   }
 }
@@ -1417,7 +1424,9 @@ export function initChat({
       case "waiting": return titles.waiting;
       case "paused": return titles.paused;
       case "stopped": return chat.agentStatus === "unavailable" ? titles.unavailable : titles.closed;
-      default: return viewerOnly ? titles.viewer_only : (titles[chat.agentStatus] || titles.idle);
+      default:
+        if (activity.notConnected) return titles.not_connected;
+        return viewerOnly ? titles.viewer_only : (titles[chat.agentStatus] || titles.idle);
     }
   }
 
