@@ -1184,6 +1184,9 @@ export function initProjectHeader({ ctx, root, title, projectId, idChange = null
           model.cancelEdit();
         },
       });
+      field.addEventListener("context-menu-close", (event) => {
+        if (field === event.currentTarget && !event.detail.restoredFocus) model.cancelEdit();
+      });
       shown.after(field);
       field.focus();
       field.select();
@@ -1297,6 +1300,11 @@ export function initProjectList({ ctx, root, onRenamed = () => {} } = {}) {
         onblur: (event) => {
           if (!event.relatedTarget?.closest?.(".context-menu")) model.cancelRename();
         },
+      });
+      input.addEventListener("context-menu-close", (event) => {
+        if (input.isConnected && model.state.editing === st.editing && !event.detail.restoredFocus) {
+          model.cancelRename();
+        }
       });
       queueMicrotask(() => {
         input.focus();

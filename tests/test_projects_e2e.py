@@ -314,6 +314,48 @@ def test_a_dialog_the_project_moved_under_cannot_be_confirmed(page, store):
 # --- title -----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("kind", ["title", "header_id", "list_id"])
+@pytest.mark.parametrize("restored", [False, True])
+def test_rename_survives_menu_focus_and_follows_menu_close(page, kind, restored):
+    if kind == "title":
+        page.get_by_role("button", name="Rename").click()
+        field = page.locator("#header").get_by_label("Project title")
+    elif kind == "header_id":
+        page.get_by_role("button", name="Change id").first.click()
+        field = page.locator("#header").get_by_label("Project id")
+    else:
+        row = page.locator("#list .pj-card[data-project='lamp']")
+        row.get_by_role("button", name="Change id").click()
+        field = row.get_by_label("Project id")
+
+    field.fill("unfinished")
+    # Model the style menu's focus and close-event contract without depending on
+    # the separately distributed style package in this component's test suite.
+    field.evaluate("""input => {
+        const menu = document.createElement("div");
+        menu.className = "context-menu";
+        menu.innerHTML = "<button>Copy</button>";
+        document.body.append(menu);
+        menu.querySelector("button").focus();
+    }""")
+    expect(field).to_have_value("unfinished")
+    field.evaluate(
+        """(input, restored) => {
+        if (restored) input.focus();
+        document.querySelector(".context-menu").remove();
+        input.dispatchEvent(new CustomEvent("context-menu-close", {
+            bubbles: true, detail: { restoredFocus: restored }
+        }));
+    }""",
+        restored,
+    )
+    if restored:
+        expect(field).to_be_focused()
+        expect(field).to_have_value("unfinished")
+        field.evaluate("input => input.blur()")
+    expect(field).to_have_count(0)
+
+
 def test_a_title_is_renamed_with_enter_and_escape_puts_it_back(page, store):
     page.get_by_role("button", name="Rename").click()
     field = page.locator("#header").get_by_label("Project title")
