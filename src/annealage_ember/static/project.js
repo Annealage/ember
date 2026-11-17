@@ -990,10 +990,11 @@ const BUSY = "The agent is working on a turn: wait for it to finish, or interrup
  * refusal shown while the product says a change would race (`setBusy`).
  * `lineage` (the model `initProjectLineage` returned) adds "send" to each
  * commit while the host offers it: it picks that commit as the revision.
- * Returns the model: `refresh()` when the product knows history changed,
- * `setBusy(bool)`.
+ * `contextMenu` registers actions on commits. Returns the model: `refresh()`
+ * when the product knows history changed, `setBusy(bool)`, and `dispose()` to
+ * unregister the menu and lineage subscription.
  */
-export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () => {}, busyText = BUSY, lineage = null } = {}) {
+export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () => {}, busyText = BUSY, lineage = null, contextMenu = null } = {}) {
   root.classList.add("pj-history");
   const now = h("span", { class: "pj-now" });
   const refreshButton = h("button", { type: "button", class: "pj-btn pj-refresh" }, "Refresh");
@@ -1010,7 +1011,7 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
     const open = model.state.open.has(c.commit);
     const diff = model.state.diffs.get(c.commit);
     const changed = changedNames(c.files);
-    return h("div", { class: "pj-commit" },
+    return h("div", { class: "pj-commit", "data-commit": c.commit, ...(contextMenu ? { tabindex: "0" } : {}) },
       h("div", { class: "pj-commithead" },
         h("span", { class: "pj-subject" }, c.subject),
         lineage && lineage.state.available && lineage.state.canSend && lineage.state.targets.length
@@ -1069,6 +1070,8 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
     banner.replaceChildren(...(st.conflict ? [conflictBanner(st.conflict, {
       reload: () => model.reloadAfterConflict(), retry: () => {}, dismiss: () => model.dismissConflict(),
     })] : []));
+    const focusedCommit = contextMenu && document.activeElement?.matches(".pj-commit")
+      && list.contains(document.activeElement) ? document.activeElement.dataset.commit : null;
     list.replaceChildren(...runs(st.commits).map((run) => {
       const group = run.key === null ? null : st.groups.get(run.key);
       const restore = group && group.restore;
@@ -1081,31 +1084,60 @@ export function initProjectHistory({ ctx, root, pageSize = 100, onRestored = () 
           restore.label) : null),
         ...run.commits.map(commitRow));
     }));
+    if (focusedCommit) {
+      [...list.querySelectorAll(".pj-commit")].find((row) => row.dataset.commit === focusedCommit)?.focus();
+    }
     renderModal(st);
   }
 
   model = createHistoryModel(ctx, { pageSize, onChange: render, onRestored });
-  if (lineage) lineage.subscribe(() => render(model.state));
+  const unsubscribeLineage = lineage ? lineage.subscribe(() => render(model.state)) : null;
+  const unregisterMenu = contextMenu?.register(list, ({ target }) => {
+    const row = target.closest(".pj-commit");
+    if (!row || !list.contains(row)) return null;
+    const commit = row.dataset.commit;
+    if (!model.state.commits.some((c) => c.commit === commit)) return null;
+    const items = [{
+      id: "history-details",
+      label: model.state.open.has(commit) ? "Hide details" : "Show details",
+      run: () => {
+        model.toggleDiff(commit);
+        [...list.querySelectorAll(".pj-commit")].find((row) => row.dataset.commit === commit)?.focus();
+      },
+    }];
+    if (lineage && lineage.state.available && lineage.state.canSend && lineage.state.targets.length) {
+      items.push({ id: "history-send", label: `${lineage.state.labels.send}…`, run: () => lineage.chooseRevision(commit) });
+    }
+    return { label: "Change", items };
+  });
+  model.dispose = () => {
+    unregisterMenu?.();
+    unsubscribeLineage?.();
+  };
   refreshButton.addEventListener("click", () => model.refresh());
   more.addEventListener("click", () => model.loadMore());
   return model;
 }
 
 /**
- * The title bar of one project in `root`: its title, "Rename" (a field; Enter
- * saves, Escape or leaving puts the name back) and, when `idChange` is given
- * (`{warning}`, what it costs, shown for confirming first), "Change id".
+ * The title bar of one project in `root`: its title can be renamed from its
+ * context menu or with Enter, or using buttons when no menu is supplied.
+ * When `idChange` is given (`{warning}`, what it costs, shown for confirming
+ * first), "Change id" is also offered.
  * `onTitle(name)` and `onRenamed(entry)` tell the page what was saved. The
  * conflict banner shows above the field when a save is refused as stale.
+ * `dispose()` unregisters the optional context-menu provider.
  */
-export function initProjectHeader({ ctx, root, title, projectId, idChange = null, onTitle = () => {}, onRenamed = () => {} } = {}) {
+export function initProjectHeader({ ctx, root, title, projectId, idChange = null, onTitle = () => {}, onRenamed = () => {}, contextMenu = null } = {}) {
   root.classList.add("pj-header");
-  const shown = h("strong", { class: "pj-title" }, title || projectId || "");
-  const rename = h("button", { type: "button", class: "pj-btn pj-quiet" }, "Rename");
-  const idButton = h("button", { type: "button", class: "pj-btn pj-quiet", hidden: !idChange }, "Change id");
+  const shown = h("strong", contextMenu ? { class: "pj-title", tabindex: "0", role: "button",
+    title: idChange ? "Enter to rename; Shift+F10 for more actions; Alt+Shift+I to change id" : "Enter to rename; Shift+F10 for more actions" }
+    : { class: "pj-title" }, title || projectId || "");
+  const renameButton = contextMenu ? null : h("button", { type: "button", class: "pj-btn pj-quiet" }, "Rename");
+  const idButton = contextMenu ? null : h("button", { type: "button", class: "pj-btn pj-quiet", hidden: !idChange }, "Change id");
   const banner = h("div", { class: "pj-banner" });
   const error = h("div", { class: "pj-error", role: "alert" });
-  const row = h("div", { class: "pj-titlerow" }, shown, rename, idButton);
+  const row = h("div", { class: "pj-titlerow" }, shown, renameButton, idButton);
   root.replaceChildren(row, banner, error);
   const modal = createModal(root);
   let field = null;
@@ -1128,9 +1160,11 @@ export function initProjectHeader({ ctx, root, title, projectId, idChange = null
       gone.remove();
     }
     shown.hidden = !!st.editing;
-    rename.hidden = !!st.editing;
-    idButton.hidden = !idChange || !!st.editing;
-    rename.disabled = idButton.disabled = st.saving;
+    if (renameButton) {
+      renameButton.hidden = !!st.editing;
+      idButton.hidden = !idChange || !!st.editing;
+      renameButton.disabled = idButton.disabled = st.saving;
+    }
     if (st.editing && !field) {
       const spec = labels[st.editing.kind];
       field = h("input", {
@@ -1144,8 +1178,9 @@ export function initProjectHeader({ ctx, root, title, projectId, idChange = null
             finish(field.value);
           }
         },
-        onblur: () => {
+        onblur: (event) => {
           if (field && !modal.el.hidden) return; // the id warning has focus now
+          if (event.relatedTarget?.closest?.(".context-menu")) return;
           model.cancelEdit();
         },
       });
@@ -1183,8 +1218,35 @@ export function initProjectHeader({ ctx, root, title, projectId, idChange = null
     onRenamed,
   });
   model.state.projectId = projectId;
-  rename.addEventListener("click", () => model.beginEdit("title", shown.textContent));
-  idButton.addEventListener("click", () => model.beginEdit("id", projectId));
+  const rename = () => {
+    if (!model.state.saving) model.beginEdit("title", shown.textContent);
+  };
+  const changeId = () => {
+    if (!model.state.saving) model.beginEdit("id", model.state.projectId);
+  };
+  if (contextMenu) {
+    shown.addEventListener("click", rename);
+    shown.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        rename();
+      } else if (idChange && event.altKey && event.shiftKey && event.code === "KeyI") {
+        event.preventDefault();
+        changeId();
+      }
+    });
+  } else {
+    renameButton.addEventListener("click", rename);
+    idButton.addEventListener("click", changeId);
+  }
+  const unregisterMenu = contextMenu?.register(shown, () => ({
+    label: "Project",
+    items: [
+      { id: "project-rename", label: "Rename", run: rename, disabled: model.state.saving },
+      ...(idChange ? [{ id: "project-change-id", label: "Change id", run: changeId, disabled: model.state.saving }] : []),
+    ],
+  }));
+  model.dispose = () => unregisterMenu?.();
   return model;
 }
 
@@ -1232,7 +1294,9 @@ export function initProjectList({ ctx, root, onRenamed = () => {} } = {}) {
             model.submitRename(input.value);
           }
         },
-        onblur: () => model.cancelRename(),
+        onblur: (event) => {
+          if (!event.relatedTarget?.closest?.(".context-menu")) model.cancelRename();
+        },
       });
       queueMicrotask(() => {
         input.focus();

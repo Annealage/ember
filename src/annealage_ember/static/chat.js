@@ -555,11 +555,12 @@ function usageChip(agentStatusEl) {
  * `onContexts(list)` is told every context the loaded conversation carries,
  * `[{turn, label, data}]` in turn order, whenever that list changes, so a
  * page can mark where earlier messages pointed; `showTurn(turn)` scrolls the
- * conversation to that turn's message and flashes it.
+ * conversation to that turn's message and flashes it. An optional
+ * `contextMenu` adds message actions; `dispose()` unregisters its provider.
  */
 export function initChat({
   send, root = document, ids = {}, agentTitles = {}, modelControl = true,
-  onContextClick = () => {}, onContexts = () => {},
+  onContextClick = () => {}, onContexts = () => {}, contextMenu = null,
 }) {
   const idMap = { ...DEFAULT_IDS, ...ids };
   const els = {};
@@ -587,6 +588,29 @@ export function initChat({
   const chatAttachStripEl = els.attachStrip;
   const chatPaneEl = els.pane;
   const chatExportBtn = els.exportButton;
+  const unregisterMenu = contextMenu?.register(chatLogEl, ({ target }) => {
+    const message = target.closest(".msg.user, .segments > .text");
+    if (!message || !chatLogEl.contains(message)) return null;
+    const text = message.matches(".msg.user") ? message.querySelector(".text")?.textContent : message.textContent;
+    const clipboard = document.defaultView?.navigator.clipboard;
+    const items = [{
+      id: "chat-copy-message", label: "Copy message",
+      disabled: !text || !clipboard?.writeText,
+      reason: !text ? "This message has no text." : !clipboard?.writeText ? "Clipboard access is unavailable." : undefined,
+      run: async () => {
+        try {
+          await clipboard.writeText(text);
+        } catch {
+          toast("Could not copy message; clipboard access was denied", false);
+        }
+      },
+    }];
+    const turn = message.closest(".turn")?.dataset.turn;
+    if (turn && message.matches(".segments > .text")) {
+      items.push({ id: "chat-show-turn", label: "Go to start of turn", run: () => showTurn(Number(turn)) });
+    }
+    return { label: "Message", items };
+  });
 
   // The session this pane belongs to, learned from the hello frame. Null until
   // then, and null for a viewer-only run, which has no conversation to write.
@@ -1013,6 +1037,7 @@ export function initChat({
 
     const userEl = document.createElement("div");
     userEl.className = "msg user";
+    if (contextMenu) userEl.tabIndex = 0;
     userEl.hidden = true;
     const userAuthor = document.createElement("div");
     userAuthor.className = "author";
@@ -1068,6 +1093,7 @@ export function initChat({
         const el = document.createElement(segment.kind === "text" ? "div" : "details");
         el.className = segment.kind === "text" ? "text"
           : segment.kind === "thinking" ? "thinking" : "toolgroup";
+        if (contextMenu && segment.kind === "text") el.tabIndex = 0;
         segmentRec = { el, tools: new Map() };
         if (segment.kind === "thinking") {
           // Closed by default; `textContent` only, since this is model output.
@@ -1146,6 +1172,7 @@ export function initChat({
     row.dataset.clientId = entry.clientId;
     const userEl = document.createElement("div");
     userEl.className = "msg user sending";
+    if (contextMenu) userEl.tabIndex = 0;
     const textEl = document.createElement("div");
     textEl.className = "text";
     textEl.textContent = blocksToText(entry.blocks);
@@ -2382,5 +2409,6 @@ export function initChat({
   return {
     handleHello, handleEvent, handleRefused, adoptSent,
     setContext, removeContext, sendMessage, showTurn,
+    dispose: () => unregisterMenu?.(),
   };
 }
