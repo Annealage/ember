@@ -57,6 +57,8 @@ READ_TOOLS = (
     "semantic_search",
     "get_datasheet_pages",
     "get_datasheet_outline",
+    "list_datasheet_figures",
+    "get_datasheet_figure",
     "get_document_relations",
     "get_job_status",
     "get_request_status",
