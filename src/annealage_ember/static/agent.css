@@ -12,6 +12,13 @@
    browser's own scroll anchoring has to stay out of its way. */
 #chatLog { overflow-y: auto; overflow-anchor: none; }
 
+/* Keep message text selectable even when a host disables selection globally. */
+#chatLog [data-native-touch-selection], .chatbanner [data-native-touch-selection] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
 /* An attachment's remove button sits on the chip's corner. */
 .attachchip { position: relative; }
 .attachchip .attachremove { position: absolute; top: -7px; right: -7px; }

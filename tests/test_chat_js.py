@@ -44,6 +44,13 @@ class El {
     this.classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
   }
   get nodeType() { return 1; }
+  set textContent(value) {
+    this._text = value;
+    const node = { nodeType: 3, nodeValue: String(value) };
+    node.replaceWith = (replacement) => { this.childNodes[0] = replacement; };
+    this.childNodes = value ? [node] : [];
+  }
+  get textContent() { return this._text; }
   get childElementCount() { return this.children.length; }
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   appendChild(child) { this.children.push(child); return child; }
@@ -69,7 +76,26 @@ class El {
     return find(this);
   }
   querySelectorAll() { return this.anchorNodes || []; }
-  set innerHTML(v) { this._html = v; }
+  set innerHTML(v) {
+    this._html = v;
+    if (v.includes("selection-nested-test")) {
+      const element = (tagName, childNodes) => ({ nodeType: 1, tagName, childNodes });
+      const text = (value) => ({ nodeType: 3, nodeValue: value });
+      const prose = text("selection-nested-test");
+      const code = text("code");
+      const control = text("button");
+      const parent = (tag, child) => {
+        const el = element(tag, [child]);
+        child.replaceWith = (replacement) => { el.childNodes[0] = replacement; };
+        return el;
+      };
+      this.childNodes = [
+        element("P", [parent("STRONG", prose)]),
+        element("PRE", [parent("CODE", code)]),
+        parent("BUTTON", control),
+      ];
+    }
+  }
   get innerHTML() { return this._html || ""; }
 }
 const byId = new Map();
@@ -159,6 +185,10 @@ sendMessage("first");
 const firstId = sent[0].client_id;
 out.clearedOnSend = input.value;
 out.sendingRow = rowInfo();
+out.pendingNativeSelection = {
+  text: liveRows()[0].children[0].children[0].dataset.nativeTouchSelection === "",
+  row: "nativeTouchSelection" in liveRows()[0].children[0].dataset,
+};
 input.value = "draft";
 chat.handleRefused("the agent is connecting, so this message was not sent", firstId);
 out.afterRefusal = input.value;
@@ -178,6 +208,19 @@ out.retried = { frames: sent.length - framesAtRetry, type: sent[sent.length - 1]
 chat.handleEvent({ kind: "user_turn", turn: 77, blocks: [{ type: "text", text: "first" }],
   client_id: retryId, at: 5000 }, { replayed: false });
 out.afterLogged = { rows: rowInfo(), states: pendingStates(), startedAt: store.getState().chat.turns.find((t) => t.turn === 77).startedAt };
+const loggedRow = el("chatLog").children.find((r) => r.dataset.turn === "77");
+out.loggedNativeSelection = {
+  text: loggedRow.children[0].children[1].dataset.nativeTouchSelection === "",
+  row: "nativeTouchSelection" in loggedRow.children[0].dataset,
+};
+chat.handleEvent({ kind: "text_delta", turn: 77, text: "selection-nested-test" }, { replayed: false });
+const rendered = loggedRow.children[1].children[0].children[0];
+out.markdownNativeSelection = {
+  prose: rendered.childNodes[0].childNodes[0].childNodes[0].dataset.nativeTouchSelection === "",
+  code: rendered.childNodes[1].childNodes[0].childNodes[0].dataset.nativeTouchSelection === "",
+  control: rendered.childNodes[2].childNodes[0].nodeType === 3,
+  block: "nativeTouchSelection" in rendered.dataset,
+};
 chat.handleEvent({ kind: "turn_end", turn: 77, stop_reason: "end_turn", cost_usd: 0, at: 9000 }, { replayed: false });
 out.endedAt = store.getState().chat.turns.find((t) => t.turn === 77).endedAt;
 out.diagForMessage = windowEvents
@@ -430,6 +473,12 @@ out.errorAfterAck = store.getState().chat.banner;
 out.errorHistory = store.getState().chat.turns.find((t) => t.turn === 1).errors;
 const recoveryRow = (n) => [...el("chatLog").children].reverse().find((r) => r.dataset.turn === String(n));
 out.errorHistoryVisible = recoveryRow(1).children[1].children[1].children[0].children.map((n) => n.textContent);
+const errorDetails = recoveryRow(1).children[1].children[1].children[0];
+out.errorNativeSelection = {
+  text: errorDetails.children[1].childNodes[0].dataset.nativeTouchSelection === "",
+  summary: errorDetails.children[0].childNodes[0].nodeType === 3,
+  card: "nativeTouchSelection" in errorDetails.dataset,
+};
 
 out.activityRecovery = [];
 for (const event of [
@@ -480,6 +529,12 @@ tools.scrollTop = 92;
 const firstCard = tools.children[0];
 firstCard.open = true;
 firstCard.listeners.toggle[0]();
+out.toolNativeSelection = {
+  input: firstCard.children[1].childNodes[0].dataset.nativeTouchSelection === "",
+  result: firstCard.children[2].childNodes[0].dataset.nativeTouchSelection === "",
+  summary: firstCard.children[0].childNodes[0].nodeType === 3,
+  card: "nativeTouchSelection" in firstCard.dataset,
+};
 firstCard.children[2].scrollTop = 37;
 const log = el("chatLog");
 log.scrollTop = 240; log.clientHeight = 200; log.scrollHeight = 2000;
@@ -608,6 +663,11 @@ chat.handleEvent({ kind: "thinking_delta", turn: 30, text: " more", truncated: t
 chat.handleEvent({ kind: "text_delta", turn: 30, text: "answer" }, { replayed: true });
 chat.handleEvent({ kind: "thinking_delta", turn: 30, text: "again" });
 const thinkingNodes = [...segmentContainer(30).children];
+out.thinkingNativeSelection = {
+  text: thinkingNodes[0].children[1].childNodes[0].dataset.nativeTouchSelection === "",
+  summary: thinkingNodes[0].children[0].childNodes[0].nodeType === 3,
+  card: "nativeTouchSelection" in thinkingNodes[0].dataset,
+};
 out.thinkingBlocks = {
   order: thinkingNodes.map((n) => n.className),
   opened: !!thinkingNodes[0].open,
@@ -768,6 +828,28 @@ def observed(tmp_path_factory):
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+
+def test_native_touch_selection_marks_message_text_not_rows_or_controls(observed):
+    assert observed["pendingNativeSelection"] == {"text": True, "row": False}
+    assert observed["loggedNativeSelection"] == {"text": True, "row": False}
+    assert observed["markdownNativeSelection"] == {
+        "prose": True,
+        "code": True,
+        "control": True,
+        "block": False,
+    }
+
+
+def test_native_touch_selection_marks_disclosure_text_not_controls(observed):
+    assert observed["thinkingNativeSelection"] == {"text": True, "summary": True, "card": False}
+    assert observed["errorNativeSelection"] == {"text": True, "summary": True, "card": False}
+    assert observed["toolNativeSelection"] == {
+        "input": True,
+        "result": True,
+        "summary": True,
+        "card": False,
+    }
 
 
 def test_a_page_opened_while_the_agent_is_down_shows_why(observed):

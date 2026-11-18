@@ -130,6 +130,26 @@ const HUMAN_DECISIONS = new Set(["allow", "allow_always", "deny"]);
 
 const renderModelText = renderMarkdown;
 
+// Mark only rendered text, not the full-width markdown blocks around it.
+// Wrapping the text nodes also covers nested markdown and fenced code.
+function markNativeTouchText(element) {
+  for (const node of element.childNodes || []) {
+    if (node.nodeType === 3 && node.nodeValue.trim()) {
+      const span = document.createElement("span");
+      span.dataset.nativeTouchSelection = "";
+      node.replaceWith(span);
+      span.appendChild(node);
+    } else if (node.nodeType === 1 && !["BUTTON", "SUMMARY"].includes(node.tagName)) {
+      markNativeTouchText(node);
+    }
+  }
+}
+
+function setNativeTouchText(element, text) {
+  element.textContent = text;
+  markNativeTouchText(element);
+}
+
 // Ordinary Claude Code tools (Bash, Edit, Write, ...) keep their plain
 // name; an in-process MCP tool arrives as `mcp__<server>__<tool>` and is
 // shown as `<server>: <tool>` instead of the wire form.
@@ -860,11 +880,12 @@ export function initChat({
       head.textContent = (result.by || "You") + ": " + result.label + ", " + result.file
         + " (" + sizeText(result.bytes) + ") to " + shortToolName(result.tool) + ": "
         + (ACTION_OUTCOME[result.outcome] || result.outcome);
+      markNativeTouchText(head);
       row.appendChild(head);
       if (result.text) {
         const body = document.createElement("pre");
         body.className = "toolresult";
-        body.textContent = result.text;
+        setNativeTouchText(body, result.text);
         row.appendChild(body);
       }
       actionEls.set(result.id, row);
@@ -989,13 +1010,13 @@ export function initChat({
     }
     if (rec.input !== tool.input) {
       rec.input = tool.input;
-      rec.inputEl.textContent = formatToolInput(tool.input);
+      setNativeTouchText(rec.inputEl, formatToolInput(tool.input));
     }
     if (tool.result) {
       rec.resultEl.hidden = false;
       if (rec.result !== tool.result) {
         rec.result = tool.result;
-        rec.resultEl.textContent = tool.result.text;
+        setNativeTouchText(rec.resultEl, tool.result.text);
         rec.resultEl.classList.toggle("error", !!tool.result.isError);
       }
     } else {
@@ -1042,8 +1063,9 @@ export function initChat({
     const userAuthor = document.createElement("div");
     userAuthor.className = "author";
     userAuthor.hidden = true;
-    const userText = document.createElement("div");
+    const userText = document.createElement("span");
     userText.className = "text";
+    userText.dataset.nativeTouchSelection = "";
     const userAttachmentsEl = document.createElement("div");
     userAttachmentsEl.className = "attachthumbs";
     const userContextsEl = document.createElement("div");
@@ -1123,10 +1145,11 @@ export function initChat({
       segmentRec.value = segment;
       if (segment.kind === "text") {
         segmentRec.el.innerHTML = renderModelText(segment.text);
+        markNativeTouchText(segmentRec.el);
         return;
       }
       if (segment.kind === "thinking") {
-        segmentRec.body.textContent = segment.text;
+        setNativeTouchText(segmentRec.body, segment.text);
         segmentRec.note.hidden = !segment.truncated;
         return;
       }
@@ -1144,7 +1167,7 @@ export function initChat({
       details.appendChild(summary);
       if (error.stderr) {
         const pre = document.createElement("pre");
-        pre.textContent = error.stderr;
+        setNativeTouchText(pre, error.stderr);
         details.appendChild(pre);
       }
       inspectDisclosure(details);
@@ -1173,8 +1196,9 @@ export function initChat({
     const userEl = document.createElement("div");
     userEl.className = "msg user sending";
     if (contextMenu) userEl.tabIndex = 0;
-    const textEl = document.createElement("div");
+    const textEl = document.createElement("span");
     textEl.className = "text";
+    textEl.dataset.nativeTouchSelection = "";
     textEl.textContent = blocksToText(entry.blocks);
     const attachmentsEl = document.createElement("div");
     attachmentsEl.className = "attachthumbs";
@@ -1664,7 +1688,7 @@ export function initChat({
     if (failure) {
       bannerEl.hidden = false;
       bannerEl.dataset.kind = "error";
-      bannerTextEl.textContent = failure.message;
+      setNativeTouchText(bannerTextEl, failure.message);
       bannerDetailEl.hidden = true;
       failureAction = failure.action;
       const label = FAILURE_ACTION_LABEL[failure.action] || "";
@@ -1679,13 +1703,13 @@ export function initChat({
     if (chat.banner) {
       bannerEl.hidden = false;
       bannerEl.dataset.kind = chat.banner.kind;
-      bannerTextEl.textContent = chat.banner.text;
+      setNativeTouchText(bannerTextEl, chat.banner.text);
       // Opened whenever it shows something new, so the backend's words are
       // seen, and left as the human set it while the same text stays.
       const detail = chat.banner.detail || "";
       const pre = bannerDetailEl.querySelector("pre");
       if (pre.textContent !== detail) {
-        pre.textContent = detail;
+        setNativeTouchText(pre, detail);
         bannerDetailEl.open = true;
       }
       bannerDetailEl.hidden = !detail;
