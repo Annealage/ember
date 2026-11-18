@@ -1116,12 +1116,31 @@ async def test_after_a_compaction_the_context_fill_is_unknown_until_the_next_cal
                 "compact_metadata": {"trigger": "auto", "pre_tokens": 150000},
             }
         )
+        invalidated = await recorder.next()
+        assert isinstance(invalidated, Usage)
+        assert invalidated.context is None
+        assert invalidated.cost_usd is None
         transport.push(_result(0.5, {"claude-haiku-4-5": _model_usage(150000, 10, 0, 0)}))
         assert isinstance(await recorder.next(), TurnEnd)
         usage = await recorder.next()
         assert isinstance(usage, Usage)
         assert usage.context is None
         assert usage.cost_usd == 0.5
+        # A later compaction immediately clears the fill but preserves the
+        # last reported cumulative accounting.
+        transport.push(
+            {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "session_id": "sdk-sess-1",
+                "compact_metadata": {"trigger": "auto", "pre_tokens": 150000},
+            }
+        )
+        invalidated = await recorder.next()
+        assert isinstance(invalidated, Usage)
+        assert invalidated.context is None
+        assert invalidated.cost_usd == 0.5
+        assert invalidated.tokens["input"] == 150000
     finally:
         await session.close()
 

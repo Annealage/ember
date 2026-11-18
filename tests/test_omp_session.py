@@ -2015,6 +2015,34 @@ async def test_a_failure_nobody_retries_is_published_when_the_turn_ends_and_abor
 
 
 @pytest.mark.asyncio
+async def test_startup_usage_is_silent_for_fresh_sessions_but_invalidates_unknown_resume(tmp_path):
+    fresh, _, fresh_events, _ = await _started_session()
+    try:
+        assert not any(isinstance(event, Usage) for event in fresh_events.all)
+    finally:
+        await fresh.close()
+
+    class UnavailableUsageClient(FakeRpcClient):
+        def get_state(self):
+            raise RuntimeError("state unavailable")
+
+        def get_session_stats(self):
+            raise RuntimeError("usage unavailable")
+
+    conversation = write_conversation(tmp_path / "conversation.jsonl")
+    resumed, _, events, _ = await _started_session(
+        session_dir=tmp_path / "omp", resume=str(conversation), client_class=UnavailableUsageClient
+    )
+    try:
+        (usage,) = [event for event in events.all if isinstance(event, Usage)]
+        assert usage.context is None
+        assert usage.cost_usd is None
+        assert all(value is None for value in usage.to_wire()["tokens"].values())
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
 async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_through_each_turn(
     tmp_path, monkeypatch
 ):
@@ -2070,6 +2098,27 @@ async def test_usage_is_the_whole_conversation_s_from_the_start_of_a_resume_thro
         fake.push_agent_end()
         await _next_of(recorder, TurnEnd)
         assert (await recorder.next()).to_wire()["context"] is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_usage_replaces_an_old_context_snapshot(monkeypatch):
+    session, fake, recorder, _ = await _started_session()
+    try:
+        _big_context(fake)
+        await session._emit_usage(await session._read_usage())
+        assert session._context_tokens == 150000
+
+        def unavailable():
+            raise RuntimeError("state unavailable")
+
+        monkeypatch.setattr(fake, "get_state", unavailable)
+        await session._emit_usage(None)
+        last = [event for event in recorder.all if isinstance(event, Usage)][-1]
+        assert last.context is None
+        assert last.cost_usd is None
+        assert session._context_tokens is None
     finally:
         await session.close()
 

@@ -1560,9 +1560,10 @@ class OmpSession:
             # the hello frame's session id and a later -c resuming it.
             sys.stderr.write("warning: could not read the omp session state: %r\n" % (exc,))
         self._usage = await self._read_usage()
-        # A resumed conversation's figures are known before any turn; a new
-        # one has used nothing yet, which the first turn's end reports.
-        if self._usage is not None and any(self._usage.values()):
+        # A resumed event-log snapshot may predate a compaction; replace it
+        # even when the backend cannot recover figures. A fresh, unused
+        # session still emits no startup usage.
+        if self._resume or (self._usage is not None and any(self._usage.values())):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
         self._start_profile_apply()
@@ -2353,9 +2354,8 @@ class OmpSession:
                 context = context_figures(figures.tokens, figures.context_window)
             self._context_tokens = context["used_tokens"] if context is not None else None
         except Exception as exc:
+            self._context_tokens = None
             sys.stderr.write("warning: could not read the omp context usage: %r\n" % (exc,))
-        if usage is None and context is None:
-            return
         self._emit(
             Usage(
                 cost_usd=usage["cost"] if usage is not None else None,

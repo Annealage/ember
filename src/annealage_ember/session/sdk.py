@@ -355,6 +355,7 @@ class SdkSession:
         # The model and prompt size (tokens) of the last main-conversation API
         # call, which is how full the context window is (``_usage``).
         self._last_call: Optional[Tuple[str, int]] = None
+        self._usage_snapshot = usage
         # A resumed conversation without recovered counters is not a fresh one.
         # Its first cumulative result establishes a baseline, not turn spend.
         self._totals = _totals_of({} if resume and usage is None else usage)
@@ -1375,6 +1376,16 @@ class SdkSession:
             self._last_call = None
             self._usage_epoch += 1
             self._totals = _totals_of(None)
+            self._usage_snapshot = None
+            self._emit(
+                Usage(
+                    cost_usd=None,
+                    tokens=None,
+                    context=None,
+                    usage_epoch=self._usage_epoch,
+                    usage_source="cumulative_snapshot",
+                )
+            )
             return
         if isinstance(message, SystemMessage):
             self._handle_system(message)
@@ -1517,12 +1528,23 @@ class SdkSession:
             # The context was compacted: the last call's prompt no longer says
             # how full it is, so the fill is unknown until the next call.
             self._last_call = None
+            previous = self._usage_snapshot or {}
+            self._emit(
+                Usage(
+                    cost_usd=previous.get("cost_usd"),
+                    tokens=previous.get("tokens"),
+                    context=None,
+                    usage_epoch=self._usage_epoch,
+                    usage_source="cumulative_snapshot",
+                )
+            )
         if message.subtype == "init" and self._resume and not self._resume_checked:
             self._resume_checked = True
             reported = data.get("session_id")
             if reported and reported != self._resume:
                 # A new conversation, whose totals start from nothing.
                 self._totals = _totals_of(None)
+                self._usage_snapshot = None
                 self._usage_epoch += 1
                 self._emit(
                     SessionReset(
@@ -1565,6 +1587,8 @@ class SdkSession:
         )
 
     def _emit(self, event) -> None:
+        if isinstance(event, Usage):
+            self._usage_snapshot = event.snapshot()
         try:
             self._on_event(event)
         except Exception as exc:

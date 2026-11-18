@@ -59,8 +59,9 @@ class El {
   before(...nodes) { (this.inserted ||= []).push(...nodes); }
   after(...nodes) { (this.inserted ||= []).push(...nodes); }
   replaceChildren(...kids) { this.children = [...kids]; }
-  setAttribute() {}
-  getAttribute() { return null; }
+  setAttribute(name, value) { (this.attributes ||= {})[name] = value; }
+  getAttribute(name) { return this.attributes?.[name] ?? null; }
+  removeAttribute(name) { if (this.attributes) delete this.attributes[name]; }
   focus() {}
   getBoundingClientRect() { return this.rect || { top: 0, bottom: 0 }; }
   blur() {}
@@ -274,6 +275,9 @@ const readouts = () => usageChip.children.map((r) => ({
   usage: r.dataset.usage, val: r.children[0].textContent, unit: r.children[1].textContent,
   hidden: r.hidden, title: r.title }));
 out.usageFromHello = { readouts: readouts(), title: usageChip.title, hidden: usageChip.hidden };
+out.contextLabel = usageChip.children[0].getAttribute("aria-label");
+out.badContext = usageSummary({ context: { window_tokens: 200000 } }).context;
+out.zeroContext = usageSummary({ context: { used_tokens: 0, window_tokens: 200000 } }).context.value;
 out.usageSummaryText = usageSummary({ cost_usd: 0.4312, tokens: {},
   context: { used_tokens: 24500, window_tokens: 200000 } }).text;
 out.usageZeroCost = usageSummary({ cost_usd: 0, tokens: {}, context: null }).cost.value;
@@ -1100,6 +1104,9 @@ def test_the_header_shows_the_conversation_s_usage_from_the_hello_and_live_event
     )
     assert observed["usageSummaryText"] == "12% context, $0.431 cost"
     assert observed["usageZeroCost"] == "$0.000", "a zero cost is a figure, not unknown"
+    assert observed["contextLabel"] == "Context window: 24,500 of 200,000 tokens (12%)"
+    assert observed["badContext"] is None
+    assert observed["zeroContext"] == "0%"
     assert observed["usageHiddenWhenUnknown"] is True
     assert observed["usageHiddenAfterReset"] is True, (
         "a new conversation's usage is not the old one's"

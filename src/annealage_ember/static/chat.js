@@ -501,7 +501,8 @@ export function usageSummary(usage) {
   let contextReadout = null;
   let costReadout = null;
   const context = usage.context;
-  if (context && context.window_tokens > 0) {
+  if (context && Number.isFinite(context.used_tokens) && context.used_tokens >= 0
+      && Number.isFinite(context.window_tokens) && context.window_tokens > 0) {
     const percent = Math.round((100 * context.used_tokens) / context.window_tokens);
     const fact = "Context window: " + tokenCount(context.used_tokens) + " of "
       + tokenCount(context.window_tokens) + " tokens (" + percent + "%)";
@@ -1505,6 +1506,8 @@ export function initChat({
       const figure = summary[readout.dataset.usage];
       readout.hidden = !figure;
       readout.title = figure ? figure.title : "";
+      if (figure) readout.setAttribute("aria-label", figure.title);
+      else readout.removeAttribute("aria-label");
       if (figure) {
         readout.children[0].textContent = figure.value;
         readout.children[1].textContent = figure.unit;
