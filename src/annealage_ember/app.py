@@ -282,6 +282,7 @@ def create_app(
     hosted_frame_ops=None,
     state_sink=None,
     usage_sink=None,
+    activity_sink=None,
     builtin_tools=None,
     auto_approve_included_tools=False,
     settings_model_controls=None,
@@ -425,6 +426,13 @@ def create_app(
     lifecycle (launch, cancel, end, error) goes to the same sink as
     ``session_event`` records.
 
+    ``activity_sink(event: dict) -> None`` (hosted mode only) observes turn
+    start/end, model text/thinking and tool start/result events. It receives
+    ``kind`` and ``turn``, plus ``tool_use_id`` for tool events, never content
+    or arguments. Text/thinking is sampled at most once per second; transitions
+    are not sampled. The synchronous callback must not block. Exceptions are
+    logged. Silence does not prove that a turn or tool is idle.
+
     ``usage_sink(event: dict) -> None`` (hosted mode only, omp) receives one
     event per provider request, with that request's token counts
     (``hosted_state.usage_event``); best-effort telemetry, since the
@@ -481,6 +489,8 @@ def create_app(
         raise ValueError("state_sink records hosted principals, so it requires hosted mode")
     if usage_sink is not None and not hosted_mode:
         raise ValueError("usage_sink reports a hosted session's usage, so it requires hosted mode")
+    if activity_sink is not None and (not hosted_mode or not callable(activity_sink)):
+        raise ValueError("activity_sink must be callable and requires hosted mode")
     if hosted_mode:
         if hosted_state_dir is None:
             raise ValueError("hosted mode requires an external hosted_state_dir")
@@ -870,6 +880,7 @@ def create_app(
         build_session=build_session,
         resume_session=resume_session,
         idle_timeout=idle_timeout,
+        activity_sink=activity_sink,
         agent_lock=agent_lock,
         restore_model_on_resume=(
             settings_model_controls.get("restore_model_on_resume", True)
@@ -1460,6 +1471,7 @@ class AgentHolder:
         build_session=None,
         resume_session=None,
         idle_timeout=None,
+        activity_sink=None,
         agent_lock=None,
         restore_model_on_resume=True,
     ):
@@ -1517,6 +1529,9 @@ class AgentHolder:
         self._viewers = 0
         self._turns = set()
         self._requests = set()
+        self._activity_sink = activity_sink
+        self._activity_last = None
+        self._activity_tools = {}
         self._attention = None
         self._last_activity = time.time()
         # Inputs accepted while the agent was still starting, in order.
@@ -2143,11 +2158,38 @@ class AgentHolder:
 
     def _observe(self, wire):
         kind = wire.get("kind")
+        turn = wire.get("turn")
+        if self._activity_sink is not None:
+            if (
+                kind in ("text_delta", "thinking_delta")
+                and turn in self._turns
+                and wire.get("text")
+            ):
+                now = time.monotonic()
+                if self._activity_last is None or now - self._activity_last >= 1:
+                    self._activity_last = now
+                    self._report_activity(kind, turn)
+            elif kind == "tool_use" and turn in self._turns:
+                tool_id = wire.get("tool_use_id")
+                if isinstance(tool_id, str) and tool_id:
+                    self._activity_tools[tool_id] = turn
+                    self._report_activity(kind, turn, tool_id)
+            elif kind == "tool_result":
+                tool_id = wire.get("tool_use_id")
+                turn = self._activity_tools.pop(tool_id, None)
+                if turn is not None:
+                    self._report_activity(kind, turn, tool_id)
         if kind == "user_turn":
             self._turns.add(wire.get("turn"))
+            self._activity_last = None
+            if self._activity_sink is not None:
+                self._report_activity("turn_started", wire.get("turn"))
             self._attention = None
         elif kind == "turn_end":
-            self._turns.discard(wire.get("turn"))
+            turn = wire.get("turn")
+            if turn in self._turns and self._activity_sink is not None:
+                self._report_activity("turn_finished", turn)
+            self._turns.discard(turn)
         elif kind == "permission_request":
             self._requests.add(wire.get("request_id"))
         elif kind == "permission_resolved":
@@ -2159,6 +2201,15 @@ class AgentHolder:
         else:
             return
         self._note_change()
+
+    def _report_activity(self, kind, turn, tool_id=None):
+        event = {"kind": kind, "turn": turn}
+        if tool_id is not None:
+            event["tool_use_id"] = tool_id
+        try:
+            self._activity_sink(event)
+        except Exception:
+            sys.stderr.write("warning: hosted activity sink failed\n")
 
     def _note_change(self, active=True):
         """Tell the status listeners. ``active`` says the change is the agent

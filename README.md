@@ -916,6 +916,8 @@ In hosted agent mode the front controls the worker's session over HTTP, each cal
 
 `create_app(..., usage_sink=...)` (hosted mode, OMP) receives the same positional `request_usage` events described above, from each assistant provider message, and publishes them through the interactive event stream even when no sink is configured. Per-request cost is an optional provider-reported estimate with provenance, never an invoice; token counts are message-local. This is best-effort telemetry; the inference proxy is the authoritative meter. `run_prompt(..., usage_sink=...)` emits the same event shape without hosted mode.
 
+`create_app(..., activity_sink=callback)` optionally reports hosted turn activity without model text or tool arguments. The synchronous callback receives `{"kind": ..., "turn": ...}` for `turn_started`, `turn_finished`, `text_delta` and `thinking_delta`; `tool_use` and `tool_result` also carry `tool_use_id`. Text and thinking are sampled at most once per second per turn, while turn and tool transitions are not sampled. Tool results are reported only for observed tool uses, including results that arrive after the turn end. The callback must enqueue and return without blocking. Delivery is best effort: a missing event or a silent model/tool is not proof that work is idle or finished. The host owns any per-process identity, sequence and persistence.
+
 ## Development
 
     uv sync --extra dev --extra codex
