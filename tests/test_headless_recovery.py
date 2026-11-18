@@ -116,6 +116,21 @@ async def test_recovery_count_is_a_hard_bound(monkeypatch, tmp_path):
     assert built.session.started == 1
 
 
+async def test_work_timeout_still_interrupts_without_a_hard_deadline(monkeypatch, tmp_path):
+    async def script(session):
+        pass
+
+    contexts = []
+    built = recoverable(monkeypatch, script)
+    result = await run_prompt(
+        "original",
+        **make_args(tmp_path, timeout=None, work_timeout=0.01, on_timeout=contexts.append),
+    )
+    assert result.timeout_kind == "work_interval" and result.error == "timeout"
+    assert built.session.interrupted == 1
+    assert contexts[0].kind == "work_interval" and contexts[0].remaining is None
+
+
 @pytest.mark.parametrize("mode", ("negative_ack", "no_boundary", "hung_abort"))
 async def test_uncertain_interruption_never_submits_next_turn(monkeypatch, tmp_path, mode):
     async def script(session):
@@ -413,7 +428,8 @@ async def test_native_error_does_not_invoke_timeout_callback(monkeypatch, tmp_pa
     assert result.timeout_kind is None and contexts == [] and built.session.interrupted == 0
 
 
-async def test_rpc_timeout_is_observational_not_a_generation_retry(monkeypatch, tmp_path):
+@pytest.mark.parametrize("timeout", [None, 5])
+async def test_rpc_timeout_is_observational_not_a_generation_retry(monkeypatch, tmp_path, timeout):
     async def script(session):
         session.last_request_timeout = "prompt"
         session.emit(AgentError(stderr="RPC acknowledgement timed out", remediation=""))
@@ -425,6 +441,7 @@ async def test_rpc_timeout_is_observational_not_a_generation_retry(monkeypatch, 
         "original",
         **make_args(
             tmp_path,
+            timeout=timeout,
             on_timeout=lambda context: contexts.append(context) or "never submit",
             max_timeout_recoveries=2,
         ),
@@ -432,6 +449,7 @@ async def test_rpc_timeout_is_observational_not_a_generation_retry(monkeypatch, 
     assert result.timeout_kind == "rpc_request_timeout"
     assert contexts[0].rpc_operation == "prompt"
     assert contexts[0].interruption == "not_attempted"
+    assert (contexts[0].remaining is None) == (timeout is None)
     assert len(built.session.submitted_turns) == 1
 
 

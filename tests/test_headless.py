@@ -590,7 +590,6 @@ async def test_cache_retention_accepts_documented_values(cache_retention, tmp_pa
         ({"model": 3}, "model must be None or a non-empty string"),
         ({"timeout": 0}, "timeout must be"),
         ({"timeout": -3}, "timeout must be"),
-        ({"timeout": None}, "timeout must be"),
         ({"tools": ["lookup"]}, "tools must be a ToolSet"),
     ],
 )
@@ -1125,9 +1124,29 @@ async def test_whole_run_timeout_includes_callback_and_followup(monkeypatch, tmp
         assert result.tokens == dict.fromkeys(TOKENS)
 
 
+async def test_no_hard_deadline_waits_for_the_turn_to_finish(monkeypatch, tmp_path):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def script(session):
+        started.set()
+        await release.wait()
+        await finish(session, text=("complete",))
+
+    built = script_session(monkeypatch, script)
+    task = asyncio.create_task(run_prompt("go", **make_args(tmp_path, timeout=None)))
+    await asyncio.wait_for(started.wait(), 2)
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    release.set()
+    result = await asyncio.wait_for(task, 2)
+    assert result.error is None and result.text == "complete"
+    assert built.session.closed == 1
+
+
+@pytest.mark.parametrize("timeout", [None, 5])
 @pytest.mark.parametrize("wait_in", ["callback", "followup"])
 async def test_cancellation_during_continuation_cleans_up_and_reraises(
-    monkeypatch, tmp_path, wait_in
+    monkeypatch, tmp_path, wait_in, timeout
 ):
     reached = asyncio.Event()
     cleaned = []
@@ -1152,7 +1171,9 @@ async def test_cancellation_during_continuation_cleans_up_and_reraises(
 
     built = script_session(monkeypatch, script)
     task = asyncio.create_task(
-        run_prompt("go", **make_args(tmp_path, on_turn_result=on_turn, max_followups=2))
+        run_prompt(
+            "go", **make_args(tmp_path, timeout=timeout, on_turn_result=on_turn, max_followups=2)
+        )
     )
     await asyncio.wait_for(reached.wait(), 2)
     task.cancel()

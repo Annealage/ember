@@ -684,6 +684,8 @@ SDK backend rejects `xhigh` rather than silently translating it.
 
 `max_followups` is a nonnegative integer, default **0**, so the default remains one turn. It is a hard upper bound on extra submissions, even if the callback always requests another. The callback observes every clean ordinary turn, including the last at the bound, but its returned text is ignored once the bound is exhausted. Clean `max_tokens` and `ended_by_tool` completions are eligible; errors, rejected input, native turn/budget limits, cancellation and timeout are not. Unknown stop reasons fail closed. The single whole-run `timeout` covers startup, every turn and the callbacks; it is not renewed per correction. Callbacks must yield normally to remain cancellable.
 
+Pass `timeout=None` to run without a whole-run deadline. `work_timeout`, OMP's per-request timeout and explicit cancellation remain in force. In a timeout callback, `TimeoutContext.remaining` is `None` when there is no whole-run deadline.
+
 On timeout or cancellation, the callback/turn task is cancelled and waited for up to 5 seconds, separately from the existing bounded tool drain and native-process close. A callback that suppresses cancellation can outlive this wait, but cannot authorize another submission after the run ends; like synchronous blocking tool code, its own external side effects cannot be forcibly stopped. Keep callbacks short and cancellation-cooperative.
 Teardown does not reissue cancellation while a handler or callback is cleaning
 up: awaited `finally` blocks retain their bounded drain opportunity. A terminal
@@ -714,15 +716,15 @@ pauses the inactivity window, and readiness starts a fresh window. If readiness
 is unknown, the window starts with the first model text or tool-use event in
 the run, not startup or input acknowledgement events. The host should return
 unknown when its loading endpoint or model identity is unavailable. Callback
-errors end the run; the whole-run `timeout` still applies while the callback
-or model is loading. Without `work_timeout`, the callback is not called.
+errors end the run; a configured whole-run `timeout` still applies while the
+callback or model is loading. Without `work_timeout`, the callback is not called.
 
 `unknown_readiness_timeout` optionally bounds inactivity in seconds while
 readiness is unknown before that first model event. A session event or tool
 activity resets the interval; known loading pauses and resets it. Expiry uses
 the same `work_interval` interruption and recovery path as `work_timeout`.
 The default `None` leaves the unknown interval unbounded by inactivity, though
-the hard deadline still applies. This option only applies with both
+a configured hard deadline still applies. This option only applies with both
 `work_timeout` and `model_readiness`.
 
 The OMP recovery path refuses new host tool calls, lets existing handlers

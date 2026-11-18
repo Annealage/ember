@@ -51,9 +51,9 @@ raises only for a bad argument (``ValueError``) or because the caller
 cancelled it (``CancelledError``, after the session is closed).
 
 Model loading. An optional ``model_readiness`` callback can pause the inactivity
-window while the host reports that the model is loading. The whole-run deadline
-remains active. Unknown readiness waits for the first model text or tool-use
-event unless the host supplies an initial inactivity bound.
+window while the host reports that the model is loading. A configured whole-run
+deadline remains active. Unknown readiness waits for the first model text or
+tool-use event unless the host supplies an initial inactivity bound.
 
 When a run ends early. An unrecovered timeout or a cancel ends the run: the
 broker refuses any further call, each tool handler starts refusing ("this run has ended") and
@@ -236,13 +236,14 @@ class TimeoutContext:
 
     ``result`` can contain confidential partial text and tool errors. Do not
     log it indiscriminately. ``remaining`` is the hard deadline's remaining
-    seconds; elapsed includes startup, diagnostics and callbacks.
+    seconds, or ``None`` without a hard deadline. Elapsed includes startup,
+    diagnostics and callbacks.
     """
 
     kind: str
     result: RunResult
     elapsed: float
-    remaining: float
+    remaining: Optional[float]
     interruption: str
     recovery: RecoveryInfo
     rpc_operation: Optional[str] = None
@@ -727,7 +728,7 @@ def _check_arguments(
             raise ValueError("deferred_tools is only supported with backend='omp'")
         if builtin_tools:
             raise ValueError("deferred_tools cannot be combined with builtin_tools")
-    if (
+    if timeout is not None and (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
         or not math.isfinite(timeout)
@@ -1311,7 +1312,8 @@ async def run_prompt(
     no Claude role mapping. ``cwd`` is an existing directory, the caller's
     scratch space, used only as the backend's working directory. ``timeout`` is
     seconds for the whole run, start included: when it passes the session is
-    closed and the result is ``error="timeout"``.
+    closed and the result is ``error="timeout"``. ``None`` disables the hard
+    deadline; inactivity, per-request timeouts and cancellation still apply.
     ``omp_request_timeout`` is an optional per-request wait for OMP RPC calls,
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
@@ -1334,9 +1336,9 @@ async def run_prompt(
     optionally bounds inactivity in seconds while readiness is unknown before that
     first event. Entering loading resets this interval; expiry follows the normal
     ``work_interval`` interruption path. Its default ``None`` leaves unknown
-    unbounded apart from the hard deadline. It only applies when ``work_timeout``
-    and ``model_readiness`` are set. Callback errors fail the run. The hard total
-    deadline remains in force, including during the callback.
+    unbounded apart from any hard deadline. It only applies when ``work_timeout``
+    and ``model_readiness`` are set. Callback errors fail the run. A configured
+    hard deadline remains in force, including during the callback.
 
     ``on_timeout(TimeoutContext) -> str | None`` may return a diagnostic user
     prompt ONLY after a ``work_interval`` with ``interruption="safe"``. At most
@@ -1567,7 +1569,7 @@ async def run_prompt(
                     else run.turn_result(stop_reason="timeout", error="timeout")
                 ),
                 elapsed=elapsed,
-                remaining=max(0, timeout - elapsed),
+                remaining=None if timeout is None else max(0, timeout - elapsed),
                 interruption=interruption,
                 recovery=recovery_info(),
                 rpc_operation=getattr(run.session, "last_request_timeout", None),
@@ -1680,14 +1682,20 @@ async def run_prompt(
                     on_timeout=on_timeout,
                     max_timeout_recoveries=max_timeout_recoveries,
                     timeout_context=timeout_context,
-                    deadline=started + timeout,
+                    deadline=float("inf") if timeout is None else started + timeout,
                 )
             )
             driver_cancelled = False
             try:
-                remaining = max(0, timeout - (asyncio.get_running_loop().time() - started))
+                remaining = (
+                    None
+                    if timeout is None
+                    else max(0, timeout - (asyncio.get_running_loop().time() - started))
+                )
                 await asyncio.wait({task}, timeout=remaining)
-                if not task.done() or asyncio.get_running_loop().time() >= started + timeout:
+                if timeout is not None and (
+                    not task.done() or asyncio.get_running_loop().time() >= started + timeout
+                ):
                     # A known terminal backend failure is no longer active
                     # work. Bounded transport cleanup must not relabel it as
                     # a generation deadline or invoke timeout diagnostics.
