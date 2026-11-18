@@ -32,7 +32,7 @@ function reply(status, body, headers = {}) {
 function script(steps) {
   const calls = [];
   const fetcher = async (url, init = {}) => {
-    calls.push({ url, method: init.method || "GET" });
+    calls.push({ url, method: init.method || "GET", body: init.body });
     const step = steps.shift();
     if (!step) throw new Error("unexpected request " + calls.length);
     if (step instanceof Error) throw step;
@@ -52,7 +52,7 @@ async function outcome(steps, extra = {}) {
   let error = null;
   try { await ensureHostedSession({ url: "/p/a/agent/session", fetcher: s.fetcher, ...clock, ...extra }); }
   catch (e) { error = e.message; }
-  return { calls: s.calls.map((c) => c.method + " " + c.url), error, slept: fastClock.slept, left: steps.length };
+  return { calls: s.calls.map((c) => c.method + " " + c.url), bodies: s.calls.filter((c) => c.method === "POST").map((c) => JSON.parse(c.body)), error, slept: fastClock.slept, left: steps.length };
 }
 const results = {};
 
@@ -62,6 +62,13 @@ results.admit = await outcome([noJob(), reply(202, {}), starting("2"), reply(200
 results.ended = await outcome([ended(), reply(202, {}), reply(200, {})]);
 // a live session is only read
 results.existing = await outcome([reply(200, {})]);
+const previewUrl = "/p/a/_front/settings-preview?operation=loom.agent_turn";
+const preview = (hash) => reply(200, { snapshot_hash: hash });
+results.resolved = await outcome([noJob(), preview("first"), reply(202, {}), reply(200, {})], { settingsPreviewUrl: previewUrl });
+results.changed = await outcome([ended(), preview("old"), reply(409, { error: { type: "settings_changed" } }), preview("new"), reply(202, {}), reply(200, {})], { settingsPreviewUrl: previewUrl });
+results.previewFailed = await outcome([noJob(), reply(503, {})], { settingsPreviewUrl: previewUrl });
+results.resolvedExisting = await outcome([reply(200, {})], { settingsPreviewUrl: previewUrl });
+results.changedRepeated = await outcome([noJob(), preview("a"), reply(409, {error: {type: "settings_changed"}}), preview("b"), reply(409, {error: {type: "settings_changed"}}), preview("c"), reply(409, {error: {type: "settings_changed"}})], { settingsPreviewUrl: previewUrl });
 // a POST that fails ambiguously is never repeated
 results.ambiguous = await outcome([noJob(), new Error("network")]);
 // a refusal (even on the POST) ends it, nothing mutated on a GET refusal
@@ -247,6 +254,28 @@ def test_a_missing_session_is_admitted_once_and_then_only_read(results):
 
 def test_a_session_that_exists_is_not_admitted(results):
     assert results["existing"]["calls"] == ["GET /p/a/agent/session"]
+
+
+def test_resolved_admission_binds_the_preview_and_refreshes_only_on_stale_settings(results):
+    r = results["resolved"]
+    assert r["calls"] == [
+        "GET /p/a/agent/session",
+        "GET /p/a/_front/settings-preview?operation=loom.agent_turn",
+        "POST /p/a/agent/session",
+        "GET /p/a/agent/session",
+    ]
+    assert r["bodies"] == [{"settings_snapshot_hash": "first"}]
+    assert r["error"] is None
+    assert results["changed"]["bodies"] == [
+        {"settings_snapshot_hash": "old"},
+        {"settings_snapshot_hash": "new"},
+    ]
+    assert results["changed"]["error"] is None
+    assert results["previewFailed"]["bodies"] == []
+    assert results["previewFailed"]["error"]
+    assert results["resolvedExisting"]["calls"] == ["GET /p/a/agent/session"]
+    assert len(results["changedRepeated"]["bodies"]) == 3
+    assert results["changedRepeated"]["error"]
 
 
 def test_an_ambiguous_admission_is_never_repeated(results):

@@ -13,10 +13,8 @@
  *
  * Only the first two 4xx/5xx kinds are answered by a POST. The rules:
  *
- *   - Admission is a mutation, so there is one POST per call and it is never
- *     repeated: a POST that fails, or whose answer was lost, is an error for
- *     the person to act on, not something to try again (a second one could
- *     start a second worker).
+ *   - A POST with a lost or failed response is never repeated: it may have
+ *     started a worker. The person can use Resume to check.
  *   - A session that already exists is read, not admitted: no POST.
  *   - Everything after the POST is a GET, bounded in count and by one
  *     overall deadline, and it waits exactly as long as the server's
@@ -27,9 +25,9 @@
  *     given up on even if the fetch ignores the abort), the POST included: an
  *     aborted POST is as ambiguous as a lost one, so it is reported, never
  *     repeated.
- *   - A 409 on the POST (the last job still publishing) started nothing, so it
- *     is asked again up to BUSY_RETRIES times, BUSY_GAP_MS apart; any other
- *     failure of the POST is reported and never repeated.
+ *   - A 409 on the POST started nothing. A busy job is retried after a delay;
+ *     `settings_changed` fetches a fresh preview before retrying. Both are
+ *     bounded by BUSY_RETRIES and the deadline.
  *   - A refusal (401, 403) ends the call before any mutation.
  */
 
@@ -59,12 +57,14 @@ export function retryAfterMs(value, now) {
  * the person (the page shows it) otherwise.
  *
  * `url` is the session route, already resolved against whatever base and
- * prefix the page lives under. `fetcher` carries the page's auth (default:
- * `fetch`) and is given `signal`. `sleep`, `now` and `after(fn, ms)` (which
- * returns a cancel function) are the clock, for tests.
+ * prefix the page lives under. `settingsPreviewUrl` opts into hosted resolved
+ * settings; its snapshot hash is bound to each admission. `fetcher` carries
+ * the page's auth and is given `signal`. `sleep`, `now` and `after(fn, ms)`
+ * (which returns a cancel function) are the clock, for tests.
  */
 export async function ensureHostedSession({
   url,
+  settingsPreviewUrl = null,
   fetcher = (...args) => globalThis.fetch(...args),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   now = () => Date.now(),
@@ -78,7 +78,7 @@ export async function ensureHostedSession({
   const deadline = now() + deadlineMs;
 
   // One request and the reading of its body, abandoned at the deadline.
-  async function request(init) {
+  async function request(init, requestUrl = url) {
     const left = deadline - now();
     if (left <= 0) throw new Expired();
     const controller = new AbortController();
@@ -92,9 +92,9 @@ export async function ensureHostedSession({
     try {
       return await Promise.race([
         (async () => {
-          const response = await fetcher(url, { ...init, signal: controller.signal });
+          const response = await fetcher(requestUrl, { ...init, signal: controller.signal });
           const body = await response.clone().json().catch(() => null);
-          return { response, kind: body && body.error && body.error.type };
+          return { response, body, kind: body && body.error && body.error.type };
         })(),
         expiry,
       ]);
@@ -117,16 +117,32 @@ export async function ensureHostedSession({
   if (response.status === 401 || response.status === 403) throw refused(response.status);
   if ((response.status === 404 && kind === "no_job") || (response.status === 503 && kind === "job_ended")) {
     let admitted;
+    let snapshotHash = null;
+    async function preview() {
+      const result = await request({ cache: "no-store" }, settingsPreviewUrl);
+      if (result.response.status === 401 || result.response.status === 403) throw refused(result.response.status);
+      if (!result.response.ok || typeof result.body?.snapshot_hash !== "string" || !result.body.snapshot_hash) {
+        throw new Error("Could not read agent settings; your message has not been sent.");
+      }
+      return result.body.snapshot_hash;
+    }
+    if (settingsPreviewUrl) snapshotHash = await preview();
     for (let busy = 0; ; busy++) {
       try {
         admitted = await request({
-          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(snapshotHash === null ? {} : { settings_snapshot_hash: snapshotHash }),
         });
       } catch (failure) {
         throw new Error(
           "The agent session request failed and was not repeated; it may or may not have started. "
           + "Use Resume session to check.",
         );
+      }
+      if (admitted.response.status === 409 && admitted.kind === "settings_changed") {
+        if (!settingsPreviewUrl || busy >= BUSY_RETRIES) break;
+        snapshotHash = await preview();
+        continue;
       }
       if (admitted.response.status !== 409 || busy >= BUSY_RETRIES) break;
       if (now() + BUSY_GAP_MS > deadline) throw stillStarting();
