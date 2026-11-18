@@ -413,6 +413,8 @@ omp has this feature itself (`compaction.idle*`), but its timer belongs to the i
 
 A message sent during the compaction is queued like any other (`InputState` `queued`) and goes out when it ends. `Usage.context` then reports the new fill. A hosted session's `send_guard` is asked before the compaction and again at the write, as for a prompt. omp refuses conversations under about 20k tokens as too small; that is logged and the session stays ready. The design is in the module docstring of `session/omp.py`.
 
+A hosted input waiting behind compaction or model profile application retains the send guard for its own admitted grant. The guard is checked again before the prompt and at the RPC write, so an interrupt or replacement grant still prevents the queued input from being sent.
+
 ## The backend's own logs
 
 Every product gets all of this from `create_app`, with nothing to wire:

@@ -276,6 +276,10 @@ option but no negotiated steering capability. OMP therefore reports
 current turn reaches its terminal event. Inputs are never sent speculatively
 with ``streamingBehavior: "steer"``. A transport loss after send is uncertain
 and is not retried; queued inputs are rejected on interrupt or process exit.
+Each input retains the send guard captured at submission, including while it
+waits behind profile application or compaction. The guard checks the original
+hosted grant again before sending and at the RPC write; an interrupt or a
+replacement grant still refuses the queued input.
 When ``session_dir`` is given, OMP keeps its conversation there; the reported
 conversation file is recorded and optionally resumed. Cumulative ``Usage``
 snapshots remain whole-conversation observations labelled with their current
@@ -857,7 +861,8 @@ class OmpSession:
         input_id = uuid.uuid4().hex
         turn = self._next_input_turn
         self._emit(InputState(input_id, turn, "received"))
-        job = (input_id, turn, blocks, viewer)
+        check = self.send_guard() if self.send_guard is not None else None
+        job = (input_id, turn, blocks, viewer, check)
         if (
             self._running
             or self._input_queue
@@ -875,7 +880,7 @@ class OmpSession:
         await self._send_input(job)
 
     async def _send_input(self, job) -> None:
-        input_id, turn, blocks, viewer = job
+        input_id, turn, blocks, viewer, check = job
         self._turn = turn
         self._turn_started = time.monotonic()
         self._active_input_id = input_id
@@ -892,7 +897,6 @@ class OmpSession:
                 self._automation_interrupted or self._closing
             ):
                 raise RuntimeError("OMP automated prompt was stopped before submission; not sent")
-            check = self.send_guard() if self.send_guard is not None else None
             if check is not None and check():
                 raise RuntimeError(check())
 
@@ -972,7 +976,7 @@ class OmpSession:
 
     def _settle_queued_inputs(self, reason: str) -> None:
         while self._input_queue:
-            input_id, turn, _blocks, _viewer = self._input_queue.popleft()
+            input_id, turn, _blocks, _viewer, _check = self._input_queue.popleft()
             self._emit(InputState(input_id, turn, "rejected", reason))
             self._emit(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
 
