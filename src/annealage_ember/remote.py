@@ -115,10 +115,6 @@ from .tools import (
 #: concurrently, so this is also the longest a startup waits for them all.
 DISCOVERY_TIMEOUT = 10.0
 
-#: The largest single response event a remote may send, in bytes. The MCP
-#: SDK's own default is 1 MiB, which a bulk read (a few hundred parts' page
-#: text) exceeds; the bound stays finite so one event cannot exhaust memory.
-MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 #: How long one proxied call may take, connecting included. The Codex stdio
 #: bridge sets no read timeout of its own, so this is what bounds it.
@@ -456,9 +452,13 @@ async def _session(server):
     async with httpx2.AsyncClient(
         headers=dict(server.headers or {}), timeout=httpx2.Timeout(CALL_TIMEOUT)
     ) as client:
-        async with streamable_http_client(
-            server.url, http_client=client, max_sse_event_size=MAX_RESPONSE_BYTES
-        ) as (read, write):
+        # A Datum text result can exceed the SDK's default SSE event limit.
+        # None disables that limit; the SDK still assembles each complete event
+        # in memory before delivering its JSON-RPC response.
+        async with streamable_http_client(server.url, http_client=client, max_sse_event_size=None) as (
+            read,
+            write,
+        ):
             async with ClientSession(read, write) as session:
                 initialized = await session.initialize()
                 yield session, initialized

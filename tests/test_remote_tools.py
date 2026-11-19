@@ -92,6 +92,7 @@ class FakeRemote:
         self.arguments = []
         self.stored = []
         self.headers = []
+        self.lookup_text = None
         primed = set()
 
         async def list_tools(ctx, params):
@@ -111,7 +112,10 @@ class FakeRemote:
                 primed.add(ctx.request.headers["mcp-session-id"])
                 content = [types.TextContent(type="text", text="welcome")]
             elif name == "lookup":
-                content = [types.TextContent(type="text", text="found %s" % arguments["query"])]
+                text = self.lookup_text
+                if text is None:
+                    text = "found %s" % arguments["query"]
+                content = [types.TextContent(type="text", text=text)]
                 structured = {"result": {"query": arguments["query"], "frozen": True}}
             elif name == "picture":
                 content = [
@@ -1224,7 +1228,7 @@ def test_a_structured_or_secret_bearing_error_is_not_passed_through():
 
 
 @pytest.mark.asyncio
-async def test_a_remote_session_allows_a_response_larger_than_the_sdk_default(monkeypatch):
+async def test_a_remote_session_disables_the_sdk_event_limit(monkeypatch):
     seen = {}
 
     @contextlib.asynccontextmanager
@@ -1239,4 +1243,14 @@ async def test_a_remote_session_allows_a_response_larger_than_the_sdk_default(mo
             RemoteServer("x", "http://x.invalid/", Grading((), (), ()))
         ):
             pass
-    assert 1024 * 1024 < seen["max_sse_event_size"] <= 64 * 1024 * 1024
+    assert seen["max_sse_event_size"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_large_sse_text_response_is_delivered_intact(fake, bus, tmp_path):
+    # The fake's streamable HTTP server sends its result as one SSE event.
+    text = "start:" + ("datasheet text\n" * (17 * 1024 * 1024 // 15)) + ":end"
+    fake.lookup_text = text
+    tools = _tools(bus, tmp_path, _fake(fake))
+    result = await tools.remote_tables()["fake"]["lookup"].handler({"query": "large"})
+    assert result == {"content": [{"type": "text", "text": text}]}
