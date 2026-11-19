@@ -661,6 +661,11 @@ class OmpSession:
         # stop reason the turn it ends reports.
         self._end_turn_calls: set = set()
         self._stop_reason: Optional[str] = None
+        # Last assistant message in wire order, captured on the reader thread.
+        self._assistant_stop: tuple = (None, None)
+        # OMP can represent missing provider usage as an all-zero record.
+        self._unknown_usage_turns: set = set()
+        self._incomplete_usage_epoch = False
         # The session's cumulative cost and tokens at the last turn end (or
         # at start), which the next turn's figures are the difference from.
         self._usage: Optional[dict] = None
@@ -1764,6 +1769,7 @@ class OmpSession:
         self._usage_epoch += 1
         self._conversation_id = str(conversation_id or uuid.uuid4().hex)
         self._usage = None
+        self._incomplete_usage_epoch = False
         self._request_count = (None, 0)
 
     async def close(self) -> None:
@@ -1983,8 +1989,15 @@ class OmpSession:
         self._request_count = (turn, request_n)
         usage = message.get("usage")
         usage = usage if isinstance(usage, dict) else {}
+        counts = [_token_count(usage.get(key)) for key in ("input", "output", "cacheRead", "cacheWrite")]
+        # OMP initialises absent streaming usage to zero. A real request
+        # cannot be distinguished from that sentinel when every count is zero.
+        unknown_usage = not any(count is not None and count > 0 for count in counts)
+        if unknown_usage:
+            usage = {}
         cost = usage.get("cost")
         response_id = message.get("responseId")
+        self._assistant_stop = (turn, _nonempty_string(message.get("stopReason")))
         report = hosted_state.usage_event(
             session_id=self.session_id,
             turn_index=turn,
@@ -2024,7 +2037,7 @@ class OmpSession:
                     ),
                 ),
             )
-        self._loop.call_soon_threadsafe(self._emit_request_usage, report)
+        self._loop.call_soon_threadsafe(self._emit_request_usage, report, turn, unknown_usage)
         error = _nonempty_string(message.get("errorMessage"))
         if error is None:
             self._loop.call_soon_threadsafe(self._retry_settled, "recovered")
@@ -2166,7 +2179,10 @@ class OmpSession:
         self.resolved_runtime = runtime
         self._emit(AgentRuntimeResolved(**runtime))
 
-    def _emit_request_usage(self, report: dict) -> None:
+    def _emit_request_usage(self, report: dict, turn: int, unknown_usage: bool) -> None:
+        if unknown_usage:
+            self._unknown_usage_turns.add(turn)
+            self._incomplete_usage_epoch = True
         self._emit(RequestUsage(**report))
         if self._on_request_usage is not None:
             try:
@@ -2260,15 +2276,18 @@ class OmpSession:
         # ended in, whatever the loop has done by the time the settle runs.
         turn = self._turn
         self._agent_end_turns.add(turn)  # the proof ``stop_for_revocation`` waits for
-        self._loop.call_soon_threadsafe(self._turn_settled, turn)
+        assistant_turn, assistant_stop = self._assistant_stop
+        self._loop.call_soon_threadsafe(
+            self._turn_settled, turn, assistant_stop if assistant_turn == turn else None
+        )
 
-    def _turn_settled(self, turn: int) -> None:
+    def _turn_settled(self, turn: int, assistant_stop: Optional[str] = None) -> None:
         """Settle only the terminal event's owning turn, before sending another."""
         if turn != self._turn or not self._running or self._settling_turn is not None:
             return
         self._settling_turn = turn
         self._end_turn_calls.clear()
-        stop_reason, self._stop_reason = self._stop_reason or "end", None
+        stop_reason, self._stop_reason = self._stop_reason or assistant_stop or "unknown", None
         asyncio.ensure_future(self._emit_turn_end(turn, stop_reason))
 
     async def _emit_turn_end(self, turn: int, stop_reason: str) -> None:
@@ -2288,6 +2307,7 @@ class OmpSession:
                 if regressed:
                     self._usage_epoch += 1
                     self._conversation_id = uuid.uuid4().hex
+                    self._incomplete_usage_epoch = turn in self._unknown_usage_turns
                     self._request_count = (None, 0)
                     source = "counter_regression"
                 else:
@@ -2298,6 +2318,10 @@ class OmpSession:
                         for key in _TOKEN_KEYS
                     }
             self._usage = usage
+        if turn in self._unknown_usage_turns:
+            self._unknown_usage_turns.discard(turn)
+            tokens, cost = None, None
+            source = "request_usage_unknown"
         self._running = False
         self._settling_turn = None
         self._active_input_id = None
@@ -2352,13 +2376,17 @@ class OmpSession:
             sys.stderr.write("warning: could not read the omp context usage: %r\n" % (exc,))
         if usage is None and context is None:
             return
+        if self._incomplete_usage_epoch:
+            usage = None
         self._emit(
             Usage(
                 cost_usd=usage["cost"] if usage is not None else None,
                 tokens={key: usage[key] for key in _TOKEN_KEYS} if usage is not None else None,
                 context=context,
                 usage_epoch=self._usage_epoch,
-                usage_source="cumulative_snapshot",
+                usage_source=(
+                    "cumulative_incomplete" if self._incomplete_usage_epoch else "cumulative_snapshot"
+                ),
             )
         )
 

@@ -1435,7 +1435,7 @@ async def test_inflight_messages_queue_until_terminal_and_keep_their_turn_identi
         ] == [(1, "received"), (1, "provider_ack"), (2, "received"), (2, "queued")]
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
-        assert (ended.turn, ended.stop_reason) == (1, "end")
+        assert (ended.turn, ended.stop_reason) == (1, "unknown")
         await _next_input_state(recorder, 2, "provider_ack")
         assert [c.message for c in fake.prompt_calls] == [
             "draw the regulator",
@@ -1447,7 +1447,7 @@ async def test_inflight_messages_queue_until_terminal_and_keep_their_turn_identi
         assert (await _next_of(recorder, TextDelta)).turn == 2
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
-        assert (ended.turn, ended.stop_reason) == (2, "end")
+        assert (ended.turn, ended.stop_reason) == (2, "unknown")
         assert any(
             isinstance(event, InputState) and event.turn == 2 and event.state == "provider_ack"
             for event in recorder.all
@@ -1482,7 +1482,7 @@ async def test_terminal_ownership_survives_a_new_input_and_a_delayed_usage_read(
 
         release.set()
         first = await _next_of(recorder, TurnEnd)
-        assert (first.turn, first.stop_reason) == (1, "end")
+        assert (first.turn, first.stop_reason) == (1, "unknown")
         assert first.cost_usd == pytest.approx(0.25)
         assert first.tokens["input"] == 10
         await _next_input_state(recorder, 2, "provider_ack")
@@ -1760,6 +1760,45 @@ def _assistant(usage=None, response_id=None, **extra):
     if response_id is not None:
         message["responseId"] = response_id
     return message
+
+@pytest.mark.asyncio
+async def test_assistant_stop_and_missing_usage_are_not_fabricated():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(
+            _assistant(
+                {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0}},
+                stopReason="length",
+            )
+        )
+        fake.push_agent_end()
+        request = await _next_of(recorder, RequestUsage)
+        ended = await _next_of(recorder, TurnEnd)
+        assert request.tokens_input is None and request.tokens_output is None
+        assert request.cost_usd is None
+        assert ended.stop_reason == "length"
+        assert ended.tokens is None and ended.cost_usd is None
+        assert ended.usage_source == "request_usage_unknown"
+        usage = await _next_of(recorder, Usage)
+        assert usage.tokens is None and usage.cost_usd is None
+        assert usage.usage_source == "cumulative_incomplete"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_last_assistant_stop_wins_over_intermediate_tool_use():
+    session, fake, recorder, broker = await _started_session()
+    try:
+        await session.submit_turn(_text("one"))
+        fake.push_message_end(_assistant({"input": 9, "output": 2}, stopReason="toolUse"))
+        fake.push_message_end(_assistant({"input": 10, "output": 3}, stopReason="length"))
+        fake.push_agent_end()
+        ended = await _next_of(recorder, TurnEnd)
+        assert ended.stop_reason == "length"
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -2412,12 +2451,12 @@ async def test_a_terminal_run_settles_before_a_queued_turn_starts():
         await session.submit_turn(_text("two"))
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
-        assert (ended.turn, ended.stop_reason) == (1, "end")
+        assert (ended.turn, ended.stop_reason) == (1, "unknown")
         await _next_input_state(recorder, 2, "provider_ack")
         assert [call.message for call in fake.prompt_calls] == ["one", "two"]
         fake.push_agent_end()
         ended = await _next_of(recorder, TurnEnd)
-        assert (ended.turn, ended.stop_reason) == (2, "end")
+        assert (ended.turn, ended.stop_reason) == (2, "unknown")
     finally:
         await session.close()
 
@@ -2548,10 +2587,10 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
         fake.push_agent_end()
         for _ in range(100):
             kinds = [
-                (r["event"]["kind"], r["event"].get("turn"), r["event"].get("stop_reason"))
+                (r["event"]["kind"], r["event"].get("turn"))
                 for r in read_records(sessions.events_path(tmp_path, sid))
             ]
-            if ("turn_end", 6, "end") in kinds:
+            if ("turn_end", 6) in kinds:
                 break
             await asyncio.sleep(0.01)
         assert [
@@ -2559,9 +2598,9 @@ async def test_a_resumed_session_s_next_turn_follows_the_last_one_in_its_history
             for k in kinds[10:]
             if k[1] is not None and k[0] in {"user_turn", "text_delta", "turn_end"}
         ] == [
-            ("user_turn", 6, None),
-            ("text_delta", 6, None),
-            ("turn_end", 6, "end"),
+            ("user_turn", 6),
+            ("text_delta", 6),
+            ("turn_end", 6),
         ]
     finally:
         await session.close()
@@ -2605,7 +2644,7 @@ async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(
                 (
                     r["event"]["kind"],
                     r["event"]["turn"],
-                    r["event"].get("state", r["event"].get("stop_reason")),
+                    r["event"].get("state"),
                 )
                 for r in records
                 if "turn" in r["event"]
@@ -2627,14 +2666,14 @@ async def test_a_queued_turn_is_logged_under_the_turn_its_reply_arrives_under(
         # terminal event stay attributed to turn 3.
         fake.push_message_update({"type": "text_delta", "delta": "Switching"})
         fake.push_agent_end()
-        turns = await logged_until(("turn_end", 3, "end"))
+        turns = await logged_until(("turn_end", 3, None))
         assert [item for item in turns if item[0] in {"user_turn", "text_delta", "turn_end"}] == [
             ("user_turn", 2, None),
             ("text_delta", 2, None),
             ("user_turn", 3, None),
-            ("turn_end", 2, "end"),
+            ("turn_end", 2, None),
             ("text_delta", 3, None),
-            ("turn_end", 3, "end"),
+            ("turn_end", 3, None),
         ]
     finally:
         await session.close()

@@ -162,7 +162,7 @@ async def test_omp_run_end_to_end_with_a_read_view_and_ungranted_write_tool(omp_
     assert saved == []
     assert result.calls == (("lookup", True), ("pan", True), ("save", False))
     # What was said after the last tool result: the narration before is dropped.
-    assert (result.text, result.stop_reason, result.error) == (" done", "end", None)
+    assert (result.text, result.stop_reason, result.error) == (" done", "unknown", None)
     assert result.cost_usd == pytest.approx(0.0125)
     assert result.tokens == {"input": 5, "output": 3, "cache_read": 0, "cache_write": 0}
 
@@ -415,14 +415,14 @@ async def test_run_prompt_omp_request_timeout_controls_the_rpc_ack_deadline(tmp_
             omp_request_timeout=180,
         ),
     )
-    assert accepted.stop_reason == "end"
+    assert accepted.stop_reason == "unknown"
     assert accepted.error is None
 
     defaulted = await run_prompt(
         "go",
         **make_args(tmp_path, timeout=4, omp_binary=str(binary)),
     )
-    assert defaulted.stop_reason == "end"
+    assert defaulted.stop_reason == "unknown"
     assert defaulted.error is None
 
 
@@ -623,7 +623,7 @@ async def test_terminal_assistant_error_message_reaches_headless_result(omp_clie
     result = await run_prompt("go", **make_args(tmp_path, usage_sink=usage.append))
 
     assert result.error == "Codex error event: Invalid schema for function create_footprint"
-    assert result.stop_reason == "end"
+    assert result.stop_reason == "unknown"
     assert [(event["tokens_input"], event["cost_usd"]) for event in usage] == [(5, 0.001)]
 
 
@@ -671,7 +671,7 @@ async def test_an_error_omp_retried_and_recovered_from_is_not_the_run_s_error(om
     ]
     assert result.error is None
     assert result.text == "done"
-    assert result.stop_reason == "end"
+    assert result.stop_reason == "stop"
 
 
 async def test_retries_omp_gave_up_on_are_the_run_s_error(omp_client, tmp_path):
@@ -726,7 +726,7 @@ async def test_a_usage_sink_that_raises_is_logged_and_never_fails_the_run(
     omp_client.script = script
     result = await run_prompt("go", **make_args(tmp_path, usage_sink=sink))
 
-    assert (result.error, result.text, result.stop_reason) == (None, "fine", "end")
+    assert (result.error, result.text, result.stop_reason) == (None, "fine", "unknown")
     assert "usage sink failed" in capsys.readouterr().err
 
 
@@ -863,6 +863,15 @@ async def test_native_timeout_recovery_uses_one_client_and_conversation(
         else:
             assert client.secret == "original conversation"
             client.say("clear_path" if len(client.messages) == 2 else "finished")
+            client._listeners["message_end"](
+                SimpleNamespace(
+                    message={
+                        "role": "assistant",
+                        "stopReason": "stop",
+                        "usage": {"input": 5, "output": 3},
+                    }
+                )
+            )
             client.end()
 
     omp_client.script = script
