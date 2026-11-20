@@ -1071,10 +1071,24 @@ export function initChat({
     userAttachmentsEl.className = "attachthumbs";
     const userContextsEl = document.createElement("div");
     userContextsEl.className = "contextchips";
+    const automatic = document.createElement("details");
+    automatic.className = "toolgroup";
+    automatic.hidden = true;
+    const automaticSummary = document.createElement("summary");
+    automaticSummary.textContent = "Automatic workflow continuation";
+    const automaticText = document.createElement("div");
+    automaticText.className = "thinkingtext";
+    automaticText.dataset.nativeTouchSelection = "";
+    const automaticAttachments = document.createElement("div");
+    automaticAttachments.className = "attachthumbs";
+    const automaticContexts = document.createElement("div");
+    automaticContexts.className = "contextchips";
+    automatic.append(automaticSummary, automaticText, automaticAttachments, automaticContexts);
     userEl.appendChild(userAuthor);
     userEl.appendChild(userText);
     userEl.appendChild(userAttachmentsEl);
     userEl.appendChild(userContextsEl);
+    userEl.appendChild(automatic);
 
     const assistantEl = document.createElement("div");
     assistantEl.className = "msg assistant";
@@ -1090,7 +1104,7 @@ export function initChat({
 
     return {
       row, userEl, userAuthor, userText, userAttachmentsEl, userContextsEl, segmentsEl,
-      errorsEl, segments: [],
+      automatic, automaticText, automaticAttachments, automaticContexts, errorsEl, segments: [],
     };
   }
 
@@ -1100,13 +1114,21 @@ export function initChat({
       rec.userEl.hidden = false;
       const automated = !!t.automationSource;
       const resent = t.redeliveryOf !== null && t.redeliveryOf !== undefined;
-      rec.userAuthor.hidden = !automated && !resent;
-      rec.userAuthor.textContent = t.automationSource === "loom_root_continuation"
-        ? "Automatic workflow continuation" : automated ? "Automatic turn"
-          : resent ? "Sent again after a restart (turn " + t.redeliveryOf + ")" : "";
-      rec.userText.textContent = blocksToText(t.user);
-      renderUserAttachments(rec.userAttachmentsEl, t.user);
-      renderUserContexts(rec.userContextsEl, t.user, (block) => pickContext(block, t.turn));
+      const continuation = t.automationSource === "loom_root_continuation";
+      rec.userEl.className = continuation ? "msg assistant" : "msg user";
+      rec.automatic.hidden = !continuation;
+      rec.userText.hidden = continuation;
+      rec.userAttachmentsEl.hidden = continuation;
+      rec.userContextsEl.hidden = continuation;
+      rec.userAuthor.hidden = continuation || (!automated && !resent);
+      rec.userAuthor.textContent = automated ? "Automatic turn"
+        : resent ? "Sent again after a restart (turn " + t.redeliveryOf + ")" : "";
+      const text = continuation ? rec.automaticText : rec.userText;
+      const attachments = continuation ? rec.automaticAttachments : rec.userAttachmentsEl;
+      const contexts = continuation ? rec.automaticContexts : rec.userContextsEl;
+      text.textContent = blocksToText(t.user);
+      renderUserAttachments(attachments, t.user);
+      renderUserContexts(contexts, t.user, (block) => pickContext(block, t.turn));
     }
     // Segment slots never move: adjacent text extends its text node, adjacent
     // calls extend their inline run, and late results update the original card.

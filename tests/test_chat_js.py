@@ -802,6 +802,24 @@ out.failureCleared = {
   hidden: el("chatBanner").hidden, actionHidden: failureButton.hidden, closeHidden: el("chatBannerClose").hidden,
 };
 
+for (const [turn, replayed] of [[9001, false], [9002, true]]) {
+  chat.handleEvent({
+    kind: "user_turn", turn, automation_source: "loom_root_continuation",
+    blocks: [{ type: "text", text: "Continue the design." }],
+  }, { replayed });
+}
+const automaticRows = [9001, 9002].map((turn) =>
+  el("chatLog").children.find((r) => r.dataset.turn === String(turn)).children[0]);
+out.automaticContinuations = automaticRows.map((row) => ({
+  kind: row.className, authorHidden: row.children[0].hidden,
+  userTextHidden: row.children[1].hidden, open: !!row.children[4].open,
+  label: row.children[4].children[0].textContent,
+  text: row.children[4].children[1].textContent,
+}));
+automaticRows[0].children[4].open = true;
+chat.handleEvent({ kind: "text_delta", turn: 9001, text: "Working." }, { replayed: false });
+out.automaticStaysOpen = automaticRows[0].children[4].open;
+
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -832,6 +850,19 @@ def observed(tmp_path_factory):
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+
+def test_automatic_continuation_is_a_closed_non_user_disclosure(observed):
+    expected = {
+        "kind": "msg assistant",
+        "authorHidden": True,
+        "userTextHidden": True,
+        "open": False,
+        "label": "Automatic workflow continuation",
+        "text": "Continue the design.",
+    }
+    assert observed["automaticContinuations"] == [expected, expected]
+    assert observed["automaticStaysOpen"] is True
 
 
 def test_native_touch_selection_marks_message_text_not_rows_or_controls(observed):
