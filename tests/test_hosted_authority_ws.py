@@ -123,6 +123,155 @@ def _logged(app, kind):
     return [w for _s, w in app.agent_event_log.replay(0).events if w["kind"] == kind]
 
 
+async def test_host_without_worker_grant_accepts_only_delegated_turns(served_dir, tmp_path_factory):
+    from annealage_ember import hosted_authority
+
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier(), hosted_worker_claims=None)
+    app = hosted.app
+    await app.agent_start()
+    try:
+        assert hosted_authority.admit_internal(app.agent_bus, app.agent_holder) is not None
+        held = await _send(app, "alice", "delegated")
+        assert hosted.sessions[0].submitted_turns[0][0][0]["text"] == "delegated"
+        assert app.agent_bus.hosted_turn_live
+        await held.close()
+    finally:
+        await app.agent_stop()
+
+
+async def test_a_browser_turn_cannot_expand_the_worker_launch_grant(served_dir, tmp_path_factory):
+    claims = SimpleNamespace(
+        sub=PRINCIPAL,
+        wsp="wsp_test",
+        prj="prj_test",
+        job="job_test",
+        ops=("project.read", "project.exec"),
+        exp=None,
+    )
+    hosted = _build(
+        served_dir,
+        tmp_path_factory,
+        verifier=_Verifier(ops=("project.read", "project.exec", "project.write")),
+        hosted_worker_claims=claims,
+    )
+    app = hosted.app
+    await app.agent_start()
+    try:
+        held = await _send(app, "alice", "run")
+        assert hosted.sessions[0].submitted_turns
+        assert app.agent_bus.hosted_turn_ops == ("project.read", "project.exec")
+        await held.close()
+    finally:
+        await app.agent_stop()
+
+
+@pytest.mark.parametrize("failure", ["authority", "durable_fence"])
+async def test_failed_outbox_admission_releases_hosted_turn(
+    served_dir, tmp_path_factory, monkeypatch, failure
+):
+    from annealage_ember.identity import Human
+    from annealage_ember.review.notifications import NotificationError
+    from annealage_ember.review.outbox import OrdinaryTurnOutbox
+
+    verifier = _Verifier()
+    hosted = _build(served_dir, tmp_path_factory, verifier=verifier)
+    app = hosted.app
+    await app.agent_start()
+    try:
+        outbox = OrdinaryTurnOutbox(
+            app,
+            path=served_dir / "ordinary-turns.json",
+            scope="project",
+            auth=app.agent_auth,
+            recorder=None,
+        )
+        claims = verifier.verify("alice", "project.exec")
+        human = Human(
+            principal_id=PRINCIPAL,
+            workspace_id=claims.wsp,
+            project_id=claims.prj,
+            hosted_claims=claims,
+        )
+        blocks = [{"type": "text", "text": "queued"}]
+        outbox.enqueue("op", human, blocks)
+        if failure == "authority":
+            permits = app.agent_auth.permits
+            calls = []
+
+            def expire_on_recheck(actor, operation):
+                calls.append(operation)
+                return len(calls) == 1 and permits(actor, operation)
+
+            monkeypatch.setattr(app.agent_auth, "permits", expire_on_recheck)
+            expected = NotificationError
+        else:
+            update = outbox._update
+
+            def fail_fence(operation_id, **changes):
+                if changes.get("status") == "dispatching":
+                    raise OSError("fence write failed")
+                return update(operation_id, **changes)
+
+            monkeypatch.setattr(outbox, "_update", fail_fence)
+            expected = OSError
+
+        with pytest.raises(expected):
+            await outbox.deliver()
+        assert not app.agent_bus.hosted_turn_live
+        assert app.agent_bus.hosted_turn_ops == ()
+        assert hosted.sessions[0].submitted_turns == []
+        assert _logged(app, "user_turn") == []
+        assert outbox.status("op")["status"] == "queued"
+
+        monkeypatch.undo()
+        await outbox.deliver()
+        assert outbox.status("op")["status"] == "sent"
+        assert hosted.sessions[0].submitted_turns[0][0] == blocks
+        assert app.agent_bus.hosted_turn_live
+    finally:
+        await app.agent_stop()
+
+
+async def test_verified_collaborator_handover_keeps_actor_and_cannot_expand_worker(
+    served_dir, tmp_path_factory
+):
+    from annealage_ember.identity import Human
+    from annealage_ember.review.outbox import OrdinaryTurnOutbox
+
+    verifier = _Verifier(ops=("project.read", "project.exec", "project.write"))
+    hosted = _build(served_dir, tmp_path_factory, verifier=verifier)
+    app = hosted.app
+    await app.agent_start()
+    try:
+        claims = verifier.verify("bob", "project.exec")
+        human = Human(
+            principal_id=OTHER, workspace_id=claims.wsp, project_id=claims.prj, hosted_claims=claims
+        )
+        blocks = [{"type": "text", "text": "handover"}]
+        outbox = OrdinaryTurnOutbox(
+            app,
+            path=served_dir / "handover.json",
+            scope="project",
+            auth=app.agent_auth,
+            recorder=None,
+            require_verified_human=True,
+        )
+        outbox.enqueue("op", human, blocks)
+        await outbox.deliver()  # the background pump cannot use persisted claims
+        await outbox.deliver(
+            verified_human=human,
+            expected_operation="op",
+            expected_blocks=[{"type": "text", "text": "forged"}],
+        )
+        assert not hosted.sessions[0].submitted_turns
+        await outbox.deliver(verified_human=human, expected_operation="op", expected_blocks=blocks)
+        assert hosted.sessions[0].submitted_turns[0][0] == blocks
+        assert app.agent_bus.hosted_turn_ops == ("project.read", "project.exec")
+        assert _logged(app, "user_turn")[-1]["principal_id"] == OTHER
+    finally:
+        await app.agent_stop()
+
+
 async def test_another_principals_turn_is_refused_and_changes_nothing(served_dir, tmp_path_factory):
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
     app = hosted.app
@@ -290,12 +439,12 @@ async def test_a_turn_waiting_for_the_lock_when_its_tab_closes_still_runs(
         (session,) = hosted.sessions
         bus = app.agent_bus
         async with bus.turn_submission_lock:
-            held = await _send(app, "bob", "still sent")  # its dispatch now waits on the lock
+            held = await _send(app, "alice", "still sent")  # dispatch waits on the lock
             assert not bus.hosted_turn_live
             await held.close()
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.3)
-        assert bus.hosted_turn_live and bus.hosted_turn_principal == OTHER
+        assert bus.hosted_turn_live and bus.hosted_turn_principal == PRINCIPAL
         assert [w["client_id"] for w in _logged(app, "user_turn")] == ["c-1"]
         assert [b[0]["text"] for b, _v in session.submitted_turns] == ["still sent"]
     finally:
@@ -550,5 +699,29 @@ async def test_a_viewer_attaching_mid_turn_after_another_left_gets_the_replay_an
         assert session.permission_decisions == [("pr_held", "allow", "")]
         assert session.interrupted == 1 and not bus.hosted_turn_live
         await third.close()
+    finally:
+        await app.agent_stop()
+
+
+async def test_worker_authority_survives_turn_and_disconnect_for_internal_work(
+    served_dir, tmp_path_factory
+):
+    from annealage_ember import hosted_authority
+
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        held = await _send(app, "alice", "first")
+        session = hosted.sessions[0]
+        bus = app.agent_bus
+        secret = bus.hosted_turn_secret
+        await held.close()
+        session.emit(TurnEnd(turn=bus.turn, stop_reason="end_turn", cost_usd=None))
+        assert not bus.hosted_turn_live and bus.hosted_turn_secret is None
+        assert hosted_authority.admit_internal(bus, app.agent_holder) is None
+        assert bus.hosted_turn_secret and bus.hosted_turn_secret != secret
+        await session.submit_turn([{"type": "text", "text": "internal"}])
+        assert [blocks[0]["text"] for blocks, _ in session.submitted_turns] == ["first", "internal"]
     finally:
         await app.agent_stop()

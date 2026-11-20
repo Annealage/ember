@@ -1,24 +1,10 @@
-"""Whose authority a hosted agent's running turn holds.
+"""Job-scoped authority and per-submission fencing for a hosted worker.
 
-One agent serves a whole project, so every principal's turns share one bus and
-the bus carries the authority that tool calls are checked against
-(``hosted_turn_ops``/``_exp``/``_secret``/``_live``). That is only sound while
-exactly one turn, for one principal, is in flight:
-
-* ``admit`` is the one place a hosted turn takes the authority, and it refuses
-  every turn while another is running, queued or waiting for the agent to
-  start, the same principal's included. A backend's own queue (and a steer
-  into a running turn) would otherwise run a message after the authority it
-  was accepted under has ended, with nothing checking it at the provider.
-* The delegation's expiry (``exp``) gates admission only. Once a turn is
-  admitted it runs until it ends, an explicit ``interrupt`` stops it, or the
-  worker is cancelled from outside (the hosted front cancels the job when
-  access is revoked). A browser closing, a connection dropping or the
-  delegation expiring mid-turn changes nothing about it: the page is a view
-  that comes and goes, not what keeps the work alive.
-* ``holds`` is what a turn waiting to be delivered must still satisfy.
-
-All of it fails closed.
+Only a trusted launch grant may install worker authority. Browser delegations
+are independently checked at admission and cannot enlarge that authority.
+Launch grant expiry, when present, and browser expiry gate admission, not work.
+Cancellation cannot undo an external call already started; the bounded stop
+must establish that the old backend is gone before another turn can start.
 """
 
 from __future__ import annotations
@@ -33,6 +19,9 @@ from typing import Optional
 #: number is its own: a send stamped with an older one is never made under a
 #: newer grant, whoever holds that.
 GENERATION = contextvars.ContextVar("hosted_grant_generation", default=None)
+
+# Stamp authenticated bridge requests so a delayed call cannot be adopted by a successor.
+BRIDGE_GENERATION = contextvars.ContextVar("hosted_bridge_generation", default=None)
 
 #: ``(bus, bus.hosted_cancel_generation)`` taken by the read loop the moment a
 #: turn frame arrives, in the context of the task that will submit it. An
@@ -63,51 +52,163 @@ def _in_flight(bus, holder) -> bool:
     return bool(holder is not None and holder.turn_in_flight())
 
 
-def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
-    """Give ``claims``' principal the bus's turn authority for a turn about to
-    be handed to the session, or return why it cannot have it (nothing changed).
-    ``claims.exp`` is checked here and nowhere after: the turn that is admitted
-    lives until it ends."""
+def install(bus, claims, *, now: Optional[float] = None) -> None:
+    """Install the supervisor-revalidated job grant."""
+    now = time.time() if now is None else now
+    expiry = getattr(claims, "exp", None)
+    if (
+        claims is None
+        or (expiry is not None and now >= expiry)
+        or not all(
+            isinstance(getattr(claims, key, None), str) and getattr(claims, key)
+            for key in ("sub", "wsp", "prj", "job")
+        )
+    ):
+        raise ValueError("a valid job-scoped launch grant is required")
+    ops = tuple(claims.ops)
+    if "project.exec" not in ops or any(not isinstance(op, str) or not op for op in ops):
+        raise ValueError("a launch grant including project.exec is required")
+    with bus.hosted_lock:
+        if bus.hosted_worker is not None or bus.hosted_fenced:
+            raise ValueError("worker authority is already installed or revoked")
+        bus.hosted_worker = (claims.sub, claims.wsp, claims.prj, claims.job, ops)
+        bus.hosted_secret_history = []
+
+
+def quiesce(bus) -> None:
+    """Close admission while existing work drains for a checkpoint."""
+    with bus.hosted_lock:
+        bus.hosted_quiescing = True
+
+
+def enter_frame(bus) -> bool:
+    """Count an admitted WebSocket dispatch until its handler settles."""
+    with bus.hosted_lock:
+        if bus.hosted_quiescing or bus.hosted_fenced:
+            return False
+        bus.hosted_frames += 1
+        return True
+
+
+def leave_frame(bus) -> None:
+    with bus.hosted_lock:
+        bus.hosted_frames -= 1
+
+
+def resume(bus) -> bool:
+    """Reopen checkpoint admission only for a still-authorised worker."""
+    with bus.hosted_lock:
+        if bus.hosted_fenced or bus.hosted_worker is None:
+            return False
+        bus.hosted_quiescing = False
+        return True
+
+
+def _admit_worker(bus, holder, caller_ops=None, principal=None) -> Optional[str]:
+    with bus.hosted_lock:
+        if bus.hosted_fenced or bus.hosted_worker is None or bus.hosted_quiescing:
+            return "this worker has no valid authority to start work"
+        if _in_flight(bus, holder):
+            return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
+        bus.hosted_turn_principal = principal or bus.hosted_worker[0]
+        bus.hosted_turn_generation += 1
+        GENERATION.set(bus.hosted_turn_generation)
+        bus.hosted_turn_ops = tuple(
+            op for op in bus.hosted_worker[4] if caller_ops is None or op in caller_ops
+        )
+        bus.hosted_turn_secret = secrets.token_urlsafe(32)
+        bus.hosted_secret_history.append(bus.hosted_turn_secret)
+        bus.hosted_turn_live = True
+    return None
+
+
+def _admit_claims(bus, holder, claims, *, collaborator, now):
     now = time.time() if now is None else now
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
-    if bus.hosted_fenced:
-        return "this agent could not be shut down safely after access ended, so it takes no more messages until the worker is restarted"
-    if _in_flight(bus, holder):
-        if bus.hosted_turn_principal == claims.sub:
-            return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
-        return "another person's turn is in progress, so this message was not sent; wait for it to finish"
+    worker = bus.hosted_worker
+    if (
+        worker is None
+        or not isinstance(getattr(claims, "sub", None), str)
+        or not claims.sub
+        or (not collaborator and claims.sub != worker[0])
+        or tuple(getattr(claims, key, None) for key in ("wsp", "prj", "job")) != worker[1:4]
+        or "project.exec" not in claims.ops
+        or "project.exec" not in worker[4]
+    ):
+        return "your delegation does not authorise this worker's operations"
+    return _admit_worker(bus, holder, claims.ops, claims.sub)
+
+
+def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
+    """Admit a browser turn, preserving per-turn authority for other hosts."""
+    if getattr(bus, "hosted_worker", None) is not None:
+        return _admit_claims(bus, holder, claims, collaborator=False, now=now)
+    now = time.time() if now is None else now
+    if claims is None or now >= claims.exp:
+        return "your access to this project has expired, so this message was not sent"
     with bus.hosted_lock:
+        if bus.hosted_fenced or getattr(bus, "hosted_quiescing", False):
+            return "this worker has no valid authority to start work"
+        if _in_flight(bus, holder):
+            return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
         bus.hosted_turn_principal = claims.sub
         bus.hosted_turn_generation += 1
         GENERATION.set(bus.hosted_turn_generation)
         bus.hosted_turn_ops = tuple(claims.ops)
         bus.hosted_turn_secret = secrets.token_urlsafe(32)
+        if hasattr(bus, "hosted_secret_history"):
+            bus.hosted_secret_history.append(bus.hosted_turn_secret)
         bus.hosted_turn_live = True
     return None
+
+
+def admit_collaborator(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
+    """Admit fresh, separately verified handover claims; never call for a browser frame."""
+    return _admit_claims(bus, holder, claims, collaborator=True, now=now)
+
+
+def abandon_admission(bus, generation) -> None:
+    """Release a grant that failed before the turn was logged or submitted."""
+    with bus.hosted_lock:
+        if bus.hosted_turn_live and bus.hosted_turn_generation == generation:
+            bus.hosted_turn_live = False
+            bus.hosted_turn_ops = ()
+            bus.hosted_turn_secret = None
+            bus.hosted_turn_generation += 1
+    if GENERATION.get() == generation:
+        GENERATION.set(None)
+
+
+def admit_internal(bus, holder) -> Optional[str]:
+    """Admit a system action under the launch grant, not a fabricated caller."""
+    return _admit_worker(bus, holder)
 
 
 def holds(bus, principal: Optional[str]) -> bool:
     """Whether ``principal``'s authority is still the live one."""
     return bool(
-        principal is not None and bus.hosted_turn_live and bus.hosted_turn_principal == principal
+        principal is not None
+        and not bus.hosted_fenced
+        and bus.hosted_turn_live
+        and bus.hosted_turn_principal == principal
     )
 
 
-def _begin_stop(bus, session) -> None:
+def _begin_stop(bus, session):
     """Start stopping ``session``'s turn and count it until it has settled."""
     bus.hosted_stopping += 1
-    task = asyncio.get_running_loop().create_task(_stop(session))
+    task = asyncio.get_running_loop().create_task(asyncio.wait_for(_stop(session), timeout=15.0))
 
     def settled(done):
         bus.hosted_stopping -= 1
-        # Only an explicit "known stopped" lets the worker go on. A stop that
-        # returned False, raised or was cancelled leaves the old process possibly
-        # alive: fence the worker for good (a restart clears it).
-        if done.cancelled() or done.exception() is not None or done.result() is False:
+        # Only an explicit True proves the old backend stopped. None, another
+        # value, an exception or cancellation leaves it possibly alive.
+        if done.cancelled() or done.exception() is not None or done.result() is not True:
             bus.hosted_fenced = True
 
     task.add_done_callback(settled)
+    return task
 
 
 def _stop(session):
@@ -117,12 +218,8 @@ def _stop(session):
     return stop() if stop is not None else session.interrupt()
 
 
-def interrupt(bus, session) -> None:
-    """A manual interrupt on a hosted turn: the grant ends and the turn is
-    stopped through the same bounded lifecycle as a revocation (abort, terminal
-    proof, verified group kill or a permanent fence), not a bare abort whose
-    failure nothing would follow up. Every turn still waiting for the
-    submission lock is cancelled with it."""
+def interrupt(bus, session):
+    """Invalidate queued/in-flight work and stop it before any successor."""
     bus.hosted_cancel_generation += 1
     with bus.hosted_lock:
         bus.hosted_turn_live = False
@@ -130,7 +227,39 @@ def interrupt(bus, session) -> None:
         bus.hosted_turn_secret = None
         bus.hosted_turn_generation += 1
     if session is not None:
-        _begin_stop(bus, session)
+        return _begin_stop(bus, session)
+    return None
+
+
+def revoke(bus, session) -> None:
+    """Permanently revoke the job, including its private bridge."""
+    with bus.hosted_lock:
+        bus.hosted_worker = None
+        bus.hosted_fenced = True
+    interrupt(bus, session)
+
+
+def maintenance_checker(bus):
+    """Fence a single idle maintenance call without granting a turn or tools."""
+    with bus.hosted_lock:
+        generation = bus.hosted_cancel_generation
+        worker = bus.hosted_worker
+
+    def check() -> Optional[str]:
+        with bus.hosted_lock:
+            if (
+                worker is not None
+                and bus.hosted_worker == worker
+                and bus.hosted_cancel_generation == generation
+                and not bus.hosted_fenced
+                and not bus.hosted_quiescing
+                and not bus.hosted_stopping
+                and not bus.hosted_turn_live
+            ):
+                return None
+        return "the hosted worker is no longer idle or authorised for maintenance"
+
+    return check
 
 
 def checker(bus):
@@ -155,6 +284,7 @@ def checker(bus):
                 generation is not None
                 and bus.hosted_turn_generation == generation
                 and bus.hosted_turn_live
+                and not bus.hosted_fenced
             ):
                 return None
         return "your access to this project ended before the message was sent to the agent"

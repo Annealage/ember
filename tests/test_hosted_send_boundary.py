@@ -23,11 +23,14 @@ def _bus():
         hosted_turn_live=True,
         hosted_turn_ops=("project.exec",),
         hosted_turn_secret="s",
+        hosted_secret_history=["s"],
         hosted_turn_principal="alice",
         hosted_turn_generation=1,
         hosted_stopping=0,
         hosted_cancel_generation=0,
         hosted_fenced=False,
+        hosted_worker=("alice", "w", "p", "j", ("project.exec",)),
+        hosted_quiescing=False,
         hosted_lock=threading.Lock(),
     )
 
@@ -120,13 +123,8 @@ async def test_a_prompt_is_never_sent_under_a_newer_grant_than_the_one_it_was_ad
     hosted_authority.GENERATION.set(bus.hosted_turn_generation)
     try:
         hosted_authority.interrupt(bus, None)
-        # Someone else is admitted meanwhile: a live grant, but not this turn's.
-        assert (
-            hosted_authority.admit(
-                bus, None, SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
-            )
-            is None
-        )
+        # A later turn belongs to the same worker but has a different generation.
+        assert hosted_authority.admit_internal(bus, None) is None
         hosted_authority.GENERATION.set(1)
         task = asyncio.ensure_future(session.submit_turn([{"type": "text", "text": "go"}]))
         await asyncio.wait_for(task, 5)
@@ -191,6 +189,14 @@ def _delayed_start_app(served_dir, tmp_path_factory, verifier, gate, built):
         build_session=build_session,
         hosted_mode=True,
         hosted_verifier=verifier,
+        hosted_worker_claims=SimpleNamespace(
+            sub="usr_0b0c2f6e-6c1c-4f6a-9d2a-5d6f0e7a4a11",
+            wsp="wsp_test",
+            prj="prj_test",
+            job="job_test",
+            ops=("project.read", "project.exec"),
+            exp=None,
+        ),
         hosted_state_dir=state_dir,
         hosted_tool_ops={"mcp__toy__list_notes": "project.read"},
         settings=settings.resolve(tmp_path_factory.mktemp("service"), flags={"backend": "omp"}),
@@ -356,14 +362,14 @@ async def test_no_successor_is_admitted_until_the_revocation_stop_has_settled():
         async def stop_for_revocation(self):
             calls.append("stop")
             await gate.wait()  # the old turn's abort is slow
+            return True
 
     hosted_authority.interrupt(bus, Session())
     await asyncio.sleep(0.05)
-    successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
-    assert hosted_authority.admit(bus, None, successor) is not None  # refused while stopping
+    assert hosted_authority.admit_internal(bus, None) is not None  # stopping
     gate.set()
     await asyncio.sleep(0.05)
-    assert hosted_authority.admit(bus, None, successor) is None
+    assert hosted_authority.admit_internal(bus, None) is None
     assert calls == ["stop"]  # exactly one stop, the old turn's
 
 
@@ -402,8 +408,7 @@ async def test_a_kill_that_is_not_verified_fences_the_worker_so_no_successor_run
             hosted_authority.interrupt(bus, _Stopping(stopped))
             await asyncio.sleep(0.1)
             assert bus.hosted_fenced is True, how
-            successor = SimpleNamespace(sub="bob", ops=(), exp=time.time() + 60)
-            assert "restarted" in hosted_authority.admit(bus, None, successor), how
+            assert hosted_authority.admit_internal(bus, None) is not None, how
         finally:
             stall.set()
             await session.close()

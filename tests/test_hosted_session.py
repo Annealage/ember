@@ -87,6 +87,12 @@ def _build(served_dir, tmp_path_factory, *, verifier=None, sink=True, **kwargs):
 
     def build_session(on_event, *, bus):
         session = FakeSession(on_event, session_id="hosted-session")
+
+        async def confirmed_stop():
+            await session.interrupt()
+            return True
+
+        session.stop_for_revocation = confirmed_stop
         built.append(session)
         return session
 
@@ -98,6 +104,17 @@ def _build(served_dir, tmp_path_factory, *, verifier=None, sink=True, **kwargs):
         build_session=build_session,
         hosted_mode=True,
         hosted_verifier=verifier or _Verifier(),
+        hosted_worker_claims=kwargs.pop(
+            "hosted_worker_claims",
+            SimpleNamespace(
+                sub=PRINCIPAL,
+                wsp="wsp_test",
+                prj="prj_test",
+                job="job_test",
+                ops=("project.read", "project.exec"),
+                exp=None,
+            ),
+        ),
         hosted_state_dir=state_dir,
         hosted_tool_ops={"mcp__toy__list_notes": "project.read"},
         settings=settings.resolve(tmp_path_factory.mktemp("service"), flags={"backend": "omp"}),
@@ -276,3 +293,42 @@ async def test_a_standalone_app_has_no_session_control_routes(served_dir):
 async def test_a_usage_sink_outside_hosted_mode_is_refused(served_dir):
     with pytest.raises(ValueError, match="usage_sink.*requires hosted mode"):
         create_toy_app(served_dir, token="tok", usage_sink=lambda event: None)
+
+
+@pytest.mark.parametrize("clean", [True, False])
+async def test_checkpoint_close_keeps_worker_quiesced_and_fences_uncertain_stop(hosted, clean):
+    from annealage_ember import hosted_authority
+
+    app = hosted.app
+    holder = app.agent_holder
+    session = holder.session
+    holder._resume_session = lambda on_event, *, bus: FakeSession(on_event)
+
+    async def checkpoint_close(_timeout, *, terminal=False):
+        return clean
+
+    session.checkpoint_close = checkpoint_close
+    hosted_authority.quiesce(app.agent_bus)
+    assert await holder.checkpoint_close() is clean
+    assert app.agent_bus.hosted_quiescing
+    if clean:
+        assert holder.session is None
+        assert hosted_authority.resume(app.agent_bus)
+    else:
+        assert app.agent_bus.hosted_fenced
+        assert not hosted_authority.resume(app.agent_bus)
+
+
+async def test_terminal_close_does_not_require_a_resume_factory(hosted):
+    from annealage_ember import hosted_authority
+
+    holder = hosted.app.agent_holder
+    holder._resume_session = None
+
+    async def checkpoint_close(_timeout, *, terminal=False):
+        return True
+
+    holder.session.checkpoint_close = checkpoint_close
+    hosted_authority.quiesce(hosted.app.agent_bus)
+    assert await holder.checkpoint_close(terminal=True)
+    assert holder.session is None

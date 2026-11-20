@@ -252,3 +252,37 @@ def test_a_compaction_is_gated_like_other_work_and_waits_only_as_long_as_its_own
     with pytest.raises(RpcTimeoutError):
         client.abort()
     assert time.monotonic() - began < 0.7
+
+
+@pytest.mark.parametrize(
+    "exit_code,reader_alive,group_alive,expected",
+    [
+        (0, False, False, True),
+        (1, False, False, False),
+        (0, True, False, False),
+        (0, False, True, False),
+    ],
+)
+def test_checkpoint_requires_clean_exit_drained_readers_and_empty_group(
+    monkeypatch, exit_code, reader_alive, group_alive, expected
+):
+    from annealage_ember.session import rpc_client
+
+    def killpg(_group, _signal):
+        if not group_alive:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(rpc_client.os, "killpg", killpg)
+    reader = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: reader_alive)
+    stopped = []
+    client = SimpleNamespace(
+        _process=SimpleNamespace(
+            stdin=SimpleNamespace(close=lambda: None), wait=lambda timeout: exit_code
+        ),
+        _pgid=123,
+        _stdout_thread=reader,
+        _stderr_thread=None,
+        stop=lambda: stopped.append(True),
+    )
+    assert LeanRpcClient.checkpoint_stop(client) is expected
+    assert bool(stopped) is expected

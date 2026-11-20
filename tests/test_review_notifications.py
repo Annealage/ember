@@ -458,6 +458,14 @@ async def test_hosted_queued_delivery_rechecks_expiry_and_retry_refreshes_only_n
         served_dir,
         tmp_path_factory,
         verifier=_Verifier(ops=("project.comment", "project.exec")),
+        hosted_worker_claims=SimpleNamespace(
+            sub=PRINCIPAL,
+            wsp="wsp_test",
+            prj="prj_test",
+            job="job_test",
+            ops=("project.comment", "project.exec"),
+            exp=None,
+        ),
         review_store=toy_review_store(served_dir),
     )
     app = hosted.app

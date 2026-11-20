@@ -420,12 +420,23 @@ class OrdinaryTurnOutbox:
     The caller owns the durable operation ID and must retain it across retries.
     """
 
-    def __init__(self, app, *, path, scope, auth, recorder, required_ops=("project.exec",)):
+    def __init__(
+        self,
+        app,
+        *,
+        path,
+        scope,
+        auth,
+        recorder,
+        required_ops=("project.exec",),
+        require_verified_human=False,
+    ):
         self.app = app
         self.ledger = _TurnStore(path, scope)
         self.auth = auth
         self.recorder = recorder
         self.required_ops = tuple(required_ops)
+        self.require_verified_human = require_verified_human
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self.last_error = None
@@ -514,8 +525,16 @@ class OrdinaryTurnOutbox:
 
         self.ledger.change(update, transition_id=operation_id)
 
-    async def deliver(self):
+    async def deliver(self, *, verified_human=None, expected_operation=None, expected_blocks=None):
         from ..http.ws import _submit_turn_locked, turn_refusal
+
+        if self.require_verified_human:
+            if verified_human is None:
+                return
+            if not isinstance(expected_operation, str) or not isinstance(expected_blocks, list):
+                raise ValueError("verified handover requires its operation and blocks")
+        elif verified_human is not None:
+            raise ValueError("verified handover admission is not enabled")
 
         async with self._lock:
             app = self.app
@@ -549,7 +568,23 @@ class OrdinaryTurnOutbox:
                 row = next((r for r in rows.values() if r["status"] == "queued"), None)
                 if row is None or row.get("error"):
                     return
-                human = _human(row["sender"])
+                if self.require_verified_human:
+                    sender = row["sender"]
+                    claims = getattr(verified_human, "hosted_claims", None)
+                    if (
+                        row["id"] != expected_operation
+                        or row["blocks"] != expected_blocks
+                        or claims is None
+                        or any(
+                            sender.get(key) != getattr(verified_human, key, None)
+                            for key in ("principal_id", "workspace_id", "project_id")
+                        )
+                        or getattr(verified_human, "principal_id", None) != claims.sub
+                        or getattr(verified_human, "workspace_id", None) != claims.wsp
+                        or getattr(verified_human, "project_id", None) != claims.prj
+                    ):
+                        return
+                human = verified_human if self.require_verified_human else _human(row["sender"])
                 if not all(self.auth.permits(human, op) for op in self.required_ops):
                     self._update(
                         row["id"], error="Turn authorisation expired; retry while signed in."
@@ -598,6 +633,7 @@ class OrdinaryTurnOutbox:
                         bus,
                         self.recorder,
                         on_admitted=admit,
+                        hosted_collaborator=self.require_verified_human,
                     )
                     if admitted:
                         error = reply.error or delivery_error

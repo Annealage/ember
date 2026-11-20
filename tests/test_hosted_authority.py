@@ -1,11 +1,12 @@
-"""One agent serves a project's principals; its turn authority has one owner at a time."""
+"""Job-owned hosted authority and per-submission fencing."""
 
+import asyncio
 import threading
 from types import SimpleNamespace
 
 import pytest
 
-from annealage_ember import hosted_authority
+from annealage_ember import hosted_authority as authority
 
 
 def _bus():
@@ -16,120 +17,189 @@ def _bus():
         hosted_turn_principal=None,
         hosted_turn_generation=0,
         hosted_cancel_generation=0,
+        hosted_quiescing=False,
         hosted_stopping=0,
         hosted_fenced=False,
+        hosted_worker=None,
         hosted_lock=threading.Lock(),
     )
 
 
-def _holder(in_flight):
-    return SimpleNamespace(turn_in_flight=lambda: in_flight[0])
+def _claims(**changes):
+    values = {
+        "sub": "alice",
+        "wsp": "workspace",
+        "prj": "project",
+        "job": "job",
+        "ops": ("project.exec", "project.read"),
+        "exp": 4_000_000_000,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
-def _claims(sub, ops=("project.exec",), exp=4_000_000_000):
-    return SimpleNamespace(sub=sub, ops=ops, exp=exp)
+def test_successive_internal_turns_keep_launch_authority_after_expiry(monkeypatch):
+    bus = _bus()
+    authority.install(bus, _claims(exp=100), now=1)
+    assert authority.admit(bus, None, _claims(exp=100), now=1) is None
+    secret = bus.hosted_turn_secret
+    old = authority.checker(bus)
+    bus.hosted_turn_live = False  # terminal event
+    bus.hosted_turn_ops = ()
+    monkeypatch.setattr(authority.time, "time", lambda: 200)
+    assert authority.admit(bus, None, _claims(exp=100)) is not None
+    assert authority.admit_internal(bus, None) is None
+    assert authority.checker(bus)() is None
+    assert old() is not None
+    assert bus.hosted_turn_secret != secret
+    assert bus.hosted_turn_ops == ("project.exec", "project.read")
 
 
-def test_another_principal_cannot_take_the_authority_while_a_turn_is_in_flight():
-    bus, running = _bus(), [False]
-    assert (
-        hosted_authority.admit(
-            bus, _holder(running), _claims("alice", ("project.exec", "project.write"))
-        )
-        is None
-    )
-    running[0] = True
-    before = (bus.hosted_turn_ops, bus.hosted_turn_generation, bus.hosted_turn_secret)
-    reason = hosted_authority.admit(
-        bus, _holder(running), _claims("bob", ("project.read",), exp=5_000_000_000)
-    )
-    assert "another person's turn" in reason
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"sub": "bob"},
+        {"wsp": "other"},
+        {"prj": "other"},
+        {"job": "other"},
+        {"ops": ("project.read",)},
+        {"exp": 1},
+    ],
+)
+def test_caller_cannot_expand_or_switch_worker_authority(changes):
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit(bus, None, _claims(**changes)) is not None
+    assert not bus.hosted_turn_live
+
+
+def test_caller_turn_operations_are_intersection_with_launch_grant():
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit(bus, None, _claims(ops=("project.exec", "project.admin"))) is None
+    assert bus.hosted_turn_ops == ("project.exec",)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"wsp": "other"},
+        {"prj": "other"},
+        {"job": "other"},
+        {"ops": ("project.read",)},
+        {"exp": 1},
+    ],
+)
+def test_collaborator_still_needs_same_job_live_exec_claims(changes):
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit_collaborator(bus, None, _claims(sub="bob", **changes)) is not None
+    assert not bus.hosted_turn_live
+
+
+def test_quiesce_drains_admitted_frames_and_reopens_only_live_worker():
+    bus = _bus()
+    bus.hosted_frames = 0
+    authority.install(bus, _claims(exp=None))
+    assert authority.enter_frame(bus)
+    authority.quiesce(bus)
+    assert not authority.enter_frame(bus)
+    assert bus.hosted_frames == 1
+    assert authority.admit_internal(bus, None) is not None
+    authority.leave_frame(bus)
+    assert bus.hosted_frames == 0 and authority.resume(bus)
+    assert authority.admit_internal(bus, None) is None
+    authority.revoke(bus, None)
+    assert not authority.resume(bus)
+
+
+def test_missing_launch_grant_and_duplicate_install_fail_closed():
+    bus = _bus()
+    assert authority.admit_internal(bus, None) is not None
+    with pytest.raises(ValueError):
+        authority.install(bus, _claims(exp=1))
+    authority.install(bus, _claims(exp=None))
+    with pytest.raises(ValueError):
+        authority.install(bus, _claims(exp=None))
+
+
+def test_other_host_without_worker_grant_retains_delegation_admission():
+    bus = _bus()
+    bus.hosted_secret_history = []
+    assert authority.admit_internal(bus, None) is not None
+    assert authority.admit(bus, None, _claims()) is None
     assert bus.hosted_turn_principal == "alice"
-    assert (bus.hosted_turn_ops, bus.hosted_turn_generation, bus.hosted_turn_secret) == before
+    assert bus.hosted_turn_ops == ("project.exec", "project.read")
 
 
-def test_a_queued_or_deferred_turn_still_blocks_another_principal_after_the_grant_ended():
-    bus, queued = _bus(), [False]
-    assert hosted_authority.admit(bus, _holder(queued), _claims("alice")) is None
-    queued[0] = True  # the first turn ended, one is still queued
-    bus.hosted_turn_live, bus.hosted_turn_ops = False, ()
-    assert hosted_authority.admit(bus, _holder(queued), _claims("bob")) is not None
-    assert "previous message" in hosted_authority.admit(bus, _holder(queued), _claims("alice"))
-
-
-def test_a_turn_nobody_owns_waits_rather_than_being_adopted():
-    bus = _bus()  # in flight, but no principal recorded
-    assert hosted_authority.admit(bus, _holder([True]), _claims("bob")) is not None
-
-
-def test_the_owner_is_refused_behind_their_own_turn_and_the_grant_is_untouched():
-    bus, running = _bus(), [False]
-    hosted_authority.admit(bus, _holder(running), _claims("alice", ("project.exec",)))
-    before = (bus.hosted_turn_ops, bus.hosted_turn_secret)
-    running[0] = True
-    reason = hosted_authority.admit(
-        bus, _holder(running), _claims("alice", ("project.exec", "project.admin"))
-    )
-    assert "previous message" in reason
-    assert (bus.hosted_turn_ops, bus.hosted_turn_secret) == before
-
-
-def test_anyone_is_admitted_when_nothing_is_in_flight_and_gets_a_fresh_grant():
-    bus, running = _bus(), [False]
-    hosted_authority.admit(bus, _holder(running), _claims("alice"))
-    first = bus.hosted_turn_secret
-    bus.hosted_turn_live = False
-    assert hosted_authority.admit(bus, _holder(running), _claims("bob", ("project.read",))) is None
-    assert bus.hosted_turn_principal == "bob" and bus.hosted_turn_ops == ("project.read",)
-    assert bus.hosted_turn_secret != first
-
-
-def test_an_expired_or_missing_delegation_is_refused_and_changes_nothing():
+def test_idle_maintenance_is_fenced_without_granting_a_turn():
     bus = _bus()
-    assert "expired" in hosted_authority.admit(bus, None, _claims("alice", exp=1))
-    assert hosted_authority.admit(bus, None, None) is not None
-    assert bus.hosted_turn_live is False and bus.hosted_turn_principal is None
-
-
-def test_a_waiting_turn_is_delivered_only_under_its_own_live_authority():
-    bus = _bus()
-    hosted_authority.admit(bus, None, _claims("alice"))
-    assert hosted_authority.holds(bus, "alice")
-    assert not hosted_authority.holds(bus, "bob")
-    assert not hosted_authority.holds(bus, None)
-    bus.hosted_turn_live = False
-    assert not hosted_authority.holds(bus, "alice")
-
-
-def test_the_delegation_expiring_after_admission_changes_nothing_about_the_turn(monkeypatch):
-    """``exp`` gates admission only: the turn that got in lives until it ends."""
-    import time
-
-    bus = _bus()
-    assert hosted_authority.admit(bus, None, _claims("alice", exp=time.time() + 60)) is None
-    generation = bus.hosted_turn_generation
-    check = hosted_authority.checker(bus)
-    monkeypatch.setattr(time, "time", lambda: time.monotonic() + 4_000_000_000)
+    assert authority.maintenance_checker(bus)() is not None
+    authority.install(bus, _claims(exp=None))
+    check = authority.maintenance_checker(bus)
     assert check() is None
-    assert hosted_authority.holds(bus, "alice")
-    assert bus.hosted_turn_live and bus.hosted_turn_generation == generation
+    assert not bus.hosted_turn_live and not bus.hosted_turn_ops
+    assert authority.admit_internal(bus, None) is None
+    assert check() is not None
+    authority.interrupt(bus, None)
+    assert check() is not None
 
 
 @pytest.mark.asyncio
-async def test_interrupt_stops_a_backend_with_the_bounded_fail_closed_stop():
-    import asyncio
+async def test_interrupt_waits_for_stop_and_revocation_is_permanent():
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit_internal(bus, None) is None
+    old = authority.checker(bus)
+    done = asyncio.Event()
 
-    calls = []
+    class Session:
+        async def stop_for_revocation(self):
+            await done.wait()
+            return True
+
+    authority.interrupt(bus, Session())
+    assert old() is not None and bus.hosted_turn_secret is None
+    assert authority.admit_internal(bus, None) is not None
+    done.set()
+    await asyncio.sleep(0.01)
+    assert authority.admit_internal(bus, None) is None
+    authority.revoke(bus, None)
+    assert authority.admit_internal(bus, None) is not None
+    assert bus.hosted_fenced and bus.hosted_worker is None
+
+
+@pytest.mark.asyncio
+async def test_uncertain_stop_permanently_fences():
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit_internal(bus, None) is None
+
+    class Session:
+        async def stop_for_revocation(self):
+            return False
+
+    authority.interrupt(bus, Session())
+    await asyncio.sleep(0.01)
+    assert bus.hosted_fenced
+    assert authority.admit_internal(bus, None) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fallback", "unknown"])
+async def test_unconfirmed_stop_fences_instead_of_admitting_successor(kind):
+    bus = _bus()
+    authority.install(bus, _claims(exp=None))
+    assert authority.admit_internal(bus, None) is None
 
     class Session:
         async def interrupt(self):
-            calls.append("interrupt")
+            return None
 
-        async def stop_for_revocation(self):
-            calls.append("stop_for_revocation")
-
-    bus = _bus()
-    hosted_authority.admit(bus, None, _claims("alice"))
-    hosted_authority.interrupt(bus, Session())
-    await asyncio.sleep(0.05)
-    assert calls == ["stop_for_revocation"]
+    session = Session()
+    if kind == "unknown":
+        session.stop_for_revocation = session.interrupt
+    await authority.interrupt(bus, session)
+    await asyncio.sleep(0)
+    assert bus.hosted_fenced
+    assert authority.admit_internal(bus, None) is not None

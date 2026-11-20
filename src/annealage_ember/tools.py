@@ -103,7 +103,7 @@ from jsonschema import Draft7Validator, Draft202012Validator
 from pydantic import TypeAdapter, create_model
 from referencing import Registry
 
-from . import product
+from . import hosted_authority, product
 from .viewers import CallError, NoViewerConnected, ViewerGone, ViewerTimeout
 
 
@@ -895,10 +895,16 @@ def _wrap(
             return fail(scope_refusal(scope_name))
         if getattr(bus, "hosted_mode", False):
             operation = bus.hosted_tool_ops.get(hosted_key)
+            bridge_generation = hosted_authority.BRIDGE_GENERATION.get()
             if (
                 operation is None
                 or not bus.hosted_turn_live
+                or getattr(bus, "hosted_fenced", False)
                 or operation not in bus.hosted_turn_ops
+                or (
+                    bridge_generation is not None
+                    and bridge_generation != bus.hosted_turn_generation
+                )
             ):
                 _record_stage("hosted", "rejected")
                 return fail("hosted operation is not granted for this tool call")

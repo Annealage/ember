@@ -30,6 +30,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3543,6 +3544,92 @@ async def test_closing_during_a_compaction_does_not_wait_for_it():
         release.set()
 
 
+@pytest.mark.asyncio
+async def test_host_idle_epoch_arms_once_and_activity_cancels_it():
+    session, fake, recorder, _ = await _started_session()
+    try:
+        _big_context(fake)
+        await session._emit_usage(await session._read_usage())
+        now = time.monotonic()
+        session.set_idle_since(now)
+        first = session._idle_compact_handle
+        assert first is not None
+        assert 479 <= first.when() - asyncio.get_running_loop().time() <= 480
+        session.set_idle_since(now)
+        assert session._idle_compact_handle is first
+        session.set_idle_since(None)
+        assert first.cancelled()
+        assert session._idle_compact_handle is None
+
+        session.set_idle_since(time.monotonic() - 480)
+        await _until(lambda: fake.compact_calls == 1)
+        await _until(lambda: not session.compacting)
+        session.set_idle_since(session._idle_since)
+        assert session._idle_compact_handle is None
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_host_idle_epoch_requires_known_eligible_context():
+    session, fake, recorder, _ = await _started_session()
+    try:
+        for tokens in (None, 99999):
+            session._context_tokens = tokens
+            session.set_idle_since(time.monotonic() - 480)
+            assert session._idle_compact_handle is None
+        session._context_tokens = 100000
+        _big_context(fake, tokens=100000)
+        session.set_idle_since(time.monotonic() - 480)
+        await _until(lambda: fake.compact_calls == 1)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_uses_maintenance_guard_not_turn_guard():
+    session, fake, recorder, _ = await _started_session()
+    try:
+        _big_context(fake)
+        session._context_tokens = 150000
+        session.send_guard = lambda: lambda: "no turn authority"
+        session.compaction_guard = lambda: lambda: None
+        session.set_idle_since(time.monotonic() - 480)
+        await _until(lambda: fake.compact_calls == 1)
+        await _until(lambda: not session.compacting)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_compaction_holds_input_until_native_state_settles(monkeypatch):
+    monkeypatch.setattr(omp_module, "_COMPACT_SETTLE_POLL", 0.01)
+    session, fake, recorder, _ = await _started_session()
+    settled = threading.Event()
+    observed = threading.Event()
+
+    def raw_state(command):
+        assert command == "get_state"
+        observed.set()
+        return {"isCompacting": False if settled.is_set() else True}
+
+    fake._request = raw_state
+    fake.compact_error = omp_module.RpcTimeoutError("response timed out")
+    try:
+        _big_context(fake)
+        session._context_tokens = 150000
+        session.set_idle_since(time.monotonic() - 480)
+        assert await asyncio.to_thread(observed.wait, 2)
+        assert session.compacting
+        await session.submit_turn(_text("after timeout"))
+        assert not fake.prompt_calls
+        settled.set()
+        await _until(lambda: bool(fake.prompt_calls))
+        assert fake.prompt_calls[-1].message == "after timeout"
+    finally:
+        await session.close()
+
+
 def test_idle_compaction_thresholds_must_be_positive():
     with pytest.raises(ValueError):
         OmpSession(lambda event: None, cwd="/p", session_id="s", idle_compact_after=0)
@@ -4002,3 +4089,30 @@ async def test_every_omp_run_turns_intent_tracing_off_through_the_overlay():
         }
     finally:
         await session.close()
+
+
+def test_terminal_checkpoint_without_native_file_requires_never_used_session():
+    session = SimpleNamespace(
+        _client=SimpleNamespace(),
+        session_file=None,
+        _resume=None,
+        _turn=0,
+        _next_input_turn=0,
+        _closing=False,
+        _running=False,
+        _input_queue=[],
+        _profile_pending=None,
+        _automation_attempt_id=None,
+        _compact_task=None,
+        _profile_task=None,
+        _models_task=None,
+        _turn_settle_task=None,
+        _broker=None,
+    )
+    assert not OmpSession.checkpoint_ready(session)
+    assert OmpSession.checkpoint_ready(session, terminal=True)
+    session._next_input_turn = 1
+    assert not OmpSession.checkpoint_ready(session, terminal=True)
+    session._next_input_turn = 0
+    session._resume = "/previous/conversation"
+    assert not OmpSession.checkpoint_ready(session, terminal=True)

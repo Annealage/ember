@@ -669,6 +669,8 @@ async def test_hosted_mcp_requires_turn_secret_and_declared_tool_operation(proje
     bus.hosted_turn_exp = time.time() + 30
     bus.hosted_turn_live = True
     bus.hosted_turn_secret = "opaque-turn-secret"
+    bus.hosted_turn_generation = 1
+    bus.hosted_fenced = False
     tools = build_toy_tools(bus, project, "sess-hosted")
     app = _mcp_app(tools, broker=None, hosted_mode=True, hosted_bus=bus)
 
@@ -690,3 +692,17 @@ async def test_hosted_mcp_requires_turn_secret_and_declared_tool_operation(proje
     assert allowed.status_code == 200
     result = json.loads(allowed.body)["result"]
     assert not result["isError"]
+    bus.hosted_turn_ops = ()
+    ungranted = await make_test_client(app).post(
+        "/mcp",
+        headers={"Authorization": "Bearer opaque-turn-secret", "Content-Type": "application/json"},
+        body=json.dumps({"method": "tools/call", "params": {"name": "list_notes"}}),
+    )
+    assert json.loads(ungranted.body)["result"]["isError"]
+    bus.hosted_fenced = True
+    fenced = await make_test_client(app).post(
+        "/mcp",
+        headers={"Authorization": "Bearer opaque-turn-secret", "Content-Type": "application/json"},
+        body=json.dumps({"method": "tools/list"}),
+    )
+    assert fenced.status_code == 403

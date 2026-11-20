@@ -548,43 +548,58 @@ async def _serve_connection(
                 )
             )
             continue
-        if kind in _AGENT_FRAMES:
-            await holder.ensure(retry=True)
-        session = holder.session
-        bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
-        if hosted and bus is not None:
-            if kind == "interrupt":
-                # Before anything awaits (see FENCE), and through the bounded stop
-                # lifecycle rather than a bare abort: see hosted_authority.interrupt.
-                hosted_authority.interrupt(bus, session)
-                continue
-        dispatching = _dispatch(
-            ws,
-            conn,
-            registry,
-            event_log,
-            token,
-            frame,
-            session,
-            bus,
-            records,
-            browser_runtime_controls,
-            history_session_id=history_session_id,
-        )
-        if hosted and kind == "turn":
-            # Not awaited here: recording the turn and the backend's own
-            # preparation (image expansion) await, and a read loop stuck in
-            # them would not see an ``interrupt`` frame until they finished. The
-            # loop keeps reading, so an interrupt cancels a turn still waiting
-            # for the lock (``hosted_authority.FENCE``). The connection going
-            # away does not: a turn frame that arrived still runs.
-            hosted_authority.FENCE.set((bus, bus.hosted_cancel_generation))
-            task = asyncio.ensure_future(dispatching)
-            dispatches.add(task)
-            task.add_done_callback(dispatches.discard)
-            task.add_done_callback(_report_dispatch_failure)
-        else:
-            await dispatching
+        bus = getattr(holder, "bus", None)
+        if hosted and bus is not None and kind == "interrupt":
+            hosted_authority.interrupt(bus, holder.session)
+            continue
+        tracked = hosted and bus is not None
+        if tracked and not hosted_authority.enter_frame(bus):
+            await ws.send(json.dumps(protocol.build_refused("worker checkpoint is in progress")))
+            continue
+        scope_bus = bus
+        if tracked and kind == "turn":
+            hosted_authority.FENCE.set((scope_bus, scope_bus.hosted_cancel_generation))
+        local_activity = not hosted and kind in _AGENT_FRAMES
+        if local_activity:
+            holder.enter_activity_frame()
+        try:
+            if kind in _AGENT_FRAMES:
+                await holder.ensure(retry=True)
+            session = holder.session
+            bus = holder.bus if (session is not None or getattr(holder, "closed", False)) else None
+            dispatching = _dispatch(
+                ws,
+                conn,
+                registry,
+                event_log,
+                token,
+                frame,
+                session,
+                bus,
+                records,
+                browser_runtime_controls,
+                history_session_id=history_session_id,
+            )
+            if tracked and kind == "turn":
+
+                async def tracked_turn(dispatching=dispatching, bus=scope_bus):
+                    try:
+                        await dispatching
+                    finally:
+                        hosted_authority.leave_frame(bus)
+
+                task = asyncio.ensure_future(tracked_turn())
+                tracked = False  # the task releases the count, even after disconnect
+                dispatches.add(task)
+                task.add_done_callback(dispatches.discard)
+                task.add_done_callback(_report_dispatch_failure)
+            else:
+                await dispatching
+        finally:
+            if local_activity:
+                holder.leave_activity_frame()
+            if tracked:
+                hosted_authority.leave_frame(scope_bus)
 
 
 def _report_dispatch_failure(task):
@@ -878,6 +893,7 @@ async def _submit_turn_locked(
     *,
     on_admitted=None,
     agent_blocks=None,
+    hosted_collaborator=False,
 ):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
@@ -945,20 +961,28 @@ async def _submit_turn_locked(
             return
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
-        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
+        admit = (
+            hosted_authority.admit_collaborator if hosted_collaborator else hosted_authority.admit
+        )
+        refusal = admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
             _note_turn(client_id, "refused:%s" % refusal)
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
         hosted_principal = bus.hosted_turn_principal
         hosted_generation = bus.hosted_turn_generation
+    try:
+        if on_admitted is not None:
+            on_admitted()
+    except BaseException:
+        if hosted_generation is not None:
+            hosted_authority.abandon_admission(bus, hosted_generation)
+        raise
+    if hosted_generation is not None:
         events = getattr(bus, "session_events", None)
         if events is not None:
-            # The principal this session now runs for: the one a session event
-            # nobody caused (an idle close, a backend failure) is attributed to.
+            # Only attribute a session to a turn that passed its durable fence.
             events.note(conn.human)
-    if on_admitted is not None:
-        on_admitted()
     _note_turn(client_id, "admitted")
     turn = None
     if bus is not None:

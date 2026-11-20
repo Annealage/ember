@@ -70,6 +70,7 @@ import hmac
 
 import mcp.types as types
 
+from .. import hosted_authority
 from ..tools import namespaced
 from . import read_json_body
 from .ws import _origin_is_allowed, _token_is_allowed, refusal
@@ -236,8 +237,10 @@ def register_mcp_routes(
                 or not hmac.compare_digest(
                     req.headers.get("Authorization", ""), "Bearer " + expected
                 )
+                or hosted_bus.hosted_fenced
             ):
                 return refusal()
+            generation = hosted_bus.hosted_turn_generation
         elif not _token_is_allowed(req, agent_token):
             return refusal()
         if not _origin_is_allowed(req, allowed_origins):
@@ -270,9 +273,14 @@ def register_mcp_routes(
                     "ok": False,
                     "error": '"params" must be {"name": str, "arguments"?: object}',
                 }, 400
-            call_result = await _call_tool_result(
-                table, await current_broker(), name, arguments, server_name=server_name
-            )
+            token = hosted_authority.BRIDGE_GENERATION.set(generation) if hosted_mode else None
+            try:
+                call_result = await _call_tool_result(
+                    table, await current_broker(), name, arguments, server_name=server_name
+                )
+            finally:
+                if token is not None:
+                    hosted_authority.BRIDGE_GENERATION.reset(token)
             return {
                 "result": call_result.model_dump(mode="json", by_alias=True, exclude_none=True)
             }, 200

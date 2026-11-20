@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import socket
+import time
 import weakref
 
 import pytest
@@ -295,6 +296,48 @@ async def test_lifecycle_gauge_uses_one_snapshot_when_a_holder_is_collected(monk
         "open": 1,
         "closed": 0,
     }
+
+
+async def test_activity_frame_fences_idle_close_and_starts_a_fresh_epoch(served_dir):
+    built = []
+    app = _app(served_dir, built, idle_timeout=900)
+    holder = app.agent_holder
+    try:
+        holder._last_active = time.monotonic() - 901
+        holder.enter_activity_frame()
+        await holder._close_idle()
+        assert not holder.closed
+        holder.leave_activity_frame()
+        assert 899 < holder._idle_remaining() <= 900
+    finally:
+        await app.agent_stop()
+
+
+async def test_idle_deadline_and_compaction_hold_share_the_same_epoch(served_dir):
+    built = []
+    app = _app(served_dir, built, idle_timeout=900)
+    holder = app.agent_holder
+    session = built[0]
+    epochs = []
+    session.set_idle_since = epochs.append
+    session.compacting = False
+    try:
+        holder._last_active = time.monotonic() - 899
+        assert 0 < holder._idle_remaining() <= 1
+        await holder._close_idle()
+        assert not holder.closed
+        holder._last_active = time.monotonic() - 901
+        session.compacting = True
+        assert holder._idle_remaining() is None
+        epoch = holder._last_active
+        await holder._close_idle()
+        assert not holder.closed
+        assert epochs[-1] == epoch
+        session.compacting = False
+        await holder._close_idle()
+        assert holder.closed
+    finally:
+        await app.agent_stop()
 
 
 async def test_an_app_with_nothing_to_resume_from_never_closes_for_idle(served_dir):

@@ -62,9 +62,9 @@ so an omp slow to answer it must not queue a prompt or an abort behind it.
 ``idleThresholdTokens``, ``idleTimeoutSeconds``), but its timer lives in the interactive
 mode's event controller and is never armed under RPC, so a session driven from here would
 never run it whatever ``config.yml`` says. ``OmpSession`` keeps the clock instead and sends
-omp's own ``compact`` command. ``_emit_turn_end`` arms a ``call_later`` timer
-(``IDLE_COMPACT_AFTER``, 20 minutes) when the last reported context fill is at least
-``IDLE_COMPACT_TOKENS`` (100,000); ``_send_input`` and ``close`` cancel it. When it fires
+omp's own ``compact`` command. Its idle timer fires after eight minutes when the last
+reported context fill is at least ``IDLE_COMPACT_TOKENS`` (100,000); activity and close
+cancel it. A host may supply the genuine idle epoch through ``set_idle_since``. When it fires
 ``_idle_compaction_due`` checks that nothing else is going on and creates ``_compact_task``
 in the same step. That task is a barrier to input in the same way ``_profile_task`` is:
 ``submit_turn`` queues behind it, ``_send_next_queued`` and ``_start_profile_apply`` stand
@@ -325,7 +325,7 @@ from typing import Any, Callable, List, Optional, Sequence
 from omp_rpc import host_tool
 from omp_rpc.client import RpcCommandError, RpcTimeoutError
 
-from .. import hosted_state, observability, product
+from .. import hosted_authority, hosted_state, observability, product
 from ..tools import host_tool_name
 from . import logfiles, turn_images
 from .base import (
@@ -399,7 +399,7 @@ _CHILD_POLL_INTERVAL = 1.0
 #: same feature (``compaction.idle*``) but arms it from its interactive UI's timer only, so an
 #: RPC-driven omp never runs it; this session drives omp's ``compact`` command itself.
 IDLE_COMPACT_TOKENS = 100_000
-IDLE_COMPACT_AFTER = 20 * 60.0
+IDLE_COMPACT_AFTER = 8 * 60.0
 
 #: The built-in tools ``deferred_tools`` enables: the transport for ``xd://`` devices.
 _XD_TRANSPORT_TOOLS = ("read", "write")
@@ -441,6 +441,7 @@ _BASE_SETTINGS = {"mcp": {"enableProjectConfig": False}, "tools": {"intentTracin
 # How long the ``compact`` request is waited for: it summarises the whole conversation, which
 # outlasts ``RpcClient``'s 30-second default for ordinary requests.
 _COMPACT_REQUEST_TIMEOUT = 600.0
+_COMPACT_SETTLE_POLL = 5.0
 
 
 class OmpSession:
@@ -503,12 +504,9 @@ class OmpSession:
     combined with ``builtin_tools``: the guard has no top-level tool to allow beyond
     the two.
 
-    ``idle_compact_tokens`` and ``idle_compact_after`` are the context size (tokens) and the
-    idle time (seconds since a turn ended) past which the session compacts itself
-    (``IDLE_COMPACT_TOKENS``, ``IDLE_COMPACT_AFTER``); always on, the parameters only
-    move the thresholds. While it runs, a message is held like any other queued input and sent
-    when the compaction ends. Only a turn that ended in this process arms it: a resumed
-    conversation's cache is already cold.
+    ``idle_compact_tokens`` and ``idle_compact_after`` set the context size and
+    idle time thresholds. While compaction runs, input waits behind it.
+    A resumed conversation is eligible from readiness.
     """
 
     #: No positive steering capability is negotiated by the observed RPC API.
@@ -601,6 +599,8 @@ class OmpSession:
         #: a prompt would be sent to the provider, in the thread that sends it (hosted
         #: apps set it: the turn's own authority must still hold).
         self.send_guard = None
+        #: Optional separate hosted maintenance authority; never used for prompts.
+        self.compaction_guard = None
         #: ``() -> None``, called when omp may still be running work this session can no
         #: longer track (a hosted app fences its worker with it).
         self.fence_hook = None
@@ -653,6 +653,7 @@ class OmpSession:
         self._profile_task = None
         self._profile_status = None
         self._settling_turn: Optional[int] = None
+        self._turn_settle_task = None
         self._input_queue = deque()
         self._automation_completion = None
         self._automation_attempt_id = None
@@ -707,6 +708,10 @@ class OmpSession:
         self._context_tokens: Optional[int] = None
         self._idle_compact_handle: Optional[asyncio.TimerHandle] = None
         self._compact_task: Optional[asyncio.Future] = None
+        self._external_idle = False
+        self._idle_since = None
+        self._compact_attempted_since = None
+        self._automation_waiters = 0
         # Its own pool: a minutes-long ``compact`` on ``_executor`` would hold up ``close``'s stop.
         self._compact_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omp-compact")
 
@@ -804,7 +809,11 @@ class OmpSession:
         if not callable(on_admitted):
             raise ValueError("on_admitted must be callable")
         if self._compact_task is not None:
-            await asyncio.shield(self._compact_task)
+            self._automation_waiters += 1
+            try:
+                await asyncio.shield(self._compact_task)
+            finally:
+                self._automation_waiters -= 1
         if (
             self._client is None
             or self._status != AGENT_READY
@@ -1566,6 +1575,7 @@ class OmpSession:
         if self._resume or (self._usage is not None and any(self._usage.values())):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
+        self._arm_idle_compaction()
         self._start_profile_apply()
         # After READY, and not waited for: the list only feeds suggestions,
         # so a slow listing holds up neither the start nor what is sent once
@@ -1771,6 +1781,89 @@ class OmpSession:
         self._usage = None
         self._request_count = (None, 0)
 
+    def checkpoint_ready(self, *, terminal=False) -> bool:
+        """Whether all local OMP work and callbacks have settled."""
+        client = self._client
+        pending = (
+            self._compact_task,
+            self._profile_task,
+            self._models_task,
+            self._turn_settle_task,
+        )
+        return bool(
+            client is not None
+            and (
+                self.session_file
+                or (
+                    terminal
+                    and self._resume is None
+                    and self._turn == 0
+                    and self._next_input_turn == 0
+                )
+            )
+            and not self._closing
+            and not self._running
+            and not self._input_queue
+            and self._profile_pending is None
+            and self._automation_attempt_id is None
+            and not any(task is not None and not task.done() for task in pending)
+            and not (self._broker is not None and self._broker.pending_requests())
+            and not getattr(client, "_pending_host_tool_calls", {})
+            and not getattr(client, "_pending_host_uri_requests", {})
+        )
+
+    async def checkpoint_close(self, timeout: float = 5.0, *, terminal=False) -> bool:
+        """Close a genuinely idle backend only after a clean, drained exit.
+
+        A timeout or unverified exit is not a checkpoint and leaves the caller
+        responsible for fencing the worker. No forced termination counts as a
+        successfully flushed conversation.
+        """
+        if not self.checkpoint_ready(terminal=terminal):
+            return False
+        client = self._client
+        stop = getattr(client, "checkpoint_stop", None)
+        if stop is None:
+            return False
+        self._closing = True
+        self._cancel_idle_compaction()
+        if self._watch_task is not None:
+            self._watch_task.cancel()
+        try:
+            clean = await asyncio.wait_for(asyncio.to_thread(stop, timeout), timeout + 1.0)
+        except (Exception, asyncio.CancelledError):
+            return False
+        if not clean:
+            return False
+        # Reader threads have finished; process their already-scheduled callbacks.
+        await asyncio.sleep(0)
+        if getattr(client, "_pending_host_tool_calls", {}) or getattr(
+            client, "_pending_host_uri_requests", {}
+        ):
+            return False
+        if self.session_file:
+            try:
+
+                def sync_conversation():
+                    with open(self.session_file, "rb") as conversation:
+                        os.fsync(conversation.fileno())
+
+                await asyncio.wait_for(asyncio.to_thread(sync_conversation), timeout)
+            except (Exception, asyncio.CancelledError):
+                return False
+        if self._broker is not None:
+            self._broker.shutdown()
+        self._client = None
+        observability.untrack_session(self)
+        observability.session_stopped()
+        self._executor.shutdown(wait=False)
+        self._models_executor.shutdown(wait=False)
+        self._compact_executor.shutdown(wait=False)
+        self._abort_executor.shutdown(wait=False)
+        self._discard_agent_dir()
+        self._set_status(AGENT_UNAVAILABLE)
+        return True
+
     async def close(self) -> None:
         self._closing = True
         self._cancel_idle_compaction()
@@ -1913,9 +2006,15 @@ class OmpSession:
         handler = spec.handler
 
         def execute(params, context):
+            generation_source = getattr(self, "hosted_tool_generation", None)
+            generation = generation_source() if generation_source is not None else None
+            if generation_source is not None and generation is None:
+                raise RuntimeError("hosted worker has no active tool authority")
             tool_call_id = getattr(context, "tool_call_id", None)
 
             async def run():
+                if generation is not None:
+                    hosted_authority.BRIDGE_GENERATION.set(generation)
                 # Seen by end_turn_after_tool if this tool's handler asks to
                 # end the turn: the task running this coroutine carries it.
                 _TOOL_CALL_ID.set(tool_call_id)
@@ -2274,7 +2373,7 @@ class OmpSession:
         self._settling_turn = turn
         self._end_turn_calls.clear()
         stop_reason, self._stop_reason = self._stop_reason or "end", None
-        asyncio.ensure_future(self._emit_turn_end(turn, stop_reason))
+        self._turn_settle_task = asyncio.ensure_future(self._emit_turn_end(turn, stop_reason))
 
     async def _emit_turn_end(self, turn: int, stop_reason: str) -> None:
         usage = await self._read_usage()
@@ -2443,10 +2542,46 @@ class OmpSession:
         if handle is not None:
             handle.cancel()
 
+    @property
+    def compacting(self) -> bool:
+        """Whether idle maintenance is holding the session open."""
+        return self._compact_task is not None
+
+    @property
+    def idle_busy(self) -> bool:
+        """Work admitted or queued in this session, excluding maintenance."""
+        return bool(
+            self._running
+            or self._input_queue
+            or self._automation_waiters
+            or self._automation_attempt_id is not None
+            or self._profile_pending is not None
+            or self._profile_task is not None
+            or (self._broker is not None and self._broker.pending_requests())
+        )
+
+    def set_idle_since(self, since: Optional[float]) -> None:
+        """Use the host's monotonic idle epoch, or inhibit maintenance while busy.
+
+        Repeated calls with the same epoch do not repeat a compaction attempt.
+        The host must invalidate it as soon as work is admitted, not at completion.
+        """
+        self._external_idle = True
+        if since != self._idle_since:
+            self._cancel_idle_compaction()
+            self._idle_since = since
+        self._arm_idle_compaction()
+
     def _arm_idle_compaction(self) -> None:
-        """Start the idle clock at a turn's end (the one place a turn's cache is last touched), when
-        the context is large enough to be worth compacting. Any later turn cancels it."""
-        self._cancel_idle_compaction()
+        if self._external_idle:
+            if self._idle_since is None or self._compact_attempted_since == self._idle_since:
+                return
+            if self._idle_compact_handle is not None:
+                return
+            delay = max(0.0, self._idle_since + self._idle_compact_after - time.monotonic())
+        else:
+            self._cancel_idle_compaction()
+            delay = self._idle_compact_after
         if (
             self._closing
             or self._loop is None
@@ -2455,9 +2590,7 @@ class OmpSession:
             or self._context_tokens < self._idle_compact_tokens
         ):
             return
-        self._idle_compact_handle = self._loop.call_later(
-            self._idle_compact_after, self._idle_compaction_due
-        )
+        self._idle_compact_handle = self._loop.call_later(delay, self._idle_compaction_due)
 
     def _idle_compaction_due(self) -> None:
         """The idle clock ran out. Compacts only a session with nothing else going on; the task is
@@ -2472,10 +2605,13 @@ class OmpSession:
             or self._profile_pending is not None
             or self._profile_task is not None
             or self._compact_task is not None
+            or self._automation_waiters
             or self._automation_attempt_id is not None
             or (self._broker is not None and self._broker.pending_requests())
         ):
             return
+        if self._external_idle:
+            self._compact_attempted_since = self._idle_since
         self._compact_task = asyncio.ensure_future(self._run_idle_compaction())
 
     async def _run_idle_compaction(self) -> None:
@@ -2491,12 +2627,21 @@ class OmpSession:
                 or tokens < self._idle_compact_tokens
             ):
                 return
-            check = self.send_guard() if self.send_guard is not None else None
+            guard = self.compaction_guard or self.send_guard
+            check = guard() if guard is not None else None
             if check is not None and check():
                 return
-            await asyncio.get_running_loop().run_in_executor(
-                self._compact_executor, self._compact_call, check
-            )
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    self._compact_executor, self._compact_call, check
+                )
+            except RpcTimeoutError as exc:
+                # The RPC client discards the response waiter on timeout; it does
+                # not cancel the native request. Keep the barrier until omp
+                # explicitly reports that compaction has stopped.
+                sys.stderr.write("warning: idle compaction outcome unknown: %r\n" % (exc,))
+                await self._wait_for_compaction_settlement()
+                return
             await self._emit_usage(await self._read_usage())
         except asyncio.CancelledError:
             raise
@@ -2513,6 +2658,22 @@ class OmpSession:
             self._compact_task = None
             if not self._closing:
                 await self._send_next_queued()
+
+    async def _wait_for_compaction_settlement(self) -> None:
+        while not self._closing:
+            try:
+                # The typed parser defaults a missing isCompacting to False;
+                # only an explicit native flag proves the operation settled.
+                state = await self._run_blocking(self._client._request, "get_state")
+                if state.get("isCompacting") is False:
+                    await self._emit_usage(await self._read_usage())
+                    return
+            except Exception as exc:
+                if _process_gone(exc):
+                    self._fail(exc)
+                    return
+                sys.stderr.write("warning: cannot determine compaction state: %r\n" % (exc,))
+            await asyncio.sleep(_COMPACT_SETTLE_POLL)
 
     def _compact_call(self, check) -> None:
         """``compact`` on the compaction pool's thread: the send gate re-asks ``check`` at the write

@@ -276,6 +276,7 @@ def create_app(
     upload_actions=(),
     hosted_mode=False,
     hosted_verifier: Optional[HostedVerifier] = None,
+    hosted_worker_claims=None,
     hosted_state_dir=None,
     hosted_upload_dir=None,
     hosted_tool_ops=None,
@@ -448,9 +449,9 @@ def create_app(
     reopens with (a product's passes ``resumed=True`` to
     ``launch.build_session``, so the backend resumes the conversation).
     ``idle_timeout`` is how many seconds (more than zero) an app that has one
-    waits, with no page connected, no turn running and no permission request
-    open, before it closes its session and that session's broker; the next
-    page to connect (or a turn, or a call through ``/mcp``) builds and starts
+    waits without work or a pending permission request before closing its
+    session and broker. Page presence does not keep it open; the next
+    interaction (a turn or a call through ``/mcp``) builds and starts
     a new one from ``resume_session`` (``AgentHolder``), switched to the model
     the human last chose if that is not the run's. Without both, the app never
     closes for being idle.
@@ -744,12 +745,20 @@ def create_app(
     bus.hosted_turn_ops = ()
     bus.hosted_turn_live = False
     bus.hosted_turn_secret = None
+    bus.hosted_secret_history = []
     bus.hosted_turn_principal = None
     bus.hosted_turn_generation = 0
     bus.hosted_lock = threading.Lock()
+    bus.hosted_worker = None
+    bus.hosted_quiescing = False
+    bus.hosted_frames = 0
     bus.hosted_cancel_generation = 0
     bus.hosted_stopping = 0
     bus.hosted_fenced = False
+    if hosted_worker_claims is not None:
+        if not hosted_mode:
+            raise ValueError("worker authority requires hosted mode")
+        hosted_authority.install(bus, hosted_worker_claims)
     # Hosted telemetry and lifecycle sinks (hosted_state.py). The omp session
     # reads ``request_usage`` through launch.py; the publisher and the
     # WebSocket handler read ``session_events`` off the bus.
@@ -862,6 +871,13 @@ def create_app(
             session = ExternalAgentSession(publish, bus.broker)
         if hosted_mode and session is not None:
             session.send_guard = lambda: hosted_authority.checker(bus)
+            if bus.hosted_worker is not None:
+                session.compaction_guard = lambda: hosted_authority.maintenance_checker(bus)
+            session.hosted_tool_generation = lambda: (
+                bus.hosted_turn_generation
+                if bus.hosted_turn_live and not bus.hosted_fenced
+                else None
+            )
             session.fence_hook = lambda: setattr(bus, "hosted_fenced", True)
         return session
 
@@ -1231,13 +1247,11 @@ def _event_publisher(registry, event_log, session_info=None, bus=None):
 
     def publish(event):
         if bus is not None and getattr(bus, "hosted_mode", False):
-            # Only a real end of the turn ends its grant. An AgentError does not: a
-            # stream error leaves the session ready and the turn possibly still
-            # running, and clearing the grant then would leave nothing for an
-            # explicit interrupt to stop (the turn's own TurnEnd, or a
-            # SessionReset, clears it).
+            # A turn ends without revoking the job's launch authority.
             ended = isinstance(event, SessionReset) or (
-                isinstance(event, TurnEnd) and event.stop_reason != "steered"
+                isinstance(event, TurnEnd)
+                and event.stop_reason != "steered"
+                and event.turn == bus.turn
             )
             if ended:
                 bus.hosted_turn_live = False
@@ -1543,6 +1557,8 @@ class AgentHolder:
         #: re-sends them once started (``redeliver``).
         self.redeliveries = []
         self._last_active = time.monotonic()
+        self._idle_busy_seen = False
+        self._activity_frames = 0
         event_log.observers.append(self._observe)
 
     # -- the session -----------------------------------------------------------
@@ -1652,6 +1668,8 @@ class AgentHolder:
         # Only browser-controlled sessions replay a human's old model.
         # Policy-managed factories select the current model themselves.
         wanted = self._session_info.get("model") if self._restore_model_on_resume else None
+        if getattr(self.bus, "hosted_quiescing", False):
+            return
         if self._fenced():
             # Every path that opens a successor (ensure, launch, a replaced
             # down session) ends here: none may while the old process could live.
@@ -1688,6 +1706,52 @@ class AgentHolder:
         else:
             self._release_lock()
         self._note_change()
+
+    async def checkpoint_close(self, timeout=5.0, *, terminal=False):
+        """Close an idle hosted backend, leaving admission closed.
+
+        Stop children and other writers first. A nonterminal close requires a
+        strict resume factory; a terminal close does not. Refused preconditions
+        leave the worker unchanged; an uncertain attempted close fences it.
+        """
+        async with self._lock:
+            bus = self.bus
+            if (
+                not getattr(bus, "hosted_mode", False)
+                or not bus.hosted_quiescing
+                or self._fenced()
+                or bus.hosted_turn_live
+                or bus.hosted_frames
+                or self.turn_in_flight()
+                or (not terminal and self._resume_session is None)
+                or (self._start_task is not None and not self._start_task.done())
+                or (self._closing is not None and not self._closing.done())
+            ):
+                return False
+            session = self.session
+            if session is None:
+                # Only a never-opened worker proves there is no backend to stop.
+                return bool(terminal and not self._opened)
+            close = getattr(session, "checkpoint_close", None)
+            if close is None:
+                bus.hosted_fenced = True
+                return False
+            ready = getattr(session, "checkpoint_ready", None)
+            if ready is not None and not ready(terminal=terminal):
+                return False
+            self.closed = True
+            self._reopen_with = self._resume_session
+            try:
+                clean = await asyncio.wait_for(close(timeout, terminal=terminal), timeout * 2 + 2)
+            except (Exception, asyncio.CancelledError):
+                clean = False
+            if not clean:
+                bus.hosted_fenced = True
+                return False
+            self.install(None)
+            self._release_lock()
+            self._note_change()
+            return True
 
     async def _close_idle(self):
         async with self._lock:
@@ -1808,8 +1872,9 @@ class AgentHolder:
                 )
                 self._publish(TurnEnd(turn=turn, stop_reason="rejected", cost_usd=None))
                 continue
-            if getattr(self.bus, "hosted_mode", False) and not hosted_authority.holds(
-                self.bus, principal
+            if getattr(self.bus, "hosted_mode", False) and (
+                not hosted_authority.holds(self.bus, principal)
+                or generation != self.bus.hosted_turn_generation
             ):
                 # Accepted under authority that has since ended or been taken
                 # over: delivering it now would run it under no verified grant.
@@ -1921,9 +1986,13 @@ class AgentHolder:
         (possibly none), or ``None`` when there was no live session to end."""
         async with self._lock:
             self._cancelled = True
-            if self._stopped or self.closed or self.session is None:
+            session = self.session
+            stop = None
+            if getattr(self.bus, "hosted_mode", False):
+                stop = hosted_authority.interrupt(self.bus, session)
+            if self._stopped or self.closed or session is None:
                 return None
-            session, start = self.session, self._start_task
+            start = self._start_task
             self._start_task = None
             # Closed before the session is, as for an idle close, so a request
             # arriving meanwhile waits on the lock and finds it cancelled.
@@ -1931,17 +2000,18 @@ class AgentHolder:
             self._reopen_with = self._retry_with
             self.install(None)
             self._closed(CLOSE_CANCEL, "ended by a cancel request")
+            if stop is not None:
+                try:
+                    await asyncio.shield(stop)
+                except Exception:
+                    # The stop callback permanently fences on uncertainty.
+                    pass
             await _end_session(start, session)
             self._release_lock()
             interrupted = sorted(self._turns)
             _end_unfinished_turns(self._publish, self._turns)
             self._turns.clear()
-            bus = self.bus
-            if getattr(bus, "hosted_mode", False):
-                # The grant of the turn that was running ends with it.
-                bus.hosted_turn_live = False
-                bus.hosted_turn_ops = ()
-                bus.hosted_turn_secret = None
+            # In-flight authority was invalidated before backend shutdown.
         self._note_change()
         return interrupted
 
@@ -1992,6 +2062,15 @@ class AgentHolder:
     def note_activity(self):
         """Something used this app without changing its status (a call through
         ``/mcp``): it is not idle."""
+        self._note_change()
+
+    def enter_activity_frame(self):
+        """Hold idle shutdown while an accepted interaction is being admitted."""
+        self._activity_frames += 1
+        self._note_change()
+
+    def leave_activity_frame(self):
+        self._activity_frames -= 1
         self._note_change()
 
     # -- lifecycle ---------------------------------------------------------------
@@ -2060,6 +2139,8 @@ class AgentHolder:
 
     async def _stop(self):
         self._stopped = True
+        if getattr(self.bus, "hosted_mode", False):
+            hosted_authority.revoke(self.bus, None)
         for task in self._tasks:
             task.cancel()
         self._tasks = []
@@ -2125,7 +2206,27 @@ class AgentHolder:
         project's, and outlives and is opened without any page."""
         if self._idle_timeout is None or self.closed or self._stopped or self.session is None:
             return None
-        if self._turns or self._requests or self._deferred:
+        busy = bool(
+            self._turns
+            or self._requests
+            or self._deferred
+            or self._activity_frames
+            or getattr(self.session, "idle_busy", False)
+            or (
+                callable(getattr(self._app, "agent_idle_busy", None))
+                and self._app.agent_idle_busy()
+            )
+            or (self._start_task is not None and not self._start_task.done())
+        )
+        if busy:
+            self._idle_busy_seen = True
+        elif self._idle_busy_seen:
+            self._last_active = time.monotonic()
+            self._idle_busy_seen = False
+        set_idle_since = getattr(self.session, "set_idle_since", None)
+        if set_idle_since is not None:
+            set_idle_since(None if busy else self._last_active)
+        if busy or getattr(self.session, "compacting", False):
             return None
         return self._idle_timeout - (time.monotonic() - self._last_active)
 
@@ -2218,6 +2319,8 @@ class AgentHolder:
         self._last_activity = time.time()
         if active:
             self._last_active = time.monotonic()
+            if self._idle_timeout is not None:
+                self._idle_remaining()
         for listen in list(self.status_listeners):
             try:
                 listen()

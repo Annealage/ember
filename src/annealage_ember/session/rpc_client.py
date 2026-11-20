@@ -294,6 +294,43 @@ class LeanRpcClient(RpcClient):
             self._events.append(archived, size)
             self._event_condition.notify_all()
 
+    def checkpoint_stop(self, timeout: float = 5.0) -> bool:
+        """Close input and require clean exit and drained readers, without killing.
+
+        This deliberately does not fall back to SIGTERM/SIGKILL: a forced exit
+        cannot establish that the conversation was flushed. The caller fences
+        the worker on any failure or timeout.
+        """
+        process = self._process
+        pgid = self._pgid
+        if process is None or process.stdin is None or pgid is None:
+            return False
+        deadline = time.monotonic() + timeout
+        self._stopping = True
+        try:
+            process.stdin.close()
+            if process.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                return False
+            for thread in (self._stdout_thread, self._stderr_thread):
+                if thread is not None:
+                    thread.join(timeout=max(0, deadline - time.monotonic()))
+                    if thread.is_alive():
+                        return False
+            if getattr(self, "_pending_host_tool_calls", {}) or getattr(
+                self, "_pending_host_uri_requests", {}
+            ):
+                return False
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                return False
+            self.stop()
+            return True
+        except Exception:
+            return False
+
     def stop(self) -> bool:
         """``RpcClient.stop``'s result (``False`` when a child outlived teardown), and the
         archive and listeners emptied either way."""

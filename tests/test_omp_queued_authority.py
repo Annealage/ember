@@ -3,7 +3,6 @@
 import asyncio
 import contextvars
 import threading
-import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -25,17 +24,21 @@ def _bus():
     return SimpleNamespace(
         hosted_stopping=0,
         hosted_turn_live=False,
+        hosted_turn_secret=None,
+        hosted_secret_history=[],
         hosted_fenced=False,
         hosted_lock=threading.Lock(),
         hosted_turn_generation=0,
         hosted_cancel_generation=0,
+        hosted_quiescing=False,
+        hosted_worker=("alice", "w", "p", "j", ("project.exec",)),
         hosted_mode=True,
     )
 
 
 def _admit(bus, principal="alice"):
-    claims = SimpleNamespace(exp=time.time() + 60, sub=principal, ops=("project.exec",))
-    assert hosted_authority.admit(bus, None, claims) is None
+    assert principal == "alice"
+    assert hosted_authority.admit_internal(bus, None) is None
 
 
 async def _block_barrier(session, fake, kind):
@@ -89,7 +92,7 @@ async def test_queued_input_keeps_its_admitted_grant(kind, grant):
         if grant in ("interrupted", "replaced"):
             hosted_authority.interrupt(bus, None)
         if grant == "replaced":
-            _admit(bus, "bob")
+            _admit(bus)
         release.set()
         await asyncio.wait_for(asyncio.shield(task), 5)
         if grant in ("valid", "standalone"):
