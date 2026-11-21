@@ -99,6 +99,29 @@ store.endChatTurn(7, "end", 0, null, null, null, 1700000009000);
 store.setChatUserTurn(8, text("untimed"), null);
 out.turnTimes = [7, 8].map((n) => [turn(n).startedAt, turn(n).endedAt, turn(n).clientId]);
 
+// Every other feed item carries the time of its own event: a segment that
+// merges pieces keeps the first piece's, and an event with none (an older log)
+// or a bad one carries null.
+store.appendChatTextDelta(9, "one ", 1700000001000);
+store.appendChatTextDelta(9, "two", 1700000002000);
+store.appendChatThinkingDelta(9, "hm", false, 1700000003000);
+store.addChatToolUse(9, "t9", "read", {}, 1700000004000);
+store.addChatToolUse(9, "t10", "read", {}, 1700000005000);
+store.setChatToolResult("t9", false, "ok", 1700000006000);
+store.addChatTurnError(9, "boom", "", 1700000007000);
+store.appendChatTextDelta(9, "bad", "yesterday");
+store.addChatPermissionRequest("pr9", "t", {}, [], true, null, 1700000008000);
+store.addChatPermissionRequest("pr10", "t", {});
+store.addChatActionResult({ id: "ua9", label: "L", file: "f", bytes: 1, tool: "t", outcome: "done", at: 1700000009000 });
+store.addChatActionResult({ id: "ua10", label: "L", file: "f", bytes: 1, tool: "t", outcome: "done" });
+out.itemTimes = {
+  segments: turn(9).segments.map((s) => (
+    s.kind === "tools" ? s.tools.map((t) => [t.at, t.result ? t.result.at : "no result"]) : s.at)),
+  errors: turn(9).errors.map((e) => e.at),
+  permissions: chat().pending.map((p) => [p.request_id, p.at]),
+  actions: chat().actionResults.map((r) => [r.id, r.at]),
+};
+
 // A refusal keeps the entry as failed, handing the blocks back once; a resend
 // is marked; only failed entries are cleared together.
 store.queueChatUserTurn("c-fail", text("will fail"));
@@ -166,7 +189,7 @@ def test_the_server_s_echo_retires_this_tab_s_pending_copy(observed):
     assert observed["pendingAfterEcho"] == 0
     assert observed["turn2"] == {
         "user": [{"type": "text", "text": "second try"}],
-        "segments": [{"kind": "text", "text": "On it."}],
+        "segments": [{"kind": "text", "text": "On it.", "at": None}],
     }
 
 
@@ -195,8 +218,9 @@ def test_segments_keep_text_and_contiguous_tool_runs_in_event_order(observed):
     assert segments[1]["tools"][0]["result"] == {
         "isError": True,
         "text": "late earlier result",
+        "at": None,
     }
-    assert observed["originalResultUnchanged"] == {"isError": False, "text": "early"}
+    assert observed["originalResultUnchanged"] == {"isError": False, "text": "early", "at": None}
     assert observed["onlyOriginalRunUpdated"] == [True, False, True, True, True]
     assert observed["otherTurnUnchanged"] is True
     assert observed["frozenSegments"] is True
@@ -205,8 +229,22 @@ def test_segments_keep_text_and_contiguous_tool_runs_in_event_order(observed):
 def test_thinking_is_its_own_segment_kept_in_event_order(observed):
     segments = observed["thinkingSegments"]
     assert [s["kind"] for s in segments] == ["thinking", "text", "thinking"]
-    assert segments[0] == {"kind": "thinking", "text": "ab", "truncated": True}
+    assert segments[0] == {"kind": "thinking", "text": "ab", "truncated": True, "at": None}
     assert segments[2]["truncated"] is False
+
+
+def test_every_feed_item_carries_the_time_of_its_event_or_null(observed):
+    times = observed["itemTimes"]
+    # Text keeps its first piece's time, and a bad one is null.
+    assert times["segments"] == [
+        1700000001000,
+        1700000003000,
+        [[1700000004000, 1700000006000], [1700000005000, "no result"]],
+        None,
+    ]
+    assert times["errors"] == [1700000007000]
+    assert times["permissions"] == [["pr9", 1700000008000], ["pr10", None]]
+    assert times["actions"] == [["ua9", 1700000009000], ["ua10", None]]
 
 
 def test_a_turn_carries_the_server_s_times_when_the_log_has_them(observed):

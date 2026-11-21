@@ -103,7 +103,9 @@ class UnknownRequest(Exception):
 
 def stamp_ms() -> int:
     """The server's clock as epoch milliseconds: the ``at`` of the events a
-    page shows a time for (``UserTurn``, ``TurnEnd``, ``AgentClosed``). It is a
+    page shows a time for (``UserTurn``, ``TurnEnd``, ``AgentClosed``, and each
+    item of the feed: text and thinking deltas, tool calls and results,
+    permission requests, upload actions and agent errors). It is a
     dataclass default factory, so the time is taken once, when the event is
     built; the persisted log and every live frame call ``to_wire()`` on that
     same event and carry the same value. A log written before ``at`` existed
@@ -165,6 +167,8 @@ class TextDelta(AgentEvent):
     turn: int
     text: str
     viewer: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 #: Most characters of model thinking kept per turn. Past it the last event
@@ -182,6 +186,8 @@ class ThinkingDelta(AgentEvent):
     text: str
     truncated: Optional[bool] = None
     viewer: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 class ThinkingBudget:
@@ -215,6 +221,8 @@ class ToolUse(AgentEvent):
     name: str
     input: dict
     viewer: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -224,6 +232,8 @@ class ToolResult(AgentEvent):
     is_error: bool
     text: str
     viewer: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -250,6 +260,8 @@ class PermissionRequest(AgentEvent):
     viewer: Optional[str] = None
     action: Optional[str] = None
     by: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 #: How an upload action ended (``UploadActionEnded.outcome``): the call ran
@@ -281,6 +293,8 @@ class UploadActionEnded(AgentEvent):
     by: Optional[str] = None
     viewer: Optional[str] = None
     upload: Optional[str] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,6 +635,8 @@ class AgentError(AgentEvent):
     interruption_reason: Optional[str] = None
     fault_code: Optional[str] = None
     will_retry: Optional[bool] = None
+    #: When the event was built, epoch milliseconds (see ``stamp_ms``).
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)

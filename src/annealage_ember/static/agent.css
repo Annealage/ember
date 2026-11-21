@@ -6,7 +6,8 @@
 
 /* chat.js shows and hides these with the hidden attribute. */
 .chatusage[hidden], .porigin[hidden], .chatbanner[hidden], .chatbannerdetail[hidden],
-.chathistory[hidden], .attachstrip[hidden], .attachremove[hidden], .modal[hidden] { display: none; }
+.chathistory[hidden], .attachstrip[hidden], .attachremove[hidden], .modal[hidden],
+.feedtime[hidden] { display: none; }
 
 /* chat.js keeps the reader's position itself while the log streams, so the
    browser's own scroll anchoring has to stay out of its way. */

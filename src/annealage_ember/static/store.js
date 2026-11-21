@@ -105,6 +105,14 @@
  *                 A turn also carries `clientId`, `startedAt` (its
  *                 `user_turn`'s `at`, epoch ms, or null) and `endedAt` (its
  *                 `turn_end`'s `at`, or null); older logs have no `at`.
+ *                 Every other feed item carries the server's `at` of its own
+ *                 event the same way (epoch ms, or null from an older log):
+ *                 a text or thinking segment the first delta's, a tool its
+ *                 `tool_use`'s (and its `result.at` the `tool_result`'s), an
+ *                 `errors` record its `agent_error`'s, a pending permission
+ *                 request its `permission_request`'s, an `actionResults`
+ *                 entry its `upload_action`'s. `pendingUser[].sentAt` is this
+ *                 tab's own clock at the moment of sending.
  *                 `closed` is the last `agent_closed` event, `{reason,
  *                 detail, at}`, until the agent does anything again, or null.
  *                 `pending` is outstanding permission requests, one entry
@@ -473,10 +481,16 @@ function setChatUserTurn(
   }, ["chat"]);
 }
 
+// A server `at`, or null when the event carried none (an older log).
+function stampOf(at) {
+  return typeof at === "number" && Number.isFinite(at) ? at : null;
+}
+
 // Adjacent activity of the same kind extends its existing segment; tool calls
 // only extend a run of the same tool, so a different tool starts its own
 // segment (and its own line in the chat). Results never enter this stream:
-// they update the original tool at its original slot.
+// they update the original tool at its original slot. A merged segment keeps
+// the `at` of its first piece.
 function appendSegment(segments, segment) {
   const last = segments[segments.length - 1];
   if (last?.kind !== segment.kind
@@ -485,21 +499,21 @@ function appendSegment(segments, segment) {
     return Object.freeze([...segments, Object.freeze(segment)]);
   }
   const merged = segment.kind === "text"
-    ? { kind: "text", text: last.text + segment.text }
+    ? { kind: "text", text: last.text + segment.text, at: last.at }
     : segment.kind === "thinking"
-      ? { kind: "thinking", text: last.text + segment.text, truncated: last.truncated || segment.truncated }
+      ? { kind: "thinking", text: last.text + segment.text, truncated: last.truncated || segment.truncated, at: last.at }
       : { kind: "tools", tools: Object.freeze([...last.tools, ...segment.tools]) };
   return Object.freeze([...segments.slice(0, -1), Object.freeze(merged)]);
 }
 
-function appendChatTextDelta(turn, text) {
+function appendChatTextDelta(turn, text, at = null) {
   if (!text) return;
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx ? Object.freeze({
-        ...t, segments: appendSegment(t.segments, { kind: "text", text }),
+        ...t, segments: appendSegment(t.segments, { kind: "text", text, at: stampOf(at) }),
       }) : t)),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
@@ -508,14 +522,15 @@ function appendChatTextDelta(turn, text) {
 
 // Thinking is its own segment kind so it keeps its place between text and
 // tool runs; `truncated` is sticky once the server says the cap was hit.
-function appendChatThinkingDelta(turn, text, truncated = false) {
+function appendChatThinkingDelta(turn, text, truncated = false, at = null) {
   if (!text && !truncated) return;
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const nextTurns = Object.freeze(
       turns.map((t, i) => (i === idx ? Object.freeze({
-        ...t, segments: appendSegment(t.segments, { kind: "thinking", text: text || "", truncated }),
+        ...t,
+        segments: appendSegment(t.segments, { kind: "thinking", text: text || "", truncated, at: stampOf(at) }),
       }) : t)),
     );
     state = { ...state, chat: Object.freeze({ ...chat, turns: nextTurns }) };
@@ -524,13 +539,13 @@ function appendChatThinkingDelta(turn, text, truncated = false) {
 
 // Kept on its original turn even after the active banner has recovered.
 // Reconnecting replay may revisit an error already shown in this tab.
-function addChatTurnError(turn, remediation, stderr) {
+function addChatTurnError(turn, remediation, stderr, at = null) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     const errors = turns[idx].errors;
     if (errors.some((e) => e.remediation === remediation && e.stderr === stderr)) return;
-    const error = Object.freeze({ remediation, stderr });
+    const error = Object.freeze({ remediation, stderr, at: stampOf(at) });
     const nextTurns = Object.freeze(turns.map((t, i) => (
       i === idx ? Object.freeze({ ...t, errors: Object.freeze([...errors, error]) }) : t
     )));
@@ -538,13 +553,13 @@ function addChatTurnError(turn, remediation, stderr) {
   }, ["chat"]);
 }
 
-function addChatToolUse(turn, toolUseId, name, input) {
+function addChatToolUse(turn, toolUseId, name, input, at = null) {
   commit(() => {
     const chat = state.chat;
     const { turns, idx } = ensureTurn(chat, turn);
     if (turns[idx].segments.some((segment) => segment.kind === "tools"
         && segment.tools.some((tool) => tool.tool_use_id === toolUseId))) return;
-    const tool = Object.freeze({ tool_use_id: toolUseId, name, input, result: null });
+    const tool = Object.freeze({ tool_use_id: toolUseId, name, input, result: null, at: stampOf(at) });
     const nextTurns = Object.freeze(
       turns.map((t, i) =>
         i === idx ? Object.freeze({
@@ -559,7 +574,7 @@ function addChatToolUse(turn, toolUseId, name, input) {
 
 // A result updates only the segment that owns its tool_use_id, even after
 // later text, another tool run, or a newer turn has arrived.
-function setChatToolResult(toolUseId, isError, text) {
+function setChatToolResult(toolUseId, isError, text, at = null) {
   commit(() => {
     const chat = state.chat;
     const turns = Object.freeze(
@@ -571,7 +586,7 @@ function setChatToolResult(toolUseId, isError, text) {
           changed = true;
           const tools = Object.freeze(segment.tools.map((tool) => (
             tool.tool_use_id === toolUseId
-              ? Object.freeze({ ...tool, result: Object.freeze({ isError: !!isError, text }) })
+              ? Object.freeze({ ...tool, result: Object.freeze({ isError: !!isError, text, at: stampOf(at) }) })
               : tool
           )));
           return Object.freeze({ ...segment, tools });
@@ -715,7 +730,7 @@ function setChatClosed(closed) {
 // the human started from the page (an upload action), is `{action, by}`: the
 // action's label and the login of who started it (null for the token holder).
 function addChatPermissionRequest(
-  requestId, tool, input, suggestions, rememberable = true, origin = null,
+  requestId, tool, input, suggestions, rememberable = true, origin = null, at = null,
 ) {
   commit(() => {
     const chat = state.chat;
@@ -727,6 +742,7 @@ function addChatPermissionRequest(
       suggestions: suggestions || null,
       rememberable: rememberable !== false,
       origin: origin ? Object.freeze({ ...origin }) : null,
+      at: stampOf(at),
     });
     state = {
       ...state,
@@ -904,6 +920,7 @@ function addChatActionResult(event) {
     const entry = Object.freeze({
       id: event.id, label: event.label, file: event.file, bytes: event.bytes,
       tool: event.tool, outcome: event.outcome, text: event.text || "", by: event.by || null,
+      at: stampOf(event.at),
     });
     state = {
       ...state,

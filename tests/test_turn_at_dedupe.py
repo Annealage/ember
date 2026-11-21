@@ -1,9 +1,11 @@
 """The server's clock on the events a page shows a time for (``at``), and the
 drop of a resent ``turn`` whose ``client_id`` the log already holds.
 
-``at`` is stamped once, when ``UserTurn``, ``TurnEnd`` or ``AgentClosed`` is
-built, so the persisted line and the live frame (each a ``to_wire()`` of the
-same event) agree, and a log written before it existed still loads.
+``at`` is stamped once, when ``UserTurn``, ``TurnEnd``, ``AgentClosed`` or any
+other feed item (deltas, tool calls and results, permission requests, upload
+actions, agent errors) is built, so the persisted line and the live frame (each
+a ``to_wire()`` of the same event) agree, and a log written before it existed
+still loads.
 
 The dedupe is what makes a page's single resend of an unconfirmed message
 safe: the first copy may have arrived after all, and the replay carries it.
@@ -22,11 +24,18 @@ from annealage_ember.session.base import (
     AGENT_READY,
     AGENT_UNAVAILABLE,
     AgentClosed,
+    AgentError,
+    PermissionRequest,
     SessionReset,
+    TextDelta,
+    ThinkingDelta,
+    ToolResult,
+    ToolUse,
     TurnEnd,
+    UploadActionEnded,
     UserTurn,
 )
-from annealage_ember.session.events import EventLog, read_records
+from annealage_ember.session.events import EventLog, _coalesce, read_records
 from annealage_ember.session.fake import FakeSession
 from annealage_ember.viewers import ViewerBus
 
@@ -81,6 +90,8 @@ async def _send(session, bus, log, text, client_id, **extra):
 def _events():
     return [
         UserTurn(turn=1, blocks=[{"type": "text", "text": "hi"}], client_id="c-1"),
+        ToolUse(turn=1, tool_use_id="t1", name="read", input={}),
+        ToolResult(tool_use_id="t1", is_error=False, text="ok"),
         TurnEnd(turn=1, stop_reason="end", cost_usd=None),
         AgentClosed(reason="idle"),
     ]
@@ -92,8 +103,28 @@ def _events():
         lambda: UserTurn(turn=1, blocks=[], client_id="c-1"),
         lambda: TurnEnd(turn=1, stop_reason="end", cost_usd=None),
         lambda: AgentClosed(reason="idle"),
+        lambda: TextDelta(turn=1, text="hi"),
+        lambda: ThinkingDelta(turn=1, text="hm"),
+        lambda: ToolUse(turn=1, tool_use_id="t1", name="read", input={}),
+        lambda: ToolResult(tool_use_id="t1", is_error=False, text="ok"),
+        lambda: PermissionRequest(request_id="r1", tool="read", input={}),
+        lambda: UploadActionEnded(
+            id="a1", label="L", file="f", bytes=1, tool="t", outcome="done", text=""
+        ),
+        lambda: AgentError(stderr="", remediation="boom"),
     ],
-    ids=["user_turn", "turn_end", "agent_closed"],
+    ids=[
+        "user_turn",
+        "turn_end",
+        "agent_closed",
+        "text_delta",
+        "thinking_delta",
+        "tool_use",
+        "tool_result",
+        "permission_request",
+        "upload_action",
+        "agent_error",
+    ],
 )
 async def test_at_is_epoch_milliseconds_taken_when_the_event_is_built(make):
     before = time.time_ns() // 1_000_000
@@ -155,6 +186,19 @@ async def test_a_log_written_before_at_existed_loads_and_replays_unchanged(tmp_p
     records = [record["event"] for record in read_records(path)]
     assert records[:3] == old
     assert isinstance(records[3]["at"], int)
+
+
+async def test_a_coalesced_run_of_deltas_keeps_the_time_of_its_first_piece():
+    records = [
+        (1, {"kind": "text_delta", "turn": 1, "text": "a", "at": 10}),
+        (2, {"kind": "text_delta", "turn": 1, "text": "b", "at": 20}),
+        (3, {"kind": "thinking_delta", "turn": 1, "text": "c", "at": 30}),
+        (4, {"kind": "thinking_delta", "turn": 1, "text": "d", "at": 40}),
+    ]
+    assert _coalesce(records) == [
+        (2, {"kind": "text_delta", "turn": 1, "text": "ab", "at": 10}),
+        (4, {"kind": "thinking_delta", "turn": 1, "text": "cd", "at": 30}),
+    ]
 
 
 # -- dedupe ------------------------------------------------------------------------

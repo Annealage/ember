@@ -455,6 +455,8 @@ async def test_backend_activity_clears_the_error_for_reconnecting_clients(served
     errors = [
         wire for _seq, wire in app.agent_event_log.replay(0).events if wire["kind"] == "agent_error"
     ]
+    # The server's clock on the event (``at``) is the one thing the log adds.
+    assert all(isinstance(wire.pop("at"), int) for wire in errors)
     assert errors == [
         {
             "kind": "agent_error",

@@ -394,6 +394,40 @@ function localTime(ms, now) {
     ? time : date.toLocaleDateString([], { day: "numeric", month: "short" }) + " " + time;
 }
 
+// A feed item's time, in a <time> that is hidden and empty when the event
+// carried none (a log from before events had a time): "10:36" in the reader's
+// own zone, the date in front when it is not today's (`localTime`), and the
+// full date, seconds and zone on hover. `note` is a second line for the hover.
+function fullTime(ms) {
+  return new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "long" });
+}
+
+function buildFeedTime() {
+  const el = document.createElement("time");
+  el.className = "feedtime";
+  el.hidden = true;
+  return el;
+}
+
+function setFeedTime(el, ms, note = "") {
+  const known = typeof ms === "number" && !Number.isNaN(new Date(ms).getTime());
+  el.hidden = !known;
+  if (!known) {
+    el.textContent = "";
+    return;
+  }
+  el.dateTime = new Date(ms).toISOString();
+  el.textContent = localTime(ms, Date.now());
+  el.title = fullTime(ms) + (note ? "\n" + note : "");
+}
+
+// An assistant message's own words: its time, drawn inside it, is not copied.
+function messageText(message) {
+  const copy = message.cloneNode(true);
+  copy.querySelector("time")?.remove();
+  return copy.textContent;
+}
+
 function elapsedText(startedAt, now) {
   const s = Math.max(0, Math.floor((now - startedAt) / 1000));
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
@@ -612,7 +646,7 @@ export function initChat({
   const unregisterMenu = contextMenu?.register(chatLogEl, ({ target }) => {
     const message = target.closest(".msg.user, .segments > .text");
     if (!message || !chatLogEl.contains(message)) return null;
-    const text = message.matches(".msg.user") ? message.querySelector(".text")?.textContent : message.textContent;
+    const text = message.matches(".msg.user") ? message.querySelector(".text")?.textContent : messageText(message);
     const clipboard = document.defaultView?.navigator.clipboard;
     const items = [{
       id: "chat-copy-message", label: "Copy message",
@@ -882,6 +916,9 @@ export function initChat({
         + " (" + sizeText(result.bytes) + ") to " + shortToolName(result.tool) + ": "
         + (ACTION_OUTCOME[result.outcome] || result.outcome);
       markNativeTouchText(head);
+      const time = buildFeedTime();
+      setFeedTime(time, result.at);
+      head.appendChild(time);
       row.appendChild(head);
       if (result.text) {
         const body = document.createElement("pre");
@@ -991,7 +1028,7 @@ export function initChat({
     card.open = store.getState().toolCardsCollapsed === false;
     const summary = document.createElement("summary");
     card.appendChild(summary);
-    const rec = { card, summary, tool, inputEl: null, resultEl: null };
+    const rec = { card, summary, tool, inputEl: null, resultEl: null, time: buildFeedTime() };
     inspectDisclosure(card, () => group.open, () => updateToolCard(rec, rec.tool));
     return rec;
   }
@@ -1001,6 +1038,9 @@ export function initChat({
     // assigning a megabyte result is work for the reader who opens this card.
     rec.tool = tool;
     rec.summary.textContent = shortToolName(tool.name);
+    setFeedTime(rec.time, tool.at,
+      typeof tool.result?.at === "number" ? "Result " + fullTime(tool.result.at) : "");
+    rec.summary.appendChild(rec.time);
     if (!rec.card.open) return;
     if (!rec.inputEl) {
       rec.inputEl = document.createElement("pre");
@@ -1040,6 +1080,8 @@ export function initChat({
       failed ? `${failed} failed` : ""].filter(Boolean).join(", ");
     // A collapsed run is one summary, however many calls the real turn has.
     // Once opened, its cards stay mounted so expansion and inner scroll survive.
+    setFeedTime(rec.time, segment.tools[0].at);
+    rec.summary.appendChild(rec.time);
     if (!rec.el.open) return;
     for (const tool of segment.tools) {
       let toolRec = rec.tools.get(tool.tool_use_id);
@@ -1102,8 +1144,11 @@ export function initChat({
     row.appendChild(userEl);
     row.appendChild(assistantEl);
 
+    const userTime = buildFeedTime();
+    userEl.appendChild(userTime);
+
     return {
-      row, userEl, userAuthor, userText, userAttachmentsEl, userContextsEl, segmentsEl,
+      row, userEl, userAuthor, userText, userAttachmentsEl, userContextsEl, segmentsEl, userTime,
       automatic, automaticText, automaticAttachments, automaticContexts, errorsEl, segments: [],
     };
   }
@@ -1129,6 +1174,7 @@ export function initChat({
       text.textContent = blocksToText(t.user);
       renderUserAttachments(attachments, t.user);
       renderUserContexts(contexts, t.user, (block) => pickContext(block, t.turn));
+      setFeedTime(rec.userTime, t.startedAt);
     }
     // Segment slots never move: adjacent text extends its text node, adjacent
     // calls extend their inline run, and late results update the original card.
@@ -1140,6 +1186,7 @@ export function initChat({
           : segment.kind === "thinking" ? "thinking" : "toolgroup";
         if (contextMenu && segment.kind === "text") el.tabIndex = 0;
         segmentRec = { el, tools: new Map() };
+        if (segment.kind === "text") segmentRec.time = buildFeedTime();
         if (segment.kind === "thinking") {
           // Closed by default; `textContent` only, since this is model output.
           const summary = document.createElement("summary");
@@ -1150,10 +1197,13 @@ export function initChat({
           segmentRec.note.className = "thinkingnote";
           segmentRec.note.textContent = "Thinking truncated.";
           segmentRec.note.hidden = true;
+          segmentRec.time = buildFeedTime();
+          summary.appendChild(segmentRec.time);
           el.append(summary, segmentRec.body, segmentRec.note);
           inspectDisclosure(el);
         }
         if (segment.kind === "tools") {
+          segmentRec.time = buildFeedTime();
           segmentRec.summary = document.createElement("summary");
           segmentRec.toolsEl = document.createElement("div");
           segmentRec.toolsEl.className = "tools";
@@ -1169,9 +1219,13 @@ export function initChat({
       if (segment.kind === "text") {
         segmentRec.el.innerHTML = renderModelText(segment.text);
         markNativeTouchText(segmentRec.el);
+        // After the marking, which would wrap the time's own text as message text.
+        setFeedTime(segmentRec.time, segment.at);
+        segmentRec.el.appendChild(segmentRec.time);
         return;
       }
       if (segment.kind === "thinking") {
+        setFeedTime(segmentRec.time, segment.at);
         setNativeTouchText(segmentRec.body, segment.text);
         segmentRec.note.hidden = !segment.truncated;
         return;
@@ -1187,6 +1241,9 @@ export function initChat({
       details.className = "turnerror";
       const summary = document.createElement("summary");
       summary.textContent = error.remediation || "The agent reported an error.";
+      const errorTime = buildFeedTime();
+      setFeedTime(errorTime, error.at);
+      summary.appendChild(errorTime);
       details.appendChild(summary);
       if (error.stderr) {
         const pre = document.createElement("pre");
@@ -1231,7 +1288,9 @@ export function initChat({
     renderUserContexts(contextsEl, entry.blocks, (block) => pickContext(block, null));
     const markEl = document.createElement("div");
     markEl.className = "sendmark";
-    userEl.append(textEl, attachmentsEl, contextsEl, markEl);
+    const timeEl = buildFeedTime();
+    setFeedTime(timeEl, entry.sentAt);
+    userEl.append(textEl, attachmentsEl, contextsEl, markEl, timeEl);
     row.appendChild(userEl);
     return { row, userEl, markEl, state: null, reason: null };
   }
@@ -1438,7 +1497,10 @@ export function initChat({
     card.appendChild(actions);
     card.appendChild(statusEl);
 
-    return { card, toolEl, inputEl, statusEl, buttons, reasonEl };
+    const timeEl = buildFeedTime();
+    card.appendChild(timeEl);
+
+    return { card, toolEl, inputEl, statusEl, buttons, reasonEl, timeEl };
   }
 
   // Tells the human when a card ended in a way they would otherwise have to
@@ -1471,6 +1533,7 @@ export function initChat({
         chatPendingEl.appendChild(rec.card);
       }
       rec.toolEl.textContent = shortToolName(req.tool);
+      setFeedTime(rec.timeEl, req.at);
       rec.inputEl.textContent = formatToolInput(req.input);
       // A card whose decision is in flight stays visible and stops accepting
       // clicks, so a second click cannot send a second decision for one
@@ -2211,18 +2274,18 @@ export function initChat({
         store.setChatInputState(event.turn, event.state, event.detail || null);
         break;
       case "text_delta":
-        store.appendChatTextDelta(event.turn, event.text);
+        store.appendChatTextDelta(event.turn, event.text, event.at ?? null);
         break;
       case "thinking_delta":
         // Not activity: it neither clears an error banner nor marks a turn
         // as running, so a replay of it changes nothing but the block.
-        store.appendChatThinkingDelta(event.turn, event.text, !!event.truncated);
+        store.appendChatThinkingDelta(event.turn, event.text, !!event.truncated, event.at ?? null);
         break;
       case "tool_use":
-        store.addChatToolUse(event.turn, event.tool_use_id, event.name, event.input);
+        store.addChatToolUse(event.turn, event.tool_use_id, event.name, event.input, event.at ?? null);
         break;
       case "tool_result":
-        store.setChatToolResult(event.tool_use_id, !!event.is_error, event.text);
+        store.setChatToolResult(event.tool_use_id, !!event.is_error, event.text, event.at ?? null);
         break;
       case "turn_end":
         store.endChatTurn(
@@ -2264,6 +2327,7 @@ export function initChat({
           event.suggestions,
           event.rememberable,
           event.action ? { action: event.action, by: event.by || null } : null,
+          event.at ?? null,
         );
         break;
       case "upload_action":
@@ -2333,7 +2397,7 @@ export function initChat({
         // the only real reason given.
         store.addChatTurnError(
           meta.history ? historyActivityTurn : activityTurn,
-          event.remediation || "", event.stderr || "",
+          event.remediation || "", event.stderr || "", event.at ?? null,
         );
         if (!replayed) {
           store.setChatBanner(

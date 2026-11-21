@@ -14,6 +14,7 @@ delivery state stay out of the transcript. Same harness as ``test_review_js.py``
 """
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -820,6 +821,61 @@ automaticRows[0].children[4].open = true;
 chat.handleEvent({ kind: "text_delta", turn: 9001, text: "Working." }, { replayed: false });
 out.automaticStaysOpen = automaticRows[0].children[4].open;
 
+// Every feed item shows the time of its event in the reader's own zone (the
+// test pins TZ to Australia/Perth, UTC+8): the hour alone for today's, the
+// date in front for an older one, the full date, seconds and zone on hover,
+// and nothing at all for an event that carried no time.
+const NOW = Date.UTC(2026, 10, 21, 4, 0, 0); // 12:00 on 21 Nov in Perth
+const TODAY = Date.UTC(2026, 10, 21, 2, 5, 9); // 10:05:09 that day
+const OLDER = Date.UTC(2026, 10, 19, 2, 5, 9);
+clock = NOW;
+chat.handleHello({ id: "feedtimes", agent: "ready" });
+const lastTime = (host) => {
+  const node = [...host.children].filter((c) => c.tagName === "time").at(-1);
+  return { hidden: node.hidden, text: node.textContent, dateTime: node.dateTime, title: node.title };
+};
+const feedTurn = (turn, base) => {
+  const at = (n) => (base === null ? undefined : base + n * 1000);
+  const ev = (event, meta = { replayed: false }) => chat.handleEvent(event, meta);
+  ev({ kind: "user_turn", turn, blocks: [{ type: "text", text: "q" }], at: at(0) });
+  ev({ kind: "thinking_delta", turn, text: "hm", at: at(1) });
+  ev({ kind: "text_delta", turn, text: "a", at: at(2) });
+  ev({ kind: "text_delta", turn, text: "b", at: at(3) });
+  ev({ kind: "tool_use", turn, tool_use_id: "ft" + turn, name: "read", input: {}, at: at(4) });
+  ev({ kind: "tool_result", tool_use_id: "ft" + turn, is_error: false, text: "ok", at: at(5) });
+  ev({ kind: "agent_error", remediation: "boom", stderr: "", at: at(6) }, { replayed: true });
+  ev({ kind: "turn_end", turn, stop_reason: "end_turn", cost_usd: 0, at: at(7) });
+  const row = el("chatLog").children.find((r) => r.dataset?.turn === String(turn));
+  const segments = row.children[1].children[0].children;
+  const run = segments[2];
+  run.open = true;
+  run.listeners.toggle[0]();
+  const card = run.children[1].children[0];
+  card.open = true;
+  card.listeners.toggle[0]();
+  return {
+    user: lastTime(row.children[0]),
+    thinking: lastTime(segments[0].children[0]),
+    text: lastTime(segments[1]),
+    run: lastTime(run.children[0]),
+    card: lastTime(card.children[0]),
+    error: lastTime(row.children[1].children[1].children[0].children[0]),
+  };
+};
+out.feedTimes = { today: feedTurn(8100, TODAY), older: feedTurn(8101, OLDER), none: feedTurn(8102, null) };
+input.value = "";
+sendMessage("feed time probe");
+const probe = liveRows().find((r) => r.children[0].children[0].textContent === "feed time probe");
+out.feedTimes.pending = lastTime(probe.children[0]);
+chat.handleEvent({ kind: "permission_request", request_id: "pr_feed", tool: "t", input: {}, at: TODAY },
+  { replayed: false });
+out.feedTimes.permission = lastTime(
+  el("chatPending").children.find((c) => c.dataset.requestId === "pr_feed"));
+chat.handleEvent({ kind: "upload_action", id: "ua_feed", label: "L", file: "f.pdf", bytes: 10,
+  tool: "t", outcome: "done", text: "", at: TODAY }, { replayed: false });
+out.feedTimes.action = lastTime(el("chatLog").children.find(
+  (r) => r.className === "msg action" && r.children[0].textContent.includes("f.pdf")).children[0]);
+
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -846,10 +902,69 @@ def observed(tmp_path_factory):
     harness = tmp_path_factory.mktemp("chat-js") / "harness.mjs"
     harness.write_text(HARNESS, encoding="utf-8")
     proc = subprocess.run(
-        ["node", str(harness), str(STATIC)], capture_output=True, text=True, timeout=60
+        ["node", str(harness), str(STATIC)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        # A fixed zone, so the local time the pane draws is known: UTC+8, no DST.
+        env={**os.environ, "TZ": "Australia/Perth"},
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)
+
+
+FEED_KINDS = ("user", "thinking", "text", "run", "card", "error")
+
+
+def test_every_feed_item_shows_its_time_in_the_readers_zone_with_the_full_time_on_hover(observed):
+    today = observed["feedTimes"]["today"]
+    # The server's epoch-millisecond `at`, 02:05:09 UTC on 21 Nov 2026, drawn as
+    # Perth's 10:05; a segment's time is its first delta's, not the later one's.
+    for kind in FEED_KINDS:
+        item = today[kind]
+        assert item["hidden"] is False, kind
+        assert "10:05" in item["text"], kind
+        assert item["dateTime"].startswith("2026-11-21T02:05:"), kind
+        assert "10:05:" in item["title"] and "2026" in item["title"], kind
+        assert "AWST" in item["title"] or "+8" in item["title"], kind
+    assert today["user"]["dateTime"] == "2026-11-21T02:05:09.000Z"
+    assert today["thinking"]["dateTime"] == "2026-11-21T02:05:10.000Z"
+    assert today["text"]["dateTime"] == "2026-11-21T02:05:11.000Z"
+    assert today["run"]["dateTime"] == today["card"]["dateTime"] == "2026-11-21T02:05:13.000Z"
+    assert today["error"]["dateTime"] == "2026-11-21T02:05:15.000Z"
+    # The call's card says when its result came back.
+    assert "Result" in today["card"]["title"] and "10:05:14" in today["card"]["title"]
+    assert "Result" not in today["run"]["title"]
+
+
+def test_a_feed_time_is_the_hour_alone_for_today_and_carries_the_date_when_older(observed):
+    today, older = observed["feedTimes"]["today"], observed["feedTimes"]["older"]
+    for kind in FEED_KINDS:
+        assert older[kind]["text"].endswith(today[kind]["text"]), kind
+        assert len(older[kind]["text"]) > len(today[kind]["text"]), kind
+        assert "19" in older[kind]["text"], kind
+        assert older[kind]["dateTime"].startswith("2026-11-19T02:05:"), kind
+
+
+def test_an_item_whose_event_carried_no_time_shows_none(observed):
+    for kind in FEED_KINDS:
+        assert observed["feedTimes"]["none"][kind]["hidden"] is True, kind
+        assert observed["feedTimes"]["none"][kind]["text"] == "", kind
+
+
+def test_a_message_not_yet_logged_shows_when_this_tab_sent_it(observed):
+    pending = observed["feedTimes"]["pending"]
+    assert pending["hidden"] is False
+    assert pending["dateTime"] == "2026-11-21T04:00:00.000Z"
+    assert "12:00" in pending["text"]
+
+
+def test_an_approval_card_and_an_upload_action_show_their_time(observed):
+    for kind in ("permission", "action"):
+        item = observed["feedTimes"][kind]
+        assert item["hidden"] is False, kind
+        assert item["dateTime"] == "2026-11-21T02:05:09.000Z", kind
+        assert "10:05" in item["text"], kind
 
 
 def test_automatic_continuation_is_a_closed_non_user_disclosure(observed):
@@ -1251,7 +1366,7 @@ def test_recovery_needs_live_backend_activity_and_preserves_error_history(observ
     assert observed["errorAfterRecoveredHello"] is None
     assert observed["unrelatedErrorSurvives"] == "Export failed"
     assert observed["errorHistory"] == [
-        {"remediation": "Check credentials", "stderr": "No API key found"}
+        {"remediation": "Check credentials", "stderr": "No API key found", "at": None}
     ]
     assert observed["errorHistoryVisible"] == ["Check credentials", "No API key found"]
     assert observed["replayedHistory"] == [[1, 1], [2, 1], [3, 0]]

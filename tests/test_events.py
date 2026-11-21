@@ -16,9 +16,11 @@ from annealage_ember.session import events as events_module
 from annealage_ember.session.base import RequestUsage, TextDelta, ToolUse, TurnEnd, UserTurn
 from annealage_ember.session.events import RING_SIZE, EventLog
 
+EVT_AT = 1700000000000
+
 
 def _evt(text="x", turn=1):
-    return TextDelta(turn=turn, text=text)
+    return TextDelta(turn=turn, text=text, at=EVT_AT)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +227,7 @@ def test_a_restarted_log_replays_its_history_from_the_file(tmp_path):
 
     replay = restarted.replay(1)
     assert replay.truncated is False
-    assert replay.events == [(3, {"kind": "text_delta", "turn": 1, "text": "12"})]
+    assert replay.events == [(3, {"kind": "text_delta", "turn": 1, "text": "12", "at": EVT_AT})]
 
 
 def test_a_gap_the_file_cannot_fill_is_reported(tmp_path):
@@ -388,8 +390,14 @@ def test_append_writes_one_json_line_per_event_when_a_path_is_given(tmp_path):
     assert len(lines) == 2
     first = json.loads(lines[0])
     second = json.loads(lines[1])
-    assert first == {"seq": 1, "event": {"kind": "text_delta", "turn": 7, "text": "hello"}}
-    assert second == {"seq": 2, "event": {"kind": "text_delta", "turn": 7, "text": "world"}}
+    assert first == {
+        "seq": 1,
+        "event": {"kind": "text_delta", "turn": 7, "text": "hello", "at": EVT_AT},
+    }
+    assert second == {
+        "seq": 2,
+        "event": {"kind": "text_delta", "turn": 7, "text": "world", "at": EVT_AT},
+    }
 
 
 def test_no_path_means_no_file_is_created(tmp_path):
