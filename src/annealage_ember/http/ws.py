@@ -45,6 +45,8 @@ from ..session.base import (
     UserTurn,
 )
 from ..viewers import ViewerRegistry
+from . import turn_inbox
+from .turn_inbox import HOLD
 
 # Inbound frame ceiling, and a line that must stay. Microdot's default,
 # ``max_message_length = -1``, means "fall back to Request.max_body_length",
@@ -555,6 +557,7 @@ async def _serve_connection(
             continue
         bus = getattr(holder, "bus", None)
         if hosted and bus is not None and kind == "interrupt":
+            await turn_inbox.stop_for(bus, _INTERRUPTED)
             hosted_authority.interrupt(bus, holder.session)
             continue
         tracked = hosted and bus is not None
@@ -758,6 +761,7 @@ async def _dispatch(
             return
         try:
             if kind == "interrupt":
+                await turn_inbox.stop_for(bus, _INTERRUPTED)
                 await session.interrupt()
             elif kind == "set_model":
                 await session.set_model(frame["model"])
@@ -831,7 +835,8 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
         )
         return
     client_id = frame.get("client_id")
-    if client_id is not None and client_id in getattr(bus, "held_ids", ()):
+    inbox = turn_inbox.for_bus(bus)
+    if inbox.has(client_id):
         _note_turn(client_id, "duplicate")
         return
 
@@ -846,7 +851,10 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
                 await holder.ensure(retry=True)
                 held_session = holder.session
                 if held_session is None:
-                    return _HOLD
+                    # Nothing will open one (cancelled, fenced, a factory that
+                    # fails): a fault, not a passing state.
+                    await _refuse(ws, client_id, "the agent could not be started")
+                    return None
         async with bus.turn_submission_lock:
             return await _submit_turn_locked(
                 ws,
@@ -862,42 +870,21 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
                 agent_blocks=agent_blocks,
             )
 
-    if await attempt(False) is _HOLD:
+    if await attempt(False) is HOLD:
         _note_turn(client_id, "held")
-        _hold_turn(attempt, bus, client_id)
+        inbox.add(
+            lambda: attempt(True),
+            client_id,
+            lambda reason: _refuse(ws, client_id, reason),
+        )
 
 
-#: Returned by ``_submit_turn_locked`` for a message that cannot go yet.
-_HOLD = object()
-_HOLD_POLL_SECONDS = 0.5
+_INTERRUPTED = "stopped before it was sent; send it again"
 
 
-def _hold_turn(attempt, bus, client_id):
-    """Keep a message that cannot go yet, and send it in order once it can.
-    It waits on its own task so the connection keeps reading frames, an
-    interrupt among them."""
-    bus.held_turns = getattr(bus, "held_turns", 0) + 1
-    if not hasattr(bus, "held_ids"):
-        bus.held_ids = set()
-    if client_id is not None:
-        bus.held_ids.add(client_id)
-    previous = getattr(bus, "held_tail", None)
-
-    async def run():
-        try:
-            if previous is not None:
-                await asyncio.wait({previous})
-            while True:
-                await asyncio.sleep(_HOLD_POLL_SECONDS)
-                if await attempt(True) is not _HOLD:
-                    return
-        finally:
-            bus.held_turns -= 1
-            bus.held_ids.discard(client_id)
-
-    task = asyncio.ensure_future(run())
-    bus.held_tail = task
-    task.add_done_callback(_report_dispatch_failure)
+async def _refuse(ws, client_id, reason):
+    _note_turn(client_id, "refused:%s" % reason)
+    await ws.send(json.dumps(protocol.build_refused(reason, client_id)))
 
 
 def _serve_dir(session, bus):
@@ -951,7 +938,6 @@ async def _submit_turn_locked(
     from_held=False,
     on_admitted=None,
     agent_blocks=None,
-    hosted_collaborator=False,
 ):
     """Hand one ``turn`` frame to the session, logging what the human sent.
 
@@ -1008,15 +994,15 @@ async def _submit_turn_locked(
     blocked_reason = (
         turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)
     )
-    if hold_ok and bus is not None and not defer:
+    if hold_ok and bus is not None:
         # A message is never refused for arriving at a bad moment: while the
         # agent is busy with work that cannot take it (an automatic
         # continuation, a full input queue, a turn still stopping) or earlier
         # messages are waiting, it is held and sent in order.
         if isinstance(blocked_reason, Busy) or (
-            not from_held and getattr(bus, "held_turns", 0)
+            not from_held and turn_inbox.pending(bus)
         ):
-            return _HOLD
+            return HOLD
     if blocked_reason is not None:
         _note_turn(client_id, "refused:%s" % blocked_reason)
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
@@ -1028,14 +1014,11 @@ async def _submit_turn_locked(
             return
         # Before anything is logged or handed on: whose authority the turn runs
         # under is decided here, and a refusal changes nothing.
-        admit = (
-            hosted_authority.admit_collaborator if hosted_collaborator else hosted_authority.admit
-        )
         steering = hosted_authority.is_steer(bus)
-        refusal = admit(bus, holder, conn.human.hosted_claims)
+        refusal = hosted_authority.admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
             if hold_ok and isinstance(refusal, Busy):
-                return _HOLD
+                return HOLD
             _note_turn(client_id, "refused:%s" % refusal)
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return

@@ -5,6 +5,10 @@ are independently checked at admission and cannot enlarge that authority.
 Launch grant expiry, when present, and browser expiry gate admission, not work.
 Cancellation cannot undo an external call already started; the bounded stop
 must establish that the old backend is gone before another turn can start.
+
+A message sent while a turn runs steers it (``is_steer``) and takes no new
+authority. A passing state refuses with ``refusal.Busy``, which the caller
+holds rather than reports.
 """
 
 from __future__ import annotations
@@ -123,6 +127,7 @@ def _admit_worker(bus, holder, caller_ops=None, principal=None, steer=False) -> 
         if bus.hosted_quiescing:
             return Busy("this worker is being checkpointed")
         if steer and is_steer(bus):
+            GENERATION.set(bus.hosted_turn_generation)
             return None
         if _in_flight(bus, holder):
             return Busy(_IN_FLIGHT)
@@ -138,7 +143,7 @@ def _admit_worker(bus, holder, caller_ops=None, principal=None, steer=False) -> 
     return None
 
 
-def _admit_claims(bus, holder, claims, *, collaborator, now):
+def _admit_claims(bus, holder, claims, *, now):
     now = time.time() if now is None else now
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
@@ -155,7 +160,7 @@ def _admit_claims(bus, holder, claims, *, collaborator, now):
         # Joining a running turn takes no authority, so any member of this
         # project may steer it.
         return _admit_worker(bus, holder, claims.ops, claims.sub, steer=True)
-    if not scoped or (not collaborator and claims.sub != worker[0]):
+    if not scoped:
         return "your delegation does not authorise this worker's operations"
     return _admit_worker(bus, holder, claims.ops, claims.sub)
 
@@ -163,7 +168,7 @@ def _admit_claims(bus, holder, claims, *, collaborator, now):
 def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
     """Admit a browser turn, preserving per-turn authority for other hosts."""
     if getattr(bus, "hosted_worker", None) is not None:
-        return _admit_claims(bus, holder, claims, collaborator=False, now=now)
+        return _admit_claims(bus, holder, claims, now=now)
     now = time.time() if now is None else now
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
@@ -173,6 +178,7 @@ def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
         if getattr(bus, "hosted_quiescing", False):
             return Busy("this worker is being checkpointed")
         if is_steer(bus):
+            GENERATION.set(bus.hosted_turn_generation)
             return None
         if _in_flight(bus, holder):
             return Busy(_IN_FLIGHT)
@@ -185,11 +191,6 @@ def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
             bus.hosted_secret_history.append(bus.hosted_turn_secret)
         bus.hosted_turn_live = True
     return None
-
-
-def admit_collaborator(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
-    """Admit fresh, separately verified handover claims; never call for a browser frame."""
-    return _admit_claims(bus, holder, claims, collaborator=True, now=now)
 
 
 def abandon_admission(bus, generation) -> None:

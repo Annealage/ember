@@ -60,6 +60,7 @@ from .http.routes_provider_login import register_provider_login_routes
 from .http.routes_review import register_review_routes
 from .http.routes_session import register_session_routes
 from .http.routes_settings import register_settings_routes
+from .http import turn_inbox
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
 from .identity import HOSTED_OPERATIONS, BrowserAuth, HostedVerifier, check_bind
@@ -1714,6 +1715,8 @@ class AgentHolder:
         strict resume factory; a terminal close does not. Refused preconditions
         leave the worker unchanged; an uncertain attempted close fences it.
         """
+        if getattr(self.bus, "hosted_quiescing", False):
+            await turn_inbox.stop_for(self.bus, "the agent is being checkpointed; send this again")
         async with self._lock:
             bus = self.bus
             if (
@@ -2144,6 +2147,7 @@ class AgentHolder:
         for task in self._tasks:
             task.cancel()
         self._tasks = []
+        await turn_inbox.stop_for(self.bus, "the server is shutting down")
         try:
             async with self._lock:
                 # Before the viewers are told to go away, so a permission
@@ -2210,6 +2214,7 @@ class AgentHolder:
             self._turns
             or self._requests
             or self._deferred
+            or turn_inbox.pending(self.bus)
             or self._activity_frames
             or getattr(self.session, "idle_busy", False)
             or (

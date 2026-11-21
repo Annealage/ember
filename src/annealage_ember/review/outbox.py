@@ -633,7 +633,7 @@ class OrdinaryTurnOutbox:
                         bus,
                         self.recorder,
                         on_admitted=admit,
-                        hosted_collaborator=self.require_verified_human,
+                        hold_ok=True,
                     )
                     if admitted:
                         error = reply.error or delivery_error

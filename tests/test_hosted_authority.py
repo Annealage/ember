@@ -58,7 +58,6 @@ def test_successive_internal_turns_keep_launch_authority_after_expiry(monkeypatc
 @pytest.mark.parametrize(
     "changes",
     [
-        {"sub": "bob"},
         {"wsp": "other"},
         {"prj": "other"},
         {"job": "other"},
@@ -93,7 +92,7 @@ def test_caller_turn_operations_are_intersection_with_launch_grant():
 def test_collaborator_still_needs_same_job_live_exec_claims(changes):
     bus = _bus()
     authority.install(bus, _claims(exp=None))
-    assert authority.admit_collaborator(bus, None, _claims(sub="bob", **changes)) is not None
+    assert authority.admit(bus, None, _claims(sub="bob", **changes)) is not None
     assert not bus.hosted_turn_live
 
 
@@ -203,3 +202,23 @@ async def test_unconfirmed_stop_fences_instead_of_admitting_successor(kind):
     await asyncio.sleep(0)
     assert bus.hosted_fenced
     assert authority.admit_internal(bus, None) is not None
+
+
+def test_a_member_other_than_the_owner_starts_a_turn_under_their_own_ops():
+    bus = _bus()
+    authority.install(bus, _claims())
+    bob = _claims(sub="bob", ops=("project.exec",))
+    assert authority.admit(bus, None, bob) is None
+    assert bus.hosted_turn_principal == "bob"
+    assert bus.hosted_turn_ops == ("project.exec",)
+
+
+def test_a_steer_is_stamped_with_the_running_turns_generation():
+    bus = _bus()
+    authority.install(bus, _claims())
+    assert authority.admit(bus, None, _claims()) is None
+    running = bus.hosted_turn_generation
+    authority.GENERATION.set(None)
+    assert authority.admit(bus, None, _claims(sub="bob")) is None
+    assert authority.GENERATION.get() == running
+    assert bus.hosted_turn_generation == running
