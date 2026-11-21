@@ -3566,6 +3566,73 @@ async def test_closing_during_a_compaction_does_not_wait_for_it():
 
 
 @pytest.mark.asyncio
+async def test_idle_eligibility_from_log_observer_broadcasts_after_turn_end(tmp_path):
+    from annealage_ember.app import _event_publisher
+    from annealage_ember.session.events import EventLog
+    from annealage_ember.viewers import ViewerRegistry
+
+    class Socket:
+        def __init__(self):
+            self.frames = []
+
+        async def send(self, payload):
+            self.frames.append(json.loads(payload))
+
+    session, fake, recorder, _ = await _started_session()
+    log = EventLog(str(tmp_path / "events.jsonl"))
+    registry = ViewerRegistry(event_log=log)
+    socket = Socket()
+    conn = await registry.add(socket, tab_id="viewer")
+    try:
+        session._context_tokens = 150000
+        publish = _event_publisher(registry, log)
+        session._emit = publish
+        log.observers.append(
+            lambda event: (
+                session.set_idle_since(time.monotonic()) if event["kind"] == "turn_end" else None
+            )
+        )
+        publish(TurnEnd(turn=1, stop_reason="end", cost_usd=None))
+        await _until(
+            lambda: any(
+                frame.get("event", {}).get("kind") == "compaction" for frame in socket.frames
+            )
+        )
+        frames = [
+            frame
+            for frame in socket.frames
+            if frame.get("event", {}).get("kind") in ("turn_end", "compaction")
+        ]
+        assert [frame["event"]["kind"] for frame in frames] == ["turn_end", "compaction"]
+        assert frames[1]["seq"] == frames[0]["seq"] + 1
+        assert frames[1]["event"]["state"] == "eligible"
+    finally:
+        session._emit = recorder
+        await session.close()
+        await registry.remove(conn)
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_idle_eligibility_ignores_cancelled_or_replaced_epoch():
+    session, fake, recorder, _ = await _started_session()
+    try:
+        session._context_tokens = 150000
+        session.set_idle_since(time.monotonic())
+        session.set_idle_since(None)
+        await asyncio.sleep(0)
+        assert not [e for e in recorder.all if isinstance(e, Compaction)]
+
+        session.set_idle_since(time.monotonic())
+        session.set_idle_since(time.monotonic())
+        await asyncio.sleep(0)
+        events = [e for e in recorder.all if isinstance(e, Compaction)]
+        assert [(e.state, e.context_tokens) for e in events] == [("eligible", 150000)]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_host_idle_epoch_arms_once_and_activity_cancels_it():
     session, fake, recorder, _ = await _started_session()
     try:
@@ -3578,6 +3645,7 @@ async def test_host_idle_epoch_arms_once_and_activity_cancels_it():
         assert 479 <= first.when() - asyncio.get_running_loop().time() <= 480
         session.set_idle_since(now)
         assert session._idle_compact_handle is first
+        await asyncio.sleep(0)
         assert [(e.state, e.context_tokens) for e in recorder.all if isinstance(e, Compaction)] == [
             ("eligible", 150000)
         ]

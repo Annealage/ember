@@ -2596,8 +2596,23 @@ class OmpSession:
             and self._context_tokens >= self._idle_compact_tokens
             and (not self._external_idle or not self._idle_eligible_reported)
         ):
-            self._emit(Compaction("eligible", "Waiting for idle deadline", self._context_tokens))
-            self._idle_eligible_reported = True
+            # This may be called by an EventLog observer. Let the event being
+            # observed finish scheduling its broadcast before publishing another.
+            self._loop.call_soon(self._report_idle_eligible, self._idle_compact_handle)
+
+    def _report_idle_eligible(self, handle: asyncio.TimerHandle) -> None:
+        if (
+            self._idle_compact_handle is not handle
+            or handle.cancelled()
+            or self._closing
+            or self._status != AGENT_READY
+            or self._context_tokens is None
+            or self._context_tokens < self._idle_compact_tokens
+            or (self._external_idle and self._idle_eligible_reported)
+        ):
+            return
+        self._idle_eligible_reported = True
+        self._emit(Compaction("eligible", "Waiting for idle deadline", self._context_tokens))
 
     def _idle_compaction_due(self) -> None:
         """The idle clock ran out. Compacts only a session with nothing else going on; the task is
