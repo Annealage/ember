@@ -172,6 +172,12 @@ class EventLog:
         #: reports afresh. Every ``usage`` event is the whole conversation's,
         #: so the last one is the answer, with nothing summed.
         self.last_usage: Optional[dict] = None
+        #: Latest compaction in this conversation, with its original sequence
+        #: so a hello snapshot cannot be overwritten by older paged history.
+        self.last_compaction: Optional[dict] = None
+        # The last state-changing event covers the gap between hello and a
+        # later initial history snapshot, including resets with no turns.
+        self._compaction_marker = None
         #: Called with each appended event's wire dict, after it is recorded:
         #: every event a page sees passes through here, whichever of the
         #: app's publishers sent it, so this is where the app's status
@@ -348,6 +354,12 @@ class EventLog:
 
     def _index_history(self, seq: int, event: dict, offset: int) -> None:
         kind = event.get("kind")
+        if kind == "compaction":
+            self.last_compaction = {"seq": seq, "event": event}
+            self._compaction_marker = (seq, event)
+        elif kind == "session_reset":
+            self.last_compaction = None
+            self._compaction_marker = (seq, event)
         if kind == "user_turn":
             client_id = event.get("client_id")
             if isinstance(client_id, str):
@@ -393,17 +405,23 @@ class EventLog:
         if kind == "turn_end":
             self._history_open.discard(turn)
 
-    def history_pending(self) -> HistoryPage:
+    def history_pending(self, compaction_after=None) -> HistoryPage:
         """A pending-only snapshot when a transcript read is unavailable."""
+        records = list(self._pending_history.values())
+        marker = self._compaction_marker
+        if compaction_after is not None and marker is not None and marker[0] > compaction_after:
+            records.append(marker)
         return HistoryPage(
-            events=list(self._pending_history.values()),
+            events=sorted(records),
             before=None,
             has_more=False,
             through=self._seq,
             pending_request_ids=tuple(self._pending_history),
         )
 
-    async def history_async(self, before: Optional[int] = None, limit: int = 20) -> HistoryPage:
+    async def history_async(
+        self, before: Optional[int] = None, limit: int = 20, compaction_after=None
+    ) -> HistoryPage:
         """Read up to ``limit`` complete recent turns off the event loop.
 
         Turn boundaries and byte offsets are indexed during append/recovery,
@@ -426,7 +444,9 @@ class EventLog:
             # Product notifications before the first conversation turn are
             # not a transcript, however many have accumulated in the log.
             return (
-                self.history_pending() if before is None else HistoryPage([], None, False, through)
+                self.history_pending(compaction_after)
+                if before is None
+                else HistoryPage([], None, False, through)
             )
         count = (
             len(self._history_turns) if before is None else self._history_boundaries.get(upper, 0)
@@ -442,6 +462,7 @@ class EventLog:
         else:
             lower, offset, _ = groups[start]
         pending = tuple(self._pending_history.items()) if before is None else ()
+        marker = self._compaction_marker if before is None else None
         ring = [(seq, event) for seq, event in self._ring if lower <= seq < upper]
         oldest = self._ring[0][0] if self._ring else through + 1
         if lower < upper and lower < oldest:
@@ -451,6 +472,13 @@ class EventLog:
         # An old unresolved request is state, not a reason to render all of
         # the intervening transcript. Retain its original seq and payload.
         extras = [record for _, record in pending if record[0] < lower]
+        if (
+            compaction_after is not None
+            and marker is not None
+            and compaction_after < marker[0] < lower
+        ):
+            extras.append(marker)
+            extras.sort()
         return HistoryPage(
             events=extras + records,
             before=lower if lower < upper else None,

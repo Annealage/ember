@@ -62,9 +62,10 @@ so an omp slow to answer it must not queue a prompt or an abort behind it.
 ``idleThresholdTokens``, ``idleTimeoutSeconds``), but its timer lives in the interactive
 mode's event controller and is never armed under RPC, so a session driven from here would
 never run it whatever ``config.yml`` says. ``OmpSession`` keeps the clock instead and sends
-omp's own ``compact`` command. Its idle timer fires after eight minutes when the last
-reported context fill is at least ``IDLE_COMPACT_TOKENS`` (100,000); activity and close
-cancel it. A host may supply the genuine idle epoch through ``set_idle_since``. When it fires
+omp's own ``compact`` command. Its idle timer fires after eight minutes; activity and close
+cancel it. An eligible context is reported when the timer is armed; an unknown or
+below-threshold context is reported as skipped at the deadline.
+A host may supply the genuine idle epoch through ``set_idle_since``. When it fires
 ``_idle_compaction_due`` checks that nothing else is going on and creates ``_compact_task``
 in the same step. That task is a barrier to input in the same way ``_profile_task`` is:
 ``submit_turn`` queues behind it, ``_send_next_queued`` and ``_start_profile_apply`` stand
@@ -340,6 +341,7 @@ from .base import (
     AgentRetrying,
     AgentRuntimeResolved,
     AgentStatus,
+    Compaction,
     InputState,
     RequestUsage,
     SandboxStatus,
@@ -710,6 +712,7 @@ class OmpSession:
         self._compact_task: Optional[asyncio.Future] = None
         self._external_idle = False
         self._idle_since = None
+        self._idle_eligible_reported = False
         self._compact_attempted_since = None
         self._automation_waiters = 0
         # Its own pool: a minutes-long ``compact`` on ``_executor`` would hold up ``close``'s stop.
@@ -1575,7 +1578,9 @@ class OmpSession:
         if self._resume or (self._usage is not None and any(self._usage.values())):
             await self._emit_usage(self._usage, state)
         self._set_status(AGENT_READY)
-        self._arm_idle_compaction()
+        # A fresh session has no idle turn to report. Hosts provide their own epoch.
+        if self._external_idle or self._context_tokens is not None:
+            self._arm_idle_compaction()
         self._start_profile_apply()
         # After READY, and not waited for: the list only feeds suggestions,
         # so a slow listing holds up neither the start nor what is sent once
@@ -2569,6 +2574,7 @@ class OmpSession:
         self._external_idle = True
         if since != self._idle_since:
             self._cancel_idle_compaction()
+            self._idle_eligible_reported = False
             self._idle_since = since
         self._arm_idle_compaction()
 
@@ -2582,15 +2588,16 @@ class OmpSession:
         else:
             self._cancel_idle_compaction()
             delay = self._idle_compact_after
-        if (
-            self._closing
-            or self._loop is None
-            or self._status != AGENT_READY
-            or self._context_tokens is None
-            or self._context_tokens < self._idle_compact_tokens
-        ):
+        if self._closing or self._loop is None or self._status != AGENT_READY:
             return
         self._idle_compact_handle = self._loop.call_later(delay, self._idle_compaction_due)
+        if (
+            self._context_tokens is not None
+            and self._context_tokens >= self._idle_compact_tokens
+            and (not self._external_idle or not self._idle_eligible_reported)
+        ):
+            self._emit(Compaction("eligible", "Waiting for idle deadline", self._context_tokens))
+            self._idle_eligible_reported = True
 
     def _idle_compaction_due(self) -> None:
         """The idle clock ran out. Compacts only a session with nothing else going on; the task is
@@ -2612,47 +2619,82 @@ class OmpSession:
             return
         if self._external_idle:
             self._compact_attempted_since = self._idle_since
+        if self._context_tokens is None:
+            self._emit(Compaction("skipped", "Context size unknown", None))
+            return
+        if self._context_tokens < self._idle_compact_tokens:
+            self._emit(Compaction("skipped", "Context below idle threshold", self._context_tokens))
+            return
         self._compact_task = asyncio.ensure_future(self._run_idle_compaction())
 
     async def _run_idle_compaction(self) -> None:
+        tokens = self._context_tokens
+        running = False
+        outcome_reported = False
         try:
-            # Asked again, not trusted from the last turn: omp may have pruned the context, or be
-            # running work of its own (a background job waking the agent).
+            # Recheck: omp may have pruned the context or started work of its own.
             state = await self._run_blocking(self._client.get_state)
-            tokens = getattr(getattr(state, "context_usage", None), "tokens", None)
-            if (
-                getattr(state, "is_streaming", False)
-                or getattr(state, "is_compacting", False)
-                or not isinstance(tokens, int)
-                or tokens < self._idle_compact_tokens
-            ):
+            tokens = _token_count(getattr(getattr(state, "context_usage", None), "tokens", None))
+            if getattr(state, "is_streaming", False):
+                self._emit(Compaction("skipped", "Backend is streaming", tokens))
+                return
+            if getattr(state, "is_compacting", False):
+                self._emit(Compaction("skipped", "Backend is already compacting", tokens))
+                return
+            if tokens is None:
+                self._emit(Compaction("skipped", "Context size unknown", None))
+                return
+            if tokens < self._idle_compact_tokens:
+                self._emit(Compaction("skipped", "Context below idle threshold", tokens))
                 return
             guard = self.compaction_guard or self.send_guard
             check = guard() if guard is not None else None
             if check is not None and check():
+                self._emit(Compaction("skipped", "Maintenance guard refused compaction", tokens))
                 return
+            self._emit(Compaction("running", "Idle compaction started", tokens))
+            running = True
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     self._compact_executor, self._compact_call, check
                 )
             except RpcTimeoutError as exc:
-                # The RPC client discards the response waiter on timeout; it does
-                # not cancel the native request. Keep the barrier until omp
-                # explicitly reports that compaction has stopped.
+                # The response waiter timed out, not necessarily the native request.
+                self._emit(Compaction("unknown", "Compaction timed out; outcome unknown", tokens))
+                outcome_reported = True
                 sys.stderr.write("warning: idle compaction outcome unknown: %r\n" % (exc,))
                 await self._wait_for_compaction_settlement()
                 return
             await self._emit_usage(await self._read_usage())
+            self._emit(Compaction("completed", "Idle compaction completed", self._context_tokens))
+            outcome_reported = True
         except asyncio.CancelledError:
+            if not outcome_reported:
+                self._emit(
+                    Compaction(
+                        "unknown" if running else "skipped",
+                        "Compaction cancelled; outcome unknown"
+                        if running
+                        else "Compaction cancelled",
+                        tokens,
+                    )
+                )
             raise
         except Exception as exc:
+            if not outcome_reported:
+                if isinstance(exc, SendRefused):
+                    self._emit(
+                        Compaction("skipped", "Maintenance guard refused compaction", tokens)
+                    )
+                elif isinstance(exc, RpcCommandError):
+                    self._emit(Compaction("failed", "Backend refused compaction", tokens))
+                else:
+                    self._emit(Compaction("failed", "Idle compaction failed", tokens))
             if self._closing:
                 return
             if _process_gone(exc):
                 self._fail(exc)
             else:
-                # Nothing to compact, or omp refused: the conversation is as it was, and the next
-                # turn's end starts the clock again.
                 sys.stderr.write("warning: idle compaction did not run: %r\n" % (exc,))
         finally:
             self._compact_task = None

@@ -13,7 +13,7 @@ from test_hosted_session import OTHER, PRINCIPAL, _build
 from test_identity import HELLO, UPGRADE, _RawSock, _turn
 
 from annealage_ember import protocol
-from annealage_ember.session.base import TurnEnd
+from annealage_ember.session.base import TurnEnd, UserTurn
 
 pytestmark = pytest.mark.asyncio
 
@@ -121,6 +121,44 @@ async def _send(app, who, text, client_id="c-1"):
 
 def _logged(app, kind):
     return [w for _s, w in app.agent_event_log.replay(0).events if w["kind"] == kind]
+
+
+async def test_hello_compaction_snapshot_outlives_history_page_and_clears_on_reset(
+    served_dir, tmp_path_factory
+):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier(ops=("project.read",)))
+    app = hosted.app
+    await app.agent_start()
+    try:
+        log = app.agent_event_log
+        event = {
+            "kind": "compaction",
+            "state": "completed",
+            "reason": "auto",
+            "context_tokens": 123,
+            "at": 10,
+        }
+        seq = log.append(SimpleNamespace(to_wire=lambda: event))
+        for number in range(1, 25):
+            log.append(UserTurn(turn=number, blocks=[{"type": "text", "text": str(number)}]))
+            log.append(TurnEnd(turn=number, stop_reason="end", cost_usd=0.0))
+        held = await _Held(app, "alice").open([{**HELLO, "history_turns": 2}])
+        frames = held.frames()
+        greeting = next(frame for frame in frames if frame["type"] == "hello")
+        page = next(frame for frame in frames if frame["type"] == "history_page")
+        assert greeting["compaction"] == {"seq": seq, "event": event}
+        assert seq < page["before"]
+        assert not any(item["seq"] == seq for item in page["events"])
+        await held.close()
+
+        reset = {"kind": "session_reset"}
+        log.append(SimpleNamespace(to_wire=lambda: reset))
+        held = await _Held(app, "alice").open([{**HELLO, "history_turns": 2}])
+        greeting = next(frame for frame in held.frames() if frame["type"] == "hello")
+        assert greeting["compaction"] is None
+        await held.close()
+    finally:
+        await app.agent_stop()
 
 
 async def test_host_without_worker_grant_accepts_only_delegated_turns(served_dir, tmp_path_factory):

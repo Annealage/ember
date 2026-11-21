@@ -419,6 +419,8 @@ omp's own timer belongs to its interactive UI and is never armed under RPC. `Omp
 
 A message sent during compaction is queued like any other (`InputState` `queued`) and goes out when it ends. `Usage.context` then reports the new fill. Hosted compaction uses its separate maintenance guard before the request and again at the write; it cannot authorise a prompt or tool call. omp refuses conversations under about 20k tokens as too small; that is logged and the session stays ready. The design is in the module docstring of `session/omp.py`.
 
+The agent header shows the latest compaction observation. Open it for the time, context size and reason. The event is kept with the conversation, so a hosted snapshot can show the last observation without implying a worker is still running.
+
 If the compact RPC times out, its outcome is unknown: the RPC client does not cancel the native request. Ember keeps the input and idle-close barrier until omp explicitly reports that compaction has stopped; a missing status or failed status query is not proof of settlement.
 
 A hosted input waiting behind compaction or model profile application retains the send guard for its own admitted grant. The guard is checked again before the prompt and at the RPC write, so an interrupt or replacement grant still prevents the queued input from being sent.

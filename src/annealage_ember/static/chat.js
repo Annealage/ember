@@ -589,6 +589,44 @@ function usageChip(agentStatusEl) {
   return chip;
 }
 
+// The most recent durable compaction observation, alongside the context
+// readout. A replayed "running" event is only an observation, not proof that
+// the worker is still running (notably when viewing a hosted snapshot).
+function compactionChip(agentStatusEl) {
+  const details = document.createElement("details");
+  details.className = "chatcompaction";
+  details.hidden = true;
+  const summary = document.createElement("summary");
+  const description = document.createElement("span");
+  details.append(summary, description);
+  agentStatusEl.before(details);
+  return details;
+}
+
+function renderCompaction(details, event) {
+  details.hidden = !event;
+  if (!event) return;
+  const labels = {
+    eligible: "Compaction eligible",
+    skipped: "Compaction skipped",
+    running: "Compaction last observed running",
+    completed: "Compaction completed",
+    failed: "Compaction failed",
+    unknown: "Compaction outcome unknown",
+  };
+  const label = labels[event.state] || labels.unknown;
+  details.children[0].textContent = label;
+  const time = Number.isFinite(event.at) && !Number.isNaN(new Date(event.at).getTime())
+    ? new Date(event.at).toLocaleString() : "unknown";
+  const tokens = Number.isInteger(event.context_tokens) && event.context_tokens >= 0
+    ? tokenCount(event.context_tokens) : "unknown";
+  details.children[1].textContent = [
+    "Time: " + time,
+    "Context: " + tokens + " tokens",
+    event.reason ? "Reason: " + event.reason : "",
+  ].filter(Boolean).join(" · ");
+}
+
 /**
  * Mounts the pane. `send` is ws.js's frame sender; `root` is where the pane's
  * elements are looked up (default: the document); `ids` overrides any of
@@ -734,6 +772,9 @@ export function initChat({
   let steers = false;
   initAttention(root);
   const usageEl = usageChip(agentStatusEl);
+  const compactionEl = compactionChip(agentStatusEl);
+  let compactionSeq = null;
+  let hasCompaction = false;
   showSignedIn(usageEl);
 
   // turn number -> {row, textEl, toolsEl, metaEl, userEl, tools: Map<tool_use_id, {card, resultEl}>}
@@ -2111,7 +2152,15 @@ export function initChat({
     toast(restoredText("A message sent as the connection dropped never arrived", complete), false);
   }
 
-  function handleHello(session) {
+  function handleHello(session, snapshot = {}) {
+    // Hosted snapshot viewers supply the same observation on their
+    // session-like object, without a websocket hello frame.
+    if (snapshot.compaction === undefined && session?.compaction !== undefined) {
+      snapshot = {
+        compaction: session.compaction,
+        seq: session.compaction_seq ?? session.compaction?.seq ?? 0,
+      };
+    }
     if (session) {
       // A fresh connection's hello is authoritative, the same way it
       // already is for agent status and model below: any set_model this
@@ -2155,6 +2204,9 @@ export function initChat({
     // another conversation, and this one's history arrives in the replay.
     const nextSessionId = session && session.id ? session.id : null;
     if (sessionId !== null && nextSessionId !== sessionId) {
+      compactionSeq = null;
+      hasCompaction = false;
+      renderCompaction(compactionEl, null);
       store.resetChatTurns();
       // Another conversation's cards: nobody is waiting on them any more.
       store.clearChatPending();
@@ -2162,6 +2214,27 @@ export function initChat({
       activityTurn = 0;
       resetHistory();
       stickToBottom = true;
+    }
+    // The hello's observation covers the entire log, not just the newest
+    // transcript page. Its sequence also prevents older history from
+    // resurrecting a compaction after a reset.
+    if (snapshot.compaction !== undefined && Number.isInteger(snapshot.seq)) {
+      const entry = snapshot.compaction;
+      if (compactionSeq !== null && snapshot.seq < compactionSeq) {
+        compactionSeq = null;
+        hasCompaction = false;
+      }
+      if (entry && Number.isInteger(entry.seq) && entry.event?.kind === "compaction") {
+        if (compactionSeq === null || entry.seq >= compactionSeq) {
+          compactionSeq = entry.seq;
+          hasCompaction = true;
+          renderCompaction(compactionEl, entry.event);
+        }
+      } else if (entry === null) {
+        compactionSeq = snapshot.seq;
+        hasCompaction = false;
+        renderCompaction(compactionEl, null);
+      }
     }
     // A decision sent over the connection that dropped may never have
     // arrived. A card it did decide is retired by the replay that follows;
@@ -2258,6 +2331,17 @@ export function initChat({
       store.setChatClosed(null);
     }
     switch (event.kind) {
+      case "compaction":
+        // History pages can arrive after live events and in reverse page
+        // order. Sequence, not arrival time, identifies the latest event.
+        if (Number.isInteger(meta.seq)
+            ? compactionSeq === null || meta.seq > compactionSeq
+            : !olderHistory || !hasCompaction) {
+          compactionSeq = Number.isInteger(meta.seq) ? meta.seq : null;
+          hasCompaction = true;
+          renderCompaction(compactionEl, event);
+        }
+        break;
       case "user_turn":
         store.setChatUserTurn(
           event.turn, event.blocks, event.client_id || null, event.automation_source || null,
@@ -2374,6 +2458,11 @@ export function initChat({
         if (!replayed) store.setChatModels(event.models);
         break;
       case "session_reset":
+        if (!Number.isInteger(meta.seq) || compactionSeq === null || meta.seq > compactionSeq) {
+          compactionSeq = Number.isInteger(meta.seq) ? meta.seq : null;
+          hasCompaction = false;
+          renderCompaction(compactionEl, null);
+        }
         if (meta.history) break;
         resetHistory();
         stickToBottom = true;

@@ -876,6 +876,49 @@ chat.handleEvent({ kind: "upload_action", id: "ua_feed", label: "L", file: "f.pd
 out.feedTimes.action = lastTime(el("chatLog").children.find(
   (r) => r.className === "msg action" && r.children[0].textContent.includes("f.pdf")).children[0]);
 
+// Compaction is a durable observation, independent of the transcript page.
+const compaction = el("agentStatus").inserted.find((n) => n.className === "chatcompaction");
+const compactionNow = () => ({
+  hidden: compaction.hidden, tag: compaction.tagName,
+  label: compaction.children[0].textContent, detail: compaction.children[1].textContent,
+});
+const compactionEvent = (state, tokens = 12345) => ({
+  kind: "compaction", state, reason: "Idle threshold reached",
+  context_tokens: tokens, at: TODAY,
+});
+chat.handleHello({ id: "compaction-test", agent: "ready" });
+out.compactionInitiallyHidden = compaction.hidden;
+out.compactionLifecycle = {};
+let compactionSeq = 1;
+for (const state of ["eligible", "skipped", "running", "completed", "failed", "unknown"]) {
+  chat.handleEvent(compactionEvent(state, state === "unknown" ? null : 12345),
+    { seq: compactionSeq++, replayed: false });
+  out.compactionLifecycle[state] = compactionNow();
+}
+chat.handleHello({ id: "compaction-test", agent: "ready" },
+  { seq: 20, compaction: { seq: 18, event: compactionEvent("completed") } });
+out.compactionSnapshot = compactionNow();
+chat.handleEvent(compactionEvent("failed"), { seq: 10, replayed: true, history: true });
+chat.handleEvent({ kind: "session_reset" }, { seq: 15, replayed: true, history: true });
+out.compactionAfterOlderHistory = compactionNow();
+chat.handleEvent(compactionEvent("running"), { seq: 21, replayed: false });
+chat.handleEvent(compactionEvent("skipped"), { seq: 19, replayed: true, history: true });
+out.compactionAfterLive = compactionNow();
+chat.handleEvent({ kind: "session_reset" }, { seq: 22, replayed: true, history: true });
+out.compactionAfterNewerReset = compactionNow();
+chat.handleEvent(compactionEvent("failed"), { seq: 20, replayed: true, history: true });
+out.compactionAfterResetOlderHistory = compactionNow();
+chat.handleHello({ id: "compaction-test", agent: "ready" }, { seq: 30, compaction: null });
+chat.handleEvent(compactionEvent("completed"), { seq: 29, replayed: true, history: true });
+out.compactionAfterNullSnapshot = compactionNow();
+chat.handleHello({ id: "compaction-test", agent: "ready", compaction_seq: 40,
+  compaction: { seq: 35, event: compactionEvent("running") } });
+out.compactionHostedSnapshot = compactionNow();
+chat.handleEvent(compactionEvent("failed"), { seq: 34, replayed: true, history: true });
+out.compactionHostedAfterOlderHistory = compactionNow();
+chat.handleHello({ id: "another-compaction-session", agent: "ready" });
+out.compactionAfterSessionChange = compaction.hidden;
+
 sent.length = 0;
 const modelLessRoot = {
   nodeType: 9,
@@ -1432,3 +1475,37 @@ def test_thinking_is_a_closed_block_in_event_order_and_never_raises_activity(obs
 def test_a_held_message_released_at_live_is_not_restored_as_lost(observed):
     assert observed["heldRestored"] == ""
     assert observed["heldPending"] == 1
+
+
+def test_compaction_lifecycle_is_an_accessible_observation_with_details(observed):
+    assert observed["compactionInitiallyHidden"] is True
+    labels = {
+        "eligible": "Compaction eligible",
+        "skipped": "Compaction skipped",
+        "running": "Compaction last observed running",
+        "completed": "Compaction completed",
+        "failed": "Compaction failed",
+        "unknown": "Compaction outcome unknown",
+    }
+    for state, label in labels.items():
+        item = observed["compactionLifecycle"][state]
+        assert item["hidden"] is False
+        assert item["tag"] == "details"
+        assert item["label"] == label
+        assert "Time:" in item["detail"] and "unknown" not in item["detail"].split(" · ")[0]
+        assert "Reason: Idle threshold reached" in item["detail"]
+        assert (
+            "Context: unknown tokens" if state == "unknown" else "Context: 12,345 tokens"
+        ) in item["detail"]
+
+
+def test_compaction_snapshot_replay_and_reset_are_ordered_by_sequence(observed):
+    assert observed["compactionSnapshot"]["label"] == "Compaction completed"
+    assert observed["compactionAfterOlderHistory"] == observed["compactionSnapshot"]
+    assert observed["compactionAfterLive"]["label"] == "Compaction last observed running"
+    assert observed["compactionAfterNewerReset"]["hidden"] is True
+    assert observed["compactionAfterResetOlderHistory"]["hidden"] is True
+    assert observed["compactionAfterNullSnapshot"]["hidden"] is True
+    assert observed["compactionHostedSnapshot"]["label"] == "Compaction last observed running"
+    assert observed["compactionHostedAfterOlderHistory"] == observed["compactionHostedSnapshot"]
+    assert observed["compactionAfterSessionChange"] is True

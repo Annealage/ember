@@ -394,6 +394,23 @@ class RequestUsage(AgentEvent):
 
 
 @dataclasses.dataclass(frozen=True)
+class Compaction(AgentEvent):
+    """An automatic idle-compaction decision or outcome, safe to persist and replay."""
+
+    kind: ClassVar[str] = "compaction"
+    state: str
+    reason: str
+    context_tokens: Optional[int]
+    at: int = dataclasses.field(default_factory=stamp_ms, compare=False)
+
+    def to_wire(self) -> dict:
+        data = super().to_wire()
+        # Unlike optional attribution, an unknown context size is part of this contract.
+        data["context_tokens"] = self.context_tokens
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class InputState(AgentEvent):
     """Lifecycle of a human input sent to a backend."""
 
@@ -763,6 +780,7 @@ GENERIC_EVENTS = (
     Usage,
     RequestUsage,
     InputState,
+    Compaction,
     PauseChanged,
     ViewerPrimary,
     AgentStatus,

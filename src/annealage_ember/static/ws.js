@@ -63,9 +63,9 @@
  *   whose live channel means something more specific than "updates".
  *
  * `onHello` and `onAgentEvent` are the chat pane's two inbound hooks:
- * `onHello` receives the hello frame's `session` object once per connection
- * (including every reconnect, since agent status can change between them),
- * and `onAgentEvent` receives every event neither this module nor a product
+ * `onHello` receives the hello frame's `session` object and, as a second
+ * argument, its `{compaction, seq}` snapshot once per connection (including
+ * reconnects). `onAgentEvent` receives every event neither this module nor a product
  * handler takes, replayed ones included, with `{replayed}` saying which.
  * Paged history adds `{history:true, initial, seq}` and history_page /
  * history_page_end lifecycle events around each batch; history_error reports
@@ -816,7 +816,7 @@ export function initWs({
     // have connected long after it was set, and `pause_changed` only reaches a
     // client that was attached when it happened.
     onPaused(!!(frame.session && frame.session.paused));
-    onHello(frame.session);
+    onHello(frame.session, { compaction: frame.compaction, seq: frame.seq });
   }
 
   function handleHistoryPage(frame) {

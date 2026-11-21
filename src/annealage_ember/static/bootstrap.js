@@ -228,8 +228,8 @@ export function bootstrapAgentPage({
         }
         if (hooks.onFallback) hooks.onFallback();
       },
-      onHello: (frame) => {
-        chat.handleHello(frame);
+      onHello: (frame, snapshot) => {
+        chat.handleHello(frame, snapshot);
         if (hooks.onHello) hooks.onHello(frame);
       },
       onAgentEvent: (event, meta) => {

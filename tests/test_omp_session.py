@@ -45,12 +45,14 @@ from annealage_ember.session.base import (
     AGENT_CONNECTING,
     AGENT_READY,
     AGENT_UNAVAILABLE,
+    GENERIC_EVENTS,
     AgentError,
     AgentModelChanged,
     AgentModelsAvailable,
     AgentRetrying,
     AgentRuntimeResolved,
     AgentStatus,
+    Compaction,
     InputState,
     PermissionRequest,
     PermissionResolved,
@@ -3448,6 +3450,14 @@ async def test_a_large_context_left_idle_is_compacted_and_the_new_fill_is_report
             if usage.context == {"used_tokens": 3000, "window_tokens": 200000}:
                 break
         await asyncio.sleep(0.15)
+        events = [e for e in recorder.all if isinstance(e, Compaction)]
+        assert [(e.state, e.context_tokens) for e in events] == [
+            ("eligible", 150000),
+            ("running", 150000),
+            ("completed", 3000),
+        ]
+        assert all(isinstance(e.at, int) and e.at > 0 for e in events)
+        assert Compaction in GENERIC_EVENTS
         assert fake.compact_calls == 1  # once per idle period, not on a loop
     finally:
         await session.close()
@@ -3463,6 +3473,8 @@ async def test_a_small_context_is_never_compacted():
         await _finish_turn(session, fake, recorder)
         await asyncio.sleep(0.25)
         assert fake.compact_calls == 0
+        events = [e for e in recorder.all if isinstance(e, Compaction)]
+        assert [(e.state, e.context_tokens) for e in events] == [("skipped", 99999)]
     finally:
         await session.close()
 
@@ -3514,12 +3526,18 @@ async def test_a_compaction_omp_refuses_leaves_the_session_ready_and_the_next_tu
     session, fake, recorder, _ = await _started_session(
         idle_compact_tokens=100000, idle_compact_after=0.05
     )
-    fake.compact_error = RpcCommandError("Nothing to compact")
+    fake.compact_error = omp_module.RpcCommandError(
+        command="compact", error="private backend detail", code=None
+    )
     try:
         _big_context(fake)
         await _finish_turn(session, fake, recorder)
         await _until(lambda: fake.compact_calls == 1)
         await _until(lambda: session._compact_task is None)
+        events = [e.to_wire() for e in recorder.all if isinstance(e, Compaction)]
+        assert [e["state"] for e in events] == ["eligible", "running", "failed"]
+        assert events[-1]["reason"] == "Backend refused compaction"
+        assert "private backend detail" not in str(events)
         assert session.agent_status() == AGENT_READY
         await session.submit_turn(_text("still works"))
         await _until(lambda: fake.prompt_calls[-1].message == "still works")
@@ -3540,6 +3558,9 @@ async def test_closing_during_a_compaction_does_not_wait_for_it():
         await _until(lambda: fake.compact_calls == 1)
         await asyncio.wait_for(session.close(), 1.0)
         assert fake.stopped and session._compact_task is None
+        events = [e for e in recorder.all if isinstance(e, Compaction)]
+        assert [e.state for e in events] == ["eligible", "running", "unknown"]
+        assert "cancelled" in events[-1].reason
     finally:
         release.set()
 
@@ -3557,6 +3578,9 @@ async def test_host_idle_epoch_arms_once_and_activity_cancels_it():
         assert 479 <= first.when() - asyncio.get_running_loop().time() <= 480
         session.set_idle_since(now)
         assert session._idle_compact_handle is first
+        assert [(e.state, e.context_tokens) for e in recorder.all if isinstance(e, Compaction)] == [
+            ("eligible", 150000)
+        ]
         session.set_idle_since(None)
         assert first.cancelled()
         assert session._idle_compact_handle is None
@@ -3566,22 +3590,92 @@ async def test_host_idle_epoch_arms_once_and_activity_cancels_it():
         await _until(lambda: not session.compacting)
         session.set_idle_since(session._idle_since)
         assert session._idle_compact_handle is None
+        assert [e.state for e in recorder.all if isinstance(e, Compaction)] == [
+            "eligible",
+            "eligible",
+            "running",
+            "completed",
+        ]
     finally:
         await session.close()
 
 
 @pytest.mark.asyncio
-async def test_host_idle_epoch_requires_known_eligible_context():
+async def test_host_idle_epoch_reports_ineligible_context_once():
     session, fake, recorder, _ = await _started_session()
     try:
         for tokens in (None, 99999):
             session._context_tokens = tokens
-            session.set_idle_since(time.monotonic() - 480)
+            epoch = time.monotonic() - 480
+            session.set_idle_since(epoch)
+            event = await _next_of(recorder, Compaction)
+            assert event.state == "skipped"
+            assert event.context_tokens == tokens
+            assert event.to_wire()["context_tokens"] == tokens
+            session.set_idle_since(epoch)
             assert session._idle_compact_handle is None
+        assert fake.compact_calls == 0
         session._context_tokens = 100000
         _big_context(fake, tokens=100000)
         session.set_idle_since(time.monotonic() - 480)
         await _until(lambda: fake.compact_calls == 1)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tokens", "streaming", "compacting", "reason"),
+    [
+        (None, False, False, "Context size unknown"),
+        (99999, False, False, "Context below idle threshold"),
+        (150000, True, False, "Backend is streaming"),
+        (150000, False, True, "Backend is already compacting"),
+    ],
+)
+async def test_idle_compaction_rechecks_backend_state(tokens, streaming, compacting, reason):
+    session, fake, recorder, _ = await _started_session()
+    try:
+        session._context_tokens = 150000
+        fake.get_state = lambda: SimpleNamespace(
+            context_usage=SimpleNamespace(tokens=tokens),
+            is_streaming=streaming,
+            is_compacting=compacting,
+        )
+        session.set_idle_since(time.monotonic() - 480)
+        eligible = await _next_of(recorder, Compaction)
+        assert (eligible.state, eligible.context_tokens) == ("eligible", 150000)
+        event = await _next_of(recorder, Compaction)
+        assert (event.state, event.reason, event.context_tokens) == ("skipped", reason, tokens)
+        assert fake.compact_calls == 0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at_write", [False, True])
+async def test_idle_compaction_guard_refusal_is_safe_and_not_retried(at_write):
+    session, fake, recorder, _ = await _started_session()
+    try:
+        _big_context(fake)
+        session._context_tokens = 150000
+        if at_write:
+            fake.compact_error = omp_module.SendRefused("private authority detail")
+        else:
+            session.compaction_guard = lambda: lambda: "private authority detail"
+        epoch = time.monotonic() - 480
+        session.set_idle_since(epoch)
+        await _until(
+            lambda: any(isinstance(e, Compaction) and e.state == "skipped" for e in recorder.all)
+        )
+        events = [e.to_wire() for e in recorder.all if isinstance(e, Compaction)]
+        assert [e["state"] for e in events] == (
+            ["eligible", "running", "skipped"] if at_write else ["eligible", "skipped"]
+        )
+        assert events[-1]["reason"] == "Maintenance guard refused compaction"
+        assert "private authority detail" not in str(events)
+        session.set_idle_since(epoch)
+        assert session._idle_compact_handle is None
     finally:
         await session.close()
 
@@ -3623,6 +3717,9 @@ async def test_timed_out_compaction_holds_input_until_native_state_settles(monke
         assert session.compacting
         await session.submit_turn(_text("after timeout"))
         assert not fake.prompt_calls
+        events = [e for e in recorder.all if isinstance(e, Compaction)]
+        assert [e.state for e in events] == ["eligible", "running", "unknown"]
+        assert "timed out" in events[-1].reason
         settled.set()
         await _until(lambda: bool(fake.prompt_calls))
         assert fake.prompt_calls[-1].message == "after timeout"

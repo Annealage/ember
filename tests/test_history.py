@@ -33,6 +33,46 @@ def turns(page):
     return [event["turn"] for _, event in page.events if event["kind"] == "user_turn"]
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_compaction_snapshot_tracks_sequence_and_reset_across_restart(tmp_path, restart):
+    path = str(tmp_path / "events.jsonl")
+    log = EventLog(path)
+    first = Wire("compaction", state="completed", reason="auto", context_tokens=123, at=10)
+    first_seq = log.append(first)
+    for number in range(1, 40):
+        turn(log, number, chunks=15)
+    if restart:
+        log.close()
+        log = EventLog(path)
+    try:
+        assert log.last_compaction == {"seq": first_seq, "event": first.to_wire()}
+        log.append(Wire("session_reset"))
+        assert log.last_compaction is None
+        log.close()
+        log = EventLog(path)
+        assert log.last_compaction is None
+        second = Wire("compaction", state="completed", reason="manual", context_tokens=42, at=20)
+        second_seq = log.append(second)
+        assert log.last_compaction == {"seq": second_seq, "event": second.to_wire()}
+        log.close()
+        log = EventLog(path)
+        assert log.last_compaction == {"seq": second_seq, "event": second.to_wire()}
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["compaction", "session_reset"])
+async def test_greeting_page_catches_compaction_change_after_hello(kind):
+    log = EventLog()
+    hello_seq = log.current_seq
+    event = Wire(kind, state="completed", reason="auto", context_tokens=123, at=10)
+    seq = log.append(event)
+    sock = Socket(hello(history_turns=20))
+    await ws_module._greet(sock, log, "tok", "s", hello_seq=hello_seq)
+    assert sock.sent[0]["events"] == [{"seq": seq, "event": event.to_wire()}]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("restart", [False, True])
 async def test_recent_and_older_pages_are_complete_ordered_and_nonoverlapping(tmp_path, restart):

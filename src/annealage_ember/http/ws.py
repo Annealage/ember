@@ -209,29 +209,33 @@ def register_ws(
             # can remain active while the backend itself is still ready.
             agent = session.agent_status() if session is not None else None
             agent = agent or session_info.get("agent", "unavailable")
-            await ws.send(
-                json.dumps(
-                    protocol.build_hello(
-                        event_log.current_seq,
-                        session_info["id"],
-                        session_info.get("sdk_session_id"),
-                        session_info["cwd"],
-                        agent,
-                        paused=bus.paused if bus is not None else False,
-                        model=session_info.get("model"),
-                        steers=session_info.get("steers", False),
-                        agent_error=session_info.get("agent_error"),
-                        usage=session_info.get("usage"),
-                        upload_actions=session_info.get("upload_actions"),
-                        models=session_info.get("models"),
-                        resolved_runtime=session_info.get("resolved_runtime"),
-                    )
-                )
+            greeting = protocol.build_hello(
+                event_log.current_seq,
+                session_info["id"],
+                session_info.get("sdk_session_id"),
+                session_info["cwd"],
+                agent,
+                paused=bus.paused if bus is not None else False,
+                model=session_info.get("model"),
+                steers=session_info.get("steers", False),
+                agent_error=session_info.get("agent_error"),
+                usage=session_info.get("usage"),
+                upload_actions=session_info.get("upload_actions"),
+                models=session_info.get("models"),
+                resolved_runtime=session_info.get("resolved_runtime"),
             )
+            # Capture this alongside the greeting's sequence, before the
+            # send can yield to an append. Catchup delivers later changes.
+            greeting["compaction"] = event_log.last_compaction
+            await ws.send(json.dumps(greeting))
             # The hello's token is checked only when the token opened the
             # socket: a page signed in by its tailnet login may hold none.
             hello = await _greet(
-                ws, event_log, token if human.login is None else None, session_info["id"]
+                ws,
+                event_log,
+                token if human.login is None else None,
+                session_info["id"],
+                hello_seq=greeting["seq"],
             )
             if hello is None:
                 return Response.already_handled
@@ -339,7 +343,7 @@ def _origin_is_allowed(req, allowed_origins):
     return origin in allowed_origins
 
 
-async def _greet(ws, event_log, token, session_id=None):
+async def _greet(ws, event_log, token, session_id=None, hello_seq=None):
     """Read the client's ``hello`` and answer it, before any writer exists.
 
     Returns the hello frame, or ``None`` if the connection was closed here, in
@@ -401,10 +405,10 @@ async def _greet(ws, event_log, token, session_id=None):
         if recent is not None and not reconnect:
             # Capture the fallback cursor before a worker can run. An
             # unavailable history must not accidentally trigger full replay.
-            fallback = event_log.history_pending()
+            fallback = event_log.history_pending(compaction_after=hello_seq)
             position = fallback.through
             try:
-                page = await event_log.history_async(limit=recent)
+                page = await event_log.history_async(limit=recent, compaction_after=hello_seq)
             except ValueError as exc:
                 await ws.send(
                     json.dumps(protocol.build_history_page(session_id, fallback, initial=True))
