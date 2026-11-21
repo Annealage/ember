@@ -52,6 +52,13 @@ def _in_flight(bus, holder) -> bool:
     return bool(holder is not None and holder.turn_in_flight())
 
 
+def is_steer(bus) -> bool:
+    """Whether a person's message joins the turn already running. A steer takes
+    no new authority: the running turn's generation, secret and ops stay as
+    they are."""
+    return bool(bus.hosted_turn_live and not bus.hosted_stopping)
+
+
 def install(bus, claims, *, now: Optional[float] = None) -> None:
     """Install the supervisor-revalidated job grant."""
     now = time.time() if now is None else now
@@ -104,10 +111,12 @@ def resume(bus) -> bool:
         return True
 
 
-def _admit_worker(bus, holder, caller_ops=None, principal=None) -> Optional[str]:
+def _admit_worker(bus, holder, caller_ops=None, principal=None, steer=False) -> Optional[str]:
     with bus.hosted_lock:
         if bus.hosted_fenced or bus.hosted_worker is None or bus.hosted_quiescing:
             return "this worker has no valid authority to start work"
+        if steer and is_steer(bus):
+            return None
         if _in_flight(bus, holder):
             return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
         bus.hosted_turn_principal = principal or bus.hosted_worker[0]
@@ -127,15 +136,19 @@ def _admit_claims(bus, holder, claims, *, collaborator, now):
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
     worker = bus.hosted_worker
-    if (
-        worker is None
-        or not isinstance(getattr(claims, "sub", None), str)
-        or not claims.sub
-        or (not collaborator and claims.sub != worker[0])
-        or tuple(getattr(claims, key, None) for key in ("wsp", "prj", "job")) != worker[1:4]
-        or "project.exec" not in claims.ops
-        or "project.exec" not in worker[4]
-    ):
+    scoped = (
+        worker is not None
+        and isinstance(getattr(claims, "sub", None), str)
+        and bool(claims.sub)
+        and tuple(getattr(claims, key, None) for key in ("wsp", "prj", "job")) == worker[1:4]
+        and "project.exec" in claims.ops
+        and "project.exec" in worker[4]
+    )
+    if scoped and is_steer(bus):
+        # Joining a running turn takes no authority, so any member of this
+        # project may steer it.
+        return _admit_worker(bus, holder, claims.ops, claims.sub, steer=True)
+    if not scoped or (not collaborator and claims.sub != worker[0]):
         return "your delegation does not authorise this worker's operations"
     return _admit_worker(bus, holder, claims.ops, claims.sub)
 
@@ -150,6 +163,8 @@ def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
     with bus.hosted_lock:
         if bus.hosted_fenced or getattr(bus, "hosted_quiescing", False):
             return "this worker has no valid authority to start work"
+        if is_steer(bus):
+            return None
         if _in_flight(bus, holder):
             return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
         bus.hosted_turn_principal = claims.sub

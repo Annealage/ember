@@ -820,9 +820,19 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
             await ws.send(json.dumps(protocol.build_refused(str(exc), frame.get("client_id"))))
             _note_turn(frame.get("client_id"), "refused:context")
             return
-    if bus is not None:
+    if bus is None:
+        await _submit_turn_locked(
+            ws, conn, registry, event_log, frame, session, bus, records, agent_blocks=agent_blocks
+        )
+        return
+    client_id = frame.get("client_id")
+    if client_id is not None and client_id in getattr(bus, "held_ids", ()):
+        _note_turn(client_id, "duplicate")
+        return
+
+    async def attempt(from_held):
         async with bus.turn_submission_lock:
-            await _submit_turn_locked(
+            return await _submit_turn_locked(
                 ws,
                 conn,
                 registry,
@@ -831,20 +841,63 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
                 session,
                 bus,
                 records,
+                hold_ok=True,
+                from_held=from_held,
                 agent_blocks=agent_blocks,
             )
-    else:
-        await _submit_turn_locked(
-            ws,
-            conn,
-            registry,
-            event_log,
-            frame,
-            session,
-            bus,
-            records,
-            agent_blocks=agent_blocks,
-        )
+
+    if await attempt(False) is _HOLD:
+        _note_turn(client_id, "held")
+        _hold_turn(attempt, bus, client_id)
+
+
+#: Returned by ``_submit_turn_locked`` for a message that cannot go yet.
+_HOLD = object()
+_HOLD_MARKERS = ("input queue is full", "wait for the active turn")
+_HOLD_ADMISSION = "still being worked on"
+_HOLD_POLL_SECONDS = 0.5
+
+
+def _holdable(reason, session, bus):
+    """Whether ``reason`` is a passing state (work that cannot take a message
+    now) rather than a fault in the agent."""
+    reader = getattr(bus, "manual_turn_refusal", None)
+    if callable(reader) and reader() == reason:
+        return True
+    automation_reader = getattr(session, "automation_metadata", None)
+    if callable(automation_reader):
+        automation = automation_reader()
+        if isinstance(automation, dict) and automation.get("inflight") is True:
+            return reason.startswith("Automatic continuation")
+    return any(marker in reason for marker in _HOLD_MARKERS)
+
+
+def _hold_turn(attempt, bus, client_id):
+    """Keep a message that cannot go yet, and send it in order once it can.
+    It waits on its own task so the connection keeps reading frames, an
+    interrupt among them."""
+    bus.held_turns = getattr(bus, "held_turns", 0) + 1
+    if not hasattr(bus, "held_ids"):
+        bus.held_ids = set()
+    if client_id is not None:
+        bus.held_ids.add(client_id)
+    previous = getattr(bus, "held_tail", None)
+
+    async def run():
+        try:
+            if previous is not None:
+                await asyncio.wait({previous})
+            while True:
+                await asyncio.sleep(_HOLD_POLL_SECONDS)
+                if await attempt(True) is not _HOLD:
+                    return
+        finally:
+            bus.held_turns -= 1
+            bus.held_ids.discard(client_id)
+
+    task = asyncio.ensure_future(run())
+    bus.held_tail = task
+    task.add_done_callback(_report_dispatch_failure)
 
 
 def _serve_dir(session, bus):
@@ -891,6 +944,8 @@ async def _submit_turn_locked(
     bus,
     records=None,
     *,
+    hold_ok=False,
+    from_held=False,
     on_admitted=None,
     agent_blocks=None,
     hosted_collaborator=False,
@@ -950,6 +1005,15 @@ async def _submit_turn_locked(
     blocked_reason = (
         turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)
     )
+    if hold_ok and bus is not None and not defer:
+        # A message is never refused for arriving at a bad moment: while the
+        # agent is busy with work that cannot take it (an automatic
+        # continuation, a full input queue, a turn still stopping) or earlier
+        # messages are waiting, it is held and sent in order.
+        if (blocked_reason is not None and _holdable(blocked_reason, session, bus)) or (
+            not from_held and getattr(bus, "held_turns", 0)
+        ):
+            return _HOLD
     if blocked_reason is not None:
         _note_turn(client_id, "refused:%s" % blocked_reason)
         await ws.send(json.dumps(protocol.build_refused(str(blocked_reason), client_id)))
@@ -964,8 +1028,11 @@ async def _submit_turn_locked(
         admit = (
             hosted_authority.admit_collaborator if hosted_collaborator else hosted_authority.admit
         )
+        steering = hosted_authority.is_steer(bus)
         refusal = admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
+            if hold_ok and _HOLD_ADMISSION in refusal:
+                return _HOLD
             _note_turn(client_id, "refused:%s" % refusal)
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
             return
@@ -975,7 +1042,7 @@ async def _submit_turn_locked(
         if on_admitted is not None:
             on_admitted()
     except BaseException:
-        if hosted_generation is not None:
+        if hosted_generation is not None and not steering:
             hosted_authority.abandon_admission(bus, hosted_generation)
         raise
     if hosted_generation is not None:

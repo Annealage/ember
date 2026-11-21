@@ -272,7 +272,9 @@ async def test_verified_collaborator_handover_keeps_actor_and_cannot_expand_work
         await app.agent_stop()
 
 
-async def test_another_principals_turn_is_refused_and_changes_nothing(served_dir, tmp_path_factory):
+async def test_another_principals_message_steers_the_running_turn_without_new_authority(
+    served_dir, tmp_path_factory
+):
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
     app = hosted.app
     await app.agent_start()
@@ -284,14 +286,14 @@ async def test_another_principals_turn_is_refused_and_changes_nothing(served_dir
         assert before[0] == PRINCIPAL and bus.hosted_turn_live
 
         await _send(app, "bob", "second", client_id="c-2")
-        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first"]
+        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first", "second"]
         assert (bus.hosted_turn_principal, bus.hosted_turn_ops, bus.hosted_turn_secret) == before
-        assert [w["client_id"] for w in _logged(app, "user_turn")] == ["c-1"]
+        assert [w["client_id"] for w in _logged(app, "user_turn")] == ["c-1", "c-2"]
     finally:
         await app.agent_stop()
 
 
-async def test_the_owner_cannot_queue_or_steer_behind_their_own_running_turn(
+async def test_the_owner_can_steer_their_own_running_turn_without_new_authority(
     served_dir, tmp_path_factory
 ):
     hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
@@ -299,9 +301,13 @@ async def test_the_owner_cannot_queue_or_steer_behind_their_own_running_turn(
     await app.agent_start()
     try:
         await _send(app, "alice", "first")
+        bus = app.agent_bus
+        before = (bus.hosted_turn_generation, bus.hosted_turn_secret, bus.hosted_turn_ops)
         await _send(app, "alice", "steer", client_id="c-2")
         (session,) = hosted.sessions
-        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first"]
+        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first", "steer"]
+        assert (bus.hosted_turn_generation, bus.hosted_turn_secret, bus.hosted_turn_ops) == before
+        assert bus.hosted_turn_live
     finally:
         await app.agent_stop()
 

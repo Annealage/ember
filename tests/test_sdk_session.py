@@ -740,7 +740,7 @@ async def test_submit_turn_sends_the_turn_to_the_real_client():
 
 
 @pytest.mark.asyncio
-async def test_an_active_sdk_turn_refuses_browser_input_without_consuming_notes_or_number():
+async def test_an_active_sdk_turn_holds_browser_input_until_it_can_go_in_order():
     from annealage_ember.http import ws as ws_module
     from annealage_ember.session.events import EventLog
     from annealage_ember.viewers import ViewerBus
@@ -772,7 +772,7 @@ async def test_an_active_sdk_turn_refuses_browser_input_without_consuming_notes_
         await submit("first", "c1")
         bus.queue_note("Keep this until the next accepted turn.")
         await submit("busy", "c2")
-        assert [(frame["type"], frame.get("client_id")) for frame in sent] == [("refused", "c2")]
+        assert sent == []
         assert bus.turn == 1
         assert [event["turn"] for _seq, event in log.replay(0).events] == [1]
         assert [
@@ -781,12 +781,50 @@ async def test_an_active_sdk_turn_refuses_browser_input_without_consuming_notes_
 
         transport.push(_result(0.01))
         await _turn_end_and_usage(recorder)
-        await submit("next", "c3")
+        await asyncio.sleep(1.0)
+        assert sent == []
         assert bus.turn == 2
-        assert (
-            "Keep this until the next accepted turn."
-            in (transport.written[-1]["message"]["content"][0]["text"])
+        sent_text = json.dumps(transport.written[-1]["message"]["content"])
+        assert "Keep this until the next accepted turn." in sent_text and "busy" in sent_text
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_product_hold_queues_browser_input_and_releases_it_when_cleared():
+    from annealage_ember.http import ws as ws_module
+    from annealage_ember.session.events import EventLog
+    from annealage_ember.viewers import ViewerBus
+
+    session, transport, _recorder = await _started_session()
+    bus, log = ViewerBus(None, url="http://127.0.0.1/"), EventLog()
+    sent = []
+    busy = ["Automatic continuation is active; wait."]
+    bus.manual_turn_refusal = lambda: busy[0]
+
+    class Socket:
+        async def send(self, payload):
+            sent.append(json.loads(payload))
+
+    class Registry:
+        async def broadcast(self, frame):
+            pass
+
+    try:
+        await ws_module._submit_turn(
+            Socket(),
+            SimpleNamespace(tab_id="tab", human=None),
+            Registry(),
+            log,
+            {"blocks": [{"type": "text", "text": "hi"}], "client_id": "c1"},
+            session,
+            bus,
         )
+        await asyncio.sleep(0.8)
+        assert sent == [] and bus.turn == 0
+        busy[0] = None
+        await asyncio.sleep(1.0)
+        assert sent == [] and bus.turn == 1
     finally:
         await session.close()
 
