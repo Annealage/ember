@@ -327,6 +327,7 @@ from omp_rpc import host_tool
 from omp_rpc.client import RpcCommandError, RpcTimeoutError
 
 from .. import hosted_authority, hosted_state, observability, product
+from ..refusal import Busy
 from ..tools import host_tool_name
 from . import logfiles, turn_images
 from .base import (
@@ -787,7 +788,7 @@ class OmpSession:
         if self._profile_status and self._profile_status["status"] == "error":
             return "model profile could not be applied; restart the session"
         if (self._running or self._input_queue) and len(self._input_queue) >= 8:
-            return "input queue is full; wait for a queued turn to finish"
+            return Busy("input queue is full; wait for a queued turn to finish")
         return None
 
     def automation_metadata(self) -> dict:

@@ -90,6 +90,7 @@ from claude_agent_sdk.types import (
 )
 
 from .. import product
+from ..refusal import Busy
 from . import logfiles, secret_paths, turn_images, workspace_trust
 from .base import (
     AGENT_CONNECTING,
@@ -701,11 +702,11 @@ class SdkSession:
     def turn_refusal(self) -> Optional[str]:
         """Expose manual-turn admission before the caller counts or logs it."""
         if self._closing:
-            return "SDK session is closing; this turn was not sent"
+            return Busy("SDK session is closing; this turn was not sent")
         if self._submission_lock.locked() or (
             self._active_turn is not None and not self._active_turn.done()
         ):
-            return "wait for the active turn to finish before submitting another"
+            return Busy("wait for the active turn to finish before submitting another")
         return None
 
     async def submit_turn(self, blocks: list, viewer: Optional[str] = None) -> None:

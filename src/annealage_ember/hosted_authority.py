@@ -15,6 +15,8 @@ import secrets
 import time
 from typing import Optional
 
+from .refusal import Busy
+
 #: The generation of the grant the running task was admitted under. A grant's
 #: number is its own: a send stamped with an older one is never made under a
 #: newer grant, whoever holds that.
@@ -40,6 +42,9 @@ def fenced_out() -> bool:
         return False
     bus, generation = fence
     return bus.hosted_cancel_generation != generation
+
+
+_IN_FLIGHT = "your previous message is still being worked on, so this one was not sent"
 
 
 def _in_flight(bus, holder) -> bool:
@@ -113,12 +118,14 @@ def resume(bus) -> bool:
 
 def _admit_worker(bus, holder, caller_ops=None, principal=None, steer=False) -> Optional[str]:
     with bus.hosted_lock:
-        if bus.hosted_fenced or bus.hosted_worker is None or bus.hosted_quiescing:
+        if bus.hosted_fenced or bus.hosted_worker is None:
             return "this worker has no valid authority to start work"
+        if bus.hosted_quiescing:
+            return Busy("this worker is being checkpointed")
         if steer and is_steer(bus):
             return None
         if _in_flight(bus, holder):
-            return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
+            return Busy(_IN_FLIGHT)
         bus.hosted_turn_principal = principal or bus.hosted_worker[0]
         bus.hosted_turn_generation += 1
         GENERATION.set(bus.hosted_turn_generation)
@@ -161,12 +168,14 @@ def admit(bus, holder, claims, *, now: Optional[float] = None) -> Optional[str]:
     if claims is None or now >= claims.exp:
         return "your access to this project has expired, so this message was not sent"
     with bus.hosted_lock:
-        if bus.hosted_fenced or getattr(bus, "hosted_quiescing", False):
+        if bus.hosted_fenced:
             return "this worker has no valid authority to start work"
+        if getattr(bus, "hosted_quiescing", False):
+            return Busy("this worker is being checkpointed")
         if is_steer(bus):
             return None
         if _in_flight(bus, holder):
-            return "your previous message is still being worked on, so this one was not sent; wait for it to finish"
+            return Busy(_IN_FLIGHT)
         bus.hosted_turn_principal = claims.sub
         bus.hosted_turn_generation += 1
         GENERATION.set(bus.hosted_turn_generation)

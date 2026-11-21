@@ -35,6 +35,7 @@ from microdot.websocket import WebSocket, WebSocketError, websocket_upgrade
 
 from .. import hosted_authority, observability, protocol, turn_context
 from ..hosted_state import attribution
+from ..refusal import Busy
 from ..session.base import (
     AGENT_CONNECTING,
     AGENT_READY,
@@ -835,6 +836,17 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
         return
 
     async def attempt(from_held):
+        held_session = session
+        if from_held:
+            # The session a message was first meant for may have been closed
+            # (idle close, replacement) while it waited: ask the holder, which
+            # opens a new one.
+            holder = getattr(bus, "agent_holder", None)
+            if holder is not None:
+                await holder.ensure(retry=True)
+                held_session = holder.session
+                if held_session is None:
+                    return _HOLD
         async with bus.turn_submission_lock:
             return await _submit_turn_locked(
                 ws,
@@ -842,7 +854,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
                 registry,
                 event_log,
                 frame,
-                session,
+                held_session,
                 bus,
                 records,
                 hold_ok=True,
@@ -857,23 +869,7 @@ async def _submit_turn(ws, conn, registry, event_log, frame, session, bus, recor
 
 #: Returned by ``_submit_turn_locked`` for a message that cannot go yet.
 _HOLD = object()
-_HOLD_MARKERS = ("input queue is full", "wait for the active turn")
-_HOLD_ADMISSION = "still being worked on"
 _HOLD_POLL_SECONDS = 0.5
-
-
-def _holdable(reason, session, bus):
-    """Whether ``reason`` is a passing state (work that cannot take a message
-    now) rather than a fault in the agent."""
-    reader = getattr(bus, "manual_turn_refusal", None)
-    if callable(reader) and reader() == reason:
-        return True
-    automation_reader = getattr(session, "automation_metadata", None)
-    if callable(automation_reader):
-        automation = automation_reader()
-        if isinstance(automation, dict) and automation.get("inflight") is True:
-            return reason.startswith("Automatic continuation")
-    return any(marker in reason for marker in _HOLD_MARKERS)
 
 
 def _hold_turn(attempt, bus, client_id):
@@ -918,11 +914,14 @@ def turn_refusal(session, bus=None, *, starting_ok=False):
     the turn, because the caller keeps it until the session is ready."""
     refusal_reader = getattr(bus, "manual_turn_refusal", None)
     blocked_reason = refusal_reader() if callable(refusal_reader) else None
+    if blocked_reason is not None:
+        # A product's gate is a passing state: it says when to wait.
+        blocked_reason = Busy(blocked_reason)
     automation_reader = getattr(session, "automation_metadata", None)
     if blocked_reason is None and callable(automation_reader):
         automation = automation_reader()
         if isinstance(automation, dict) and automation.get("inflight") is True:
-            blocked_reason = (
+            blocked_reason = Busy(
                 "Automatic continuation is active; pause it or wait before sending a message."
             )
     admission_reader = getattr(session, "turn_refusal", None)
@@ -1014,7 +1013,7 @@ async def _submit_turn_locked(
         # agent is busy with work that cannot take it (an automatic
         # continuation, a full input queue, a turn still stopping) or earlier
         # messages are waiting, it is held and sent in order.
-        if (blocked_reason is not None and _holdable(blocked_reason, session, bus)) or (
+        if isinstance(blocked_reason, Busy) or (
             not from_held and getattr(bus, "held_turns", 0)
         ):
             return _HOLD
@@ -1035,7 +1034,7 @@ async def _submit_turn_locked(
         steering = hosted_authority.is_steer(bus)
         refusal = admit(bus, holder, conn.human.hosted_claims)
         if refusal is not None:
-            if hold_ok and _HOLD_ADMISSION in refusal:
+            if hold_ok and isinstance(refusal, Busy):
                 return _HOLD
             _note_turn(client_id, "refused:%s" % refusal)
             await ws.send(json.dumps(protocol.build_refused(refusal, client_id)))
