@@ -75,9 +75,11 @@ def safe_context(raw, default_project):
 class RemoteActionStore:
     """Atomic project-scoped records preventing blind replay of remote writes."""
 
-    def __init__(self, path, *, project_id, session=None):
+    def __init__(self, path, *, project_id, session=None, recover_local_pids=True, writer_id=None):
         self.path = Path(path)
         self.project = project_hash(project_id)
+        self._recover_local_pids = recover_local_pids
+        self._writer_id = writer_id
         self.session = str(session) if session is not None else None
         self._lock_path = self.path.with_name(self.path.name + ".lock")
         self._thread_lock = threading.RLock()
@@ -233,6 +235,8 @@ class RemoteActionStore:
             raise OSError("remote action ledger is full of unresolved records")
 
     def _recover_abandoned(self):
+        if not self._recover_local_pids:
+            return
         changed = False
         for row in self._records:
             if row["phase"] in ("preparing", "dispatching") and not _pid_alive(
@@ -246,6 +250,29 @@ class RemoteActionStore:
                 changed = True
         if changed:
             self._save()
+
+    def recover_stopped_predecessors(self):
+        """Settle in-flight rows after the host proves all predecessor writers stopped.
+
+        Only a newly admitted exclusive writer may call this. Rows owned by
+        the current writer are left alone, even if admission is repeated.
+        PID liveness is not proof across process namespaces.
+        """
+        if not isinstance(self._writer_id, str) or not self._writer_id:
+            raise ValueError("current writer identity is required")
+        with self._locked():
+            self._refresh()
+            changed = False
+            for row in self._records:
+                if (
+                    row["phase"] in ("preparing", "dispatching")
+                    and row.get("writer_id") != self._writer_id
+                ):
+                    row["outcome"] = "uncertain" if row["phase"] == "dispatching" else "not_sent"
+                    row["phase"] = "finished"
+                    changed = True
+            if changed:
+                self._save()
 
     def _latest(self, intent_key):
         return next(
@@ -276,6 +303,7 @@ class RemoteActionStore:
                 "phase": "preparing",
                 "owner": self._owner,
                 "owner_pid": os.getpid(),
+                "writer_id": self._writer_id,
             }
             self._records.append(row)
             self._save()
@@ -301,6 +329,13 @@ class RemoteActionStore:
         if outcome not in ("not_sent", "reported_result", "uncertain"):
             raise ValueError("invalid remote action outcome")
         return self._transition(invocation, outcome=outcome, phase="finished")
+
+    def invocation(self, invocation_id):
+        """Return one exact durable invocation, or None when it is unavailable."""
+        with self._locked():
+            self._refresh()
+            row = next((r for r in self._records if r["id"] == invocation_id), None)
+            return dict(row) if row is not None else None
 
     def blocked(self, server, tool, arguments, *, context=None):
         """Whether intent is in flight/uncertain; authority changes don't alter its identity."""

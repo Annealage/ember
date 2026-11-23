@@ -81,6 +81,7 @@ never reaches the model. Without a projector delivery is unchanged.
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import dataclasses
 import hashlib
@@ -109,6 +110,19 @@ from .tools import (
     host_tool_name,
     namespaced,
 )
+
+_INVOCATION_OBSERVER = contextvars.ContextVar("remote_invocation_observer", default=None)
+
+
+@contextlib.contextmanager
+def invocation_observer(callback):
+    """Bind this task's durable receipt before a remote write may dispatch."""
+    token = _INVOCATION_OBSERVER.set(callback)
+    try:
+        yield
+    finally:
+        _INVOCATION_OBSERVER.reset(token)
+
 
 #: How long connecting, ``initialize``, the ``prime`` call and ``list_tools``
 #: may take together for one remote at startup. Remotes are reached
@@ -688,6 +702,14 @@ async def call(
             return fail(
                 "remote write refused: durable action ledger could not reserve it; nothing was sent"
             )
+        observer = _INVOCATION_OBSERVER.get()
+        if observer is not None:
+            try:
+                observer(server.name, name, dict(blocked or invocation), bool(blocked))
+            except BaseException:
+                if invocation is not None:
+                    action_store.outcome(invocation, "not_sent")
+                raise
         if blocked:
             _record_stage("policy", "rejected")
             return fail(

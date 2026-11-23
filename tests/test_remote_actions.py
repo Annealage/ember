@@ -146,3 +146,34 @@ def test_real_context_keeps_opaque_project_hash_and_integer_epoch():
     )
     assert unknown["context_verified"] is False
     assert unknown["source_manifest"] == "UNKNOWN"
+
+
+def test_host_fence_recovers_predecessors_without_pid_namespace_guesses(tmp_path):
+    path = tmp_path / "actions.json"
+    first = RemoteActionStore(path, project_id="project", recover_local_pids=False, writer_id="old")
+    preparing, _ = first.begin(
+        "datum", "submit", {"question": "a"}, source="agent", context=CONTEXT
+    )
+    dispatching, _ = first.begin(
+        "datum", "submit", {"question": "b"}, source="agent", context=CONTEXT
+    )
+    first.dispatching(dispatching)
+    replacement = RemoteActionStore(
+        path, project_id="project", recover_local_pids=False, writer_id="new"
+    )
+    assert replacement.blocked("datum", "submit", {"question": "a"})["phase"] == "preparing"
+    assert replacement.blocked("datum", "submit", {"question": "b"})["phase"] == "dispatching"
+    replacement.recover_stopped_predecessors()
+    replacement.recover_stopped_predecessors()
+    assert replacement.blocked("datum", "submit", {"question": "a"}) is None
+    uncertain = replacement.blocked("datum", "submit", {"question": "b"})
+    assert uncertain["id"] == dispatching["id"]
+    assert uncertain["phase"] == "finished"
+    assert uncertain["outcome"] == "uncertain"
+    rows = {row["id"]: row for row in replacement.status()}
+    assert rows[preparing["id"]]["outcome"] == "not_sent"
+    own, _ = replacement.begin(
+        "datum", "submit", {"question": "c"}, source="agent", context=CONTEXT
+    )
+    replacement.recover_stopped_predecessors()
+    assert replacement.blocked("datum", "submit", {"question": "c"})["id"] == own["id"]

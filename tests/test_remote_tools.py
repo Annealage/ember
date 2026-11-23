@@ -1054,6 +1054,29 @@ async def test_connection_failure_leaves_write_retryable(fake, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_invocation_observer_binds_before_connection_and_failure(tmp_path):
+    from annealage_ember.remote_actions import RemoteActionStore
+
+    server = RemoteServer("fake", "http://127.0.0.1:1/mcp", FAKE_GRADING)
+    store = RemoteActionStore(tmp_path / "actions.json", project_id="project")
+    observed = []
+    with remote_module.invocation_observer(
+        lambda server, tool, invocation, blocked: observed.append(invocation["id"])
+    ):
+        result = await remote_module.call(server, "store", {"text": "a"}, action_store=store)
+    assert result["is_error"]
+    assert store.invocation(observed[0])["outcome"] == "not_sent"
+
+    def refuse_binding(server, tool, invocation, blocked):
+        raise RuntimeError("receipt unavailable")
+
+    with remote_module.invocation_observer(refuse_binding):
+        with pytest.raises(RuntimeError, match="receipt unavailable"):
+            await remote_module.call(server, "store", {"text": "b"}, action_store=store)
+    assert store.status()[-1]["outcome"] == "not_sent"
+
+
+@pytest.mark.asyncio
 async def test_changed_approved_authority_context_refuses_remote_dispatch(fake, tmp_path):
     from annealage_ember.remote_actions import RemoteActionStore
 
