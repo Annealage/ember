@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import pytest
 from conftest import create_toy_app, make_test_client
@@ -290,6 +291,7 @@ async def test_a_second_open_of_the_same_project_is_refused_until_the_first_clos
         assert len(first_built) == 1 and second_built == []
         assert second.agent_status()["agent"] == "closed"
         errors = [e for e in _logged(second, "agent_error") if "already" in e["stderr"]]
+        assert "already" in second.agent_holder.lifecycle_error
         assert errors
 
         await second.agent_holder.ensure(retry=True)
@@ -297,10 +299,74 @@ async def test_a_second_open_of_the_same_project_is_refused_until_the_first_clos
 
         await first.agent_stop()
         await second.agent_holder.ensure(retry=True)
+        assert second.agent_holder.lifecycle_error is None
         assert len(second_built) == 1
     finally:
         await first.agent_stop()
         await second.agent_stop()
+
+
+async def test_recovery_claim_does_not_block_loop_and_notifies_failure(served_dir, monkeypatch):
+    built = []
+    app = _app(served_dir, built, start_closed=True, idle_timeout=None)
+    entered, proceed = threading.Event(), threading.Event()
+    changes = []
+    app.agent_holder.status_listeners.append(lambda: changes.append(app.agent_holder.status()))
+
+    def blocked_claim():
+        entered.set()
+        if not proceed.wait(5):
+            raise RuntimeError("claim was not released")
+        raise agent_lock.AgentRecoveryError("signal denied")
+
+    monkeypatch.setattr(app.agent_holder._agent_lock, "acquire", blocked_claim)
+    task = asyncio.create_task(app.agent_holder.ensure(retry=True))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        # Reaching here while acquire is blocked proves the loop is available.
+        assert not task.done()
+        proceed.set()
+        await task
+        assert not built
+        assert changes[-1]["lifecycle_error"] == "signal denied"
+        assert app.agent_holder.status()["lifecycle_error"] == "signal denied"
+    finally:
+        proceed.set()
+        await app.agent_stop()
+
+
+async def test_repeated_cancellation_waits_for_claim_and_releases_it(served_dir, monkeypatch):
+    app = _app(served_dir, [], start_closed=True, idle_timeout=None)
+    entered, proceed = threading.Event(), threading.Event()
+    lock = app.agent_holder._agent_lock
+    acquire = lock.acquire
+
+    def blocked_claim():
+        entered.set()
+        if not proceed.wait(5):
+            raise RuntimeError("claim was not released")
+        acquire()
+
+    monkeypatch.setattr(lock, "acquire", blocked_claim)
+    task = asyncio.create_task(app.agent_holder.ensure(retry=True))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not lock.held
+        other = agent_lock.AgentLock(lock.path.parent)
+        other.acquire()
+        other.release()
+    finally:
+        proceed.set()
+        await app.agent_stop()
 
 
 async def test_a_live_holder_refuses_the_lock_and_a_dead_ones_does_not(tmp_path):

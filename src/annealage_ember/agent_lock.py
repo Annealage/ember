@@ -8,12 +8,11 @@ would both write to the same omp session directory.
 An exclusive ``flock`` on the file is the lock. It belongs to the open file
 description, so it is released the moment its holder dies however it died (a
 SIGKILL after a stop timeout included): a leftover lock file never blocks
-anything. What a SIGKILLed server can leave behind is its agent child, which
-``flock`` knows nothing about, so the holder also records the child it started
-(pid, kernel start time and command line) in the file. The next ``acquire``
-finds that record, and if the process is still the same one it ends it before
-the new agent starts, rather than failing the open. A recorded pid that is dead,
-or has been reused by some other process, is left alone.
+anything. What a SIGKILLed server can leave behind is its agent child, so the
+holder records its pid, kernel start time and command line. A successor stops
+the matching process, including its process group when it is a dedicated group,
+before opening another agent. Failed termination leaves the record intact and
+the claim retryable. A reused pid is left alone.
 
 Linux ``/proc`` is how a process is recognised; where it is not there the
 record cannot be checked, and an orphan is then left alone rather than guessed
@@ -31,6 +30,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .lock import _boot_id
+
 #: Seconds an orphaned agent is given to exit after SIGTERM before SIGKILL.
 ORPHAN_GRACE = 3.0
 
@@ -45,6 +46,10 @@ class AgentAlreadyOpen(Exception):
             "another process%s already has an agent open for this project"
             % (" (pid %d)" % owner if owner else "")
         )
+
+
+class AgentRecoveryError(Exception):
+    """A recorded agent could not be stopped; retrying the claim is safe."""
 
 
 def _identity(pid: int) -> Optional[dict]:
@@ -66,21 +71,59 @@ def _identity(pid: int) -> Optional[dict]:
     return {"pid": pid, "start": start, "cmd": command}
 
 
-def _end_process(pid: int) -> None:
-    """SIGTERM, then SIGKILL after ``ORPHAN_GRACE``; never raises."""
-    for sig, wait in ((signal.SIGTERM, ORPHAN_GRACE), (signal.SIGKILL, 1.0)):
+def _group_alive(pgid: int) -> bool:
+    """Whether a dedicated process group still contains non-zombie processes."""
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
         try:
-            os.kill(pid, sig)
+            with open("/proc/%s/stat" % name, "rb") as stat:
+                raw = stat.read().decode("utf-8", "replace")
+            fields = raw[raw.rindex(")") + 2 :].split()
+            if fields[0] != "Z" and int(fields[2]) == pgid:
+                return True
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, IndexError) as exc:
+            raise AgentRecoveryError("could not inspect agent process group: %s" % exc) from exc
+    return False
+
+
+def _end_process(agent: dict) -> bool:
+    """Stop the identified agent/group; return whether a signal was sent."""
+    pid = agent["pid"]
+    pgid = agent.get("pgid")
+    group = pgid == pid
+
+    def alive():
+        if group:
+            return _group_alive(pgid)
+        live = _identity(pid)
+        return live is not None and live["start"] == agent["start"] and live["cmd"] == agent["cmd"]
+
+    signalled = False
+    for sig, wait in ((signal.SIGTERM, ORPHAN_GRACE), (signal.SIGKILL, 1.0)):
+        if not alive():
+            return signalled
+        try:
+            if group:
+                os.killpg(pgid, sig)
+            else:
+                os.kill(pid, sig)
+            signalled = True
         except ProcessLookupError:
-            return
+            if not alive():
+                return signalled
         except OSError as exc:
-            sys.stderr.write("warning: could not signal agent process %d: %r\n" % (pid, exc))
-            return
+            raise AgentRecoveryError("could not signal agent process %d: %s" % (pid, exc)) from exc
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if _identity(pid) is None:
-                return
+            if not alive():
+                return signalled
             time.sleep(0.05)
+    if alive():
+        raise AgentRecoveryError("agent process %d did not stop" % pid)
+    return signalled
 
 
 class AgentLock:
@@ -109,17 +152,34 @@ class AgentLock:
             raise AgentAlreadyOpen(owner if isinstance(owner, int) else None) from None
         self._fd = fd
         self.reaped = None
-        agent = self._read(fd).get("agent")
-        if isinstance(agent, dict):
-            live = _identity(agent.get("pid")) if isinstance(agent.get("pid"), int) else None
-            if (
-                live is not None
-                and live["start"] == agent.get("start")
-                and live["cmd"] == agent.get("cmd")
-            ):
-                self.reaped = live["pid"]
-                _end_process(live["pid"])
-        self._write({"pid": os.getpid()})
+        try:
+            agent = self._read(fd).get("agent")
+            if isinstance(agent, dict) and isinstance(agent.get("pid"), int):
+                current_boot = _boot_id()
+                old_boot = agent.get("boot")
+                same_boot = not old_boot or not current_boot or old_boot == current_boot
+                live = _identity(agent["pid"]) if same_boot else None
+                same = (
+                    live is not None
+                    and live["start"] == agent.get("start")
+                    and live["cmd"] == agent.get("cmd")
+                )
+                # A dedicated group can outlive its leader. A reused live
+                # leader, however, is never evidence of the old group.
+                orphaned_group = (
+                    same_boot
+                    and live is None
+                    and agent.get("pgid") == agent["pid"]
+                    and isinstance(agent.get("start"), int)
+                    and isinstance(agent.get("cmd"), str)
+                )
+                if (same or orphaned_group) and _end_process(agent):
+                    self.reaped = agent["pid"]
+            self._write({"pid": os.getpid()})
+        except BaseException:
+            self._fd = None
+            os.close(fd)
+            raise
 
     def record_agent(self, pid) -> None:
         """Note the agent child just started, so a successor can end it if this
@@ -127,17 +187,22 @@ class AgentLock:
         if self._fd is None or not isinstance(pid, int):
             return
         identity = _identity(pid)
+        if identity is not None:
+            identity["boot"] = _boot_id()
+            try:
+                if os.getpgid(pid) == pid:
+                    identity["pgid"] = pid
+            except ProcessLookupError:
+                pass
         self._write({"pid": os.getpid(), **({"agent": identity} if identity else {})})
 
     def release(self) -> None:
         if self._fd is None:
             return
-        try:
-            # The agent is closed (or being), so there is nothing left to reap.
-            self._write({"pid": os.getpid()})
-        finally:
-            fd, self._fd = self._fd, None
-            os.close(fd)
+        # Keep the record until the next claim confirms the process is gone.
+        # Session.close() may fail or leave descendants behind.
+        fd, self._fd = self._fd, None
+        os.close(fd)
 
     @staticmethod
     def _read(fd) -> dict:

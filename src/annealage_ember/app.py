@@ -50,8 +50,9 @@ from . import (
     uploads,
 )
 from . import settings as settings_module
-from .agent_lock import AgentAlreadyOpen, AgentLock
+from .agent_lock import AgentAlreadyOpen, AgentLock, AgentRecoveryError
 from .hosted_state import SessionEvents, StateRecorder, UsageRecorder
+from .http import turn_inbox
 from .http.routes_chat import register_chat_routes, register_upload_action_route
 from .http.routes_login import LoginNonces, register_login_routes, register_whoami_route
 from .http.routes_logs import register_log_routes
@@ -60,7 +61,6 @@ from .http.routes_provider_login import register_provider_login_routes
 from .http.routes_review import register_review_routes
 from .http.routes_session import register_session_routes
 from .http.routes_settings import register_settings_routes
-from .http import turn_inbox
 from .http.static import register_agent_static_routes
 from .http.ws import host_is_allowed, ping_forever, refusal, register_ws
 from .identity import HOSTED_OPERATIONS, BrowserAuth, HostedVerifier, check_bind
@@ -1553,6 +1553,7 @@ class AgentHolder:
         self._deferred = []
         self._drain_task = None
         self._agent_lock = agent_lock
+        self.lifecycle_error = None
         #: Inputs an earlier run accepted but never delivered, found in the
         #: event log at build time: ``[(old turn, UserTurn fields)]``. The app
         #: re-sends them once started (``redeliver``).
@@ -1627,7 +1628,7 @@ class AgentHolder:
                 if self._stopped:
                     pass
                 elif self.closed:
-                    self._resume()
+                    await self._resume()
                 elif retry and self._down and self._retry_with is not None:
                     await self._replace_down()
         start = self._start_task
@@ -1663,9 +1664,9 @@ class AgentHolder:
         self._release_lock()
         _end_unfinished_turns(self._publish, self._turns)
         self._turns.clear()
-        self._resume()
+        await self._resume()
 
-    def _resume(self):
+    async def _resume(self):
         # Only browser-controlled sessions replay a human's old model.
         # Policy-managed factories select the current model themselves.
         wanted = self._session_info.get("model") if self._restore_model_on_resume else None
@@ -1676,7 +1677,11 @@ class AgentHolder:
             # down session) ends here: none may while the old process could live.
             sys.stderr.write("error: the agent worker is fenced; not opening a new session\n")
             return
-        if not self._claim():
+        if not await self._claim_async():
+            return
+        # Authority can change while the blocking orphan recovery runs.
+        if self._stopped or getattr(self.bus, "hosted_quiescing", False) or self._fenced():
+            self._release_lock()
             return
         try:
             session = self._make_session(self._reopen_with)
@@ -1795,16 +1800,55 @@ class AgentHolder:
             return True
         try:
             self._agent_lock.acquire()
-        except AgentAlreadyOpen as exc:
+        except (AgentAlreadyOpen, AgentRecoveryError) as exc:
+            return self._claim_result(exc)
+        return self._claim_result()
+
+    async def _claim_async(self):
+        """Acquire off the event loop while the holder's lifecycle lock is held."""
+        if self._agent_lock is None:
+            return True
+        task = asyncio.create_task(asyncio.to_thread(self._agent_lock.acquire))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Keep the lifecycle lock until it
+            # finishes, even if another cancellation arrives while waiting.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                task.result()
+            except Exception:
+                pass
+            else:
+                self._agent_lock.release()
+            raise
+        except (AgentAlreadyOpen, AgentRecoveryError) as exc:
+            return self._claim_result(exc)
+        return self._claim_result()
+
+    def _claim_result(self, exc=None):
+        if exc is not None:
+            self.lifecycle_error = str(exc)
             sys.stderr.write("error: could not open the agent session: %s\n" % (exc,))
             self._publish(
                 AgentError(
                     stderr=str(exc),
-                    remediation="the agent is already running in another process for this "
-                    "project; stop that one first",
+                    remediation=(
+                        "the agent is already running in another process for this project; stop that one first"
+                        if isinstance(exc, AgentAlreadyOpen)
+                        else "the previous agent could not be stopped; resolve the error and retry"
+                    ),
                 )
             )
+            self._note_change(active=False)
             return False
+        self.lifecycle_error = None
         if self._agent_lock.reaped is not None:
             sys.stderr.write(
                 "warning: ended an orphaned agent process (pid %d) left by a previous run\n"
@@ -1974,7 +2018,7 @@ class AgentHolder:
             if self._stopped:
                 return False
             if self.closed:
-                self._resume()
+                await self._resume()
                 return self.session is not None
             if self._down and self._retry_with is not None:
                 await self._replace_down()
@@ -2258,6 +2302,7 @@ class AgentHolder:
             "attention": self._attention,
             "last_activity": self._last_activity,
             "viewers": self._viewers,
+            "lifecycle_error": self.lifecycle_error,
             # Read from the live process, never from the last logged status.
             "pid": None if agent == AGENT_CLOSED else getattr(self.session, "process_id", None),
         }
