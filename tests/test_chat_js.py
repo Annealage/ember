@@ -1095,7 +1095,7 @@ def test_a_message_is_a_row_marked_sending_from_the_moment_of_sending(observed):
             "text": "first",
             "mark": "Not sent ",
             "markTitle": "the agent is connecting, so this message was not sent",
-            "retry": ["Retry"],
+            "retry": ["Retry", "Dismiss"],
         }
     ]
     assert observed["refusedStates"] == ["failed"]
@@ -1151,7 +1151,7 @@ def test_a_message_still_unanswered_after_its_resend_goes_back_with_a_not_sent_r
             "text": "lost one",
             "mark": "Not sent ",
             "markTitle": "The connection dropped before it arrived",
-            "retry": ["Retry"],
+            "retry": ["Retry", "Dismiss"],
         }
     ]
 

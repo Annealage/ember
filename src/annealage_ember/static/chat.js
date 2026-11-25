@@ -1353,7 +1353,12 @@ export function initChat({
     retryBtn.className = "retry";
     retryBtn.textContent = "Retry";
     retryBtn.addEventListener("click", () => retryPending(entry.clientId));
-    rec.markEl.appendChild(retryBtn);
+    const dismissBtn = document.createElement("button");
+    dismissBtn.type = "button";
+    dismissBtn.className = "retry";
+    dismissBtn.textContent = "Dismiss";
+    dismissBtn.addEventListener("click", () => store.dropChatUserTurn(entry.clientId));
+    rec.markEl.append(retryBtn, dismissBtn);
   }
 
   // A message that was not sent, sent again from its row under a new
