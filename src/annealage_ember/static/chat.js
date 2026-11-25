@@ -589,17 +589,15 @@ function usageChip(agentStatusEl) {
   return chip;
 }
 
-// The most recent durable compaction observation, alongside the context
-// readout. A replayed "running" event is only an observation, not proof that
-// the worker is still running (notably when viewing a hosted snapshot).
-function compactionChip(agentStatusEl) {
+// The latest observation is not proof that a replayed worker is still running.
+function compactionChip(chatLogEl) {
   const details = document.createElement("details");
   details.className = "chatcompaction";
   details.hidden = true;
   const summary = document.createElement("summary");
   const description = document.createElement("span");
   details.append(summary, description);
-  agentStatusEl.before(details);
+  chatLogEl.appendChild(details);
   return details;
 }
 
@@ -772,7 +770,7 @@ export function initChat({
   let steers = false;
   initAttention(root);
   const usageEl = usageChip(agentStatusEl);
-  const compactionEl = compactionChip(agentStatusEl);
+  const compactionEl = compactionChip(chatLogEl);
   let compactionSeq = null;
   let hasCompaction = false;
   showSignedIn(usageEl);

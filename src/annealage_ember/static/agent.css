@@ -10,7 +10,6 @@
 .feedtime[hidden] { display: none; }
 
 #chat .chatcompaction {
-  order: 10;
   min-width: 0;
   max-width: 100%;
   white-space: normal;

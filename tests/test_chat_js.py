@@ -877,7 +877,7 @@ out.feedTimes.action = lastTime(el("chatLog").children.find(
   (r) => r.className === "msg action" && r.children[0].textContent.includes("f.pdf")).children[0]);
 
 // Compaction is a durable observation, independent of the transcript page.
-const compaction = el("agentStatus").inserted.find((n) => n.className === "chatcompaction");
+const compaction = el("chatLog").children.find((n) => n.className === "chatcompaction");
 const compactionNow = () => ({
   hidden: compaction.hidden, tag: compaction.tagName,
   label: compaction.children[0].textContent, detail: compaction.children[1].textContent,
