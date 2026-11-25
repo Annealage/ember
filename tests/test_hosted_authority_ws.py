@@ -331,6 +331,22 @@ async def test_another_principals_message_steers_the_running_turn_without_new_au
         await app.agent_stop()
 
 
+async def test_a_message_steers_a_running_turn_during_an_automatic_continuation(
+    served_dir, tmp_path_factory
+):
+    hosted = _build(served_dir, tmp_path_factory, verifier=_Verifier())
+    app = hosted.app
+    await app.agent_start()
+    try:
+        await _send(app, "alice", "first")
+        (session,) = hosted.sessions
+        app.agent_bus.manual_turn_refusal = lambda: "Automatic continuation is active"
+        await _send(app, "bob", "steer", client_id="c-2")
+        assert [b[0]["text"] for b, _v in session.submitted_turns] == ["first", "steer"]
+    finally:
+        await app.agent_stop()
+
+
 async def test_the_owner_can_steer_their_own_running_turn_without_new_authority(
     served_dir, tmp_path_factory
 ):

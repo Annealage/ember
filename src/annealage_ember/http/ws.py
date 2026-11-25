@@ -895,17 +895,20 @@ def _serve_dir(session, bus):
     return serve_dir if serve_dir is not None else getattr(session, "cwd", None)
 
 
-def turn_refusal(session, bus=None, *, starting_ok=False):
+def turn_refusal(session, bus=None, *, starting_ok=False, steering=False):
     """The ordinary human-turn gate, shared with explicit review notifications.
     ``starting_ok`` lets a session that is still starting (connecting) take
-    the turn, because the caller keeps it until the session is ready."""
+    the turn, because the caller keeps it until the session is ready.
+    ``steering`` means the message joins the turn already running, which an
+    automatic continuation does not forbid: only a message that would start a
+    turn waits for the continuation."""
     refusal_reader = getattr(bus, "manual_turn_refusal", None)
-    blocked_reason = refusal_reader() if callable(refusal_reader) else None
+    blocked_reason = refusal_reader() if callable(refusal_reader) and not steering else None
     if blocked_reason is not None:
         # A product's gate is a passing state: it says when to wait.
         blocked_reason = Busy(blocked_reason)
     automation_reader = getattr(session, "automation_metadata", None)
-    if blocked_reason is None and callable(automation_reader):
+    if blocked_reason is None and callable(automation_reader) and not steering:
         automation = automation_reader()
         if isinstance(automation, dict) and automation.get("inflight") is True:
             blocked_reason = Busy(
@@ -991,9 +994,16 @@ async def _submit_turn_locked(
         and bus is not None
         and (session.agent_status() == AGENT_CONNECTING or holder.has_deferred())
     )
-    blocked_reason = (
-        turn_refusal(session, bus, starting_ok=True) if defer else turn_refusal(session, bus)
+    steering = bool(
+        hold_ok
+        and bus is not None
+        and getattr(bus, "hosted_mode", False)
+        and hosted_authority.is_steer(bus)
     )
+    gate = {"starting_ok": True} if defer else {}
+    if steering:
+        gate["steering"] = True
+    blocked_reason = turn_refusal(session, bus, **gate)
     if hold_ok and bus is not None:
         # A message is never refused for arriving at a bad moment: while the
         # agent is busy with work that cannot take it (an automatic
