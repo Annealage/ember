@@ -599,6 +599,7 @@ async def test_the_status_follows_a_turn_a_permission_and_an_idle_close(served_d
         "attention": None,
         "last_activity": app.agent_status()["last_activity"],
         "viewers": 0,
+        "lifecycle_error": None,
         "pid": None,
     }
     await app.agent_start()
