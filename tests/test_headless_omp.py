@@ -792,7 +792,7 @@ class DurableRpcClient(FakeRpcClient):
         state.thinking_level = self.thinking_level
         return state
 
-    def switch_session(self, path):
+    def switch_session(self, path, **_model):
         self.switches.append(path)
         self.session_file = str(path)
         self.model = SimpleNamespace(provider="prov", id="model")
@@ -948,7 +948,7 @@ async def test_native_resume_failure_never_submits_into_fresh_conversation(
     state_dir = tmp_path / "conversation"
     first = await run_prompt("original", **make_args(tmp_path, state_dir=state_dir))
 
-    def refuse(self, path):
+    def refuse(self, path, **_model):
         if failure == "rpc_error":
             raise RuntimeError("native switch failed")
         return SimpleNamespace(cancelled=failure == "cancelled")

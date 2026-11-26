@@ -95,6 +95,7 @@ class FakeRpcClient:
         self.set_model_calls = []
         self.set_thinking_level_calls = []
         self.switch_calls = []
+        self.switch_models = []
         self.set_custom_tools_calls = []
         self._listeners = {}
         self.session_id = "omp-sess-1"
@@ -143,8 +144,9 @@ class FakeRpcClient:
     def get_session_stats(self):
         return SimpleNamespace(cost=self.cost, tokens=SimpleNamespace(**self.tokens))
 
-    def switch_session(self, session_path):
+    def switch_session(self, session_path, *, provider=None, model_id=None):
         self.switch_calls.append(session_path)
+        self.switch_models.append((provider, model_id))
         self.session_file = str(session_path)
         self.session_id = "omp-resumed"
         return SimpleNamespace(cancelled=False)
@@ -3120,9 +3122,12 @@ class ResumingModelClient(FakeRpcClient):
             self.model = SimpleNamespace(provider=provider, id=model_id)
         self.prompt_runtimes = []
 
-    def switch_session(self, session_path):
-        result = super().switch_session(session_path)
-        self.model = SimpleNamespace(provider="anthropic", id="claude-opus-4-6")
+    def switch_session(self, session_path, *, provider=None, model_id=None):
+        result = super().switch_session(session_path, provider=provider, model_id=model_id)
+        if provider:
+            self.model = SimpleNamespace(provider=provider, id=model_id)
+        else:
+            self.model = SimpleNamespace(provider="anthropic", id="claude-opus-4-6")
         self.thinking_level = "high"
         return result
 
@@ -3155,6 +3160,7 @@ async def test_resume_operator_selection_wins_on_the_same_native_conversation(tm
     )
     try:
         assert fake.switch_calls == [str(conversation)]
+        assert fake.switch_models == [(provider, "gpt-6.1-sol")]
         assert fake.set_model_calls == [(provider, "gpt-6.1-sol")]
         assert fake.set_thinking_level_calls == ["low"]
         assert (session.sdk_session_id, session.session_file) == ("omp-resumed", str(conversation))
@@ -3272,6 +3278,11 @@ async def test_resume_reapplies_the_model_omp_resolved_for_the_role(tmp_path, ro
 )
 async def test_resume_selection_failure_never_admits_a_turn(tmp_path, failure):
     class FailedSelection(ResumingModelClient):
+        def switch_session(self, session_path, *, provider=None, model_id=None):
+            if failure == "model_not_applied":
+                provider = model_id = None
+            return super().switch_session(session_path, provider=provider, model_id=model_id)
+
         def set_model(self, provider, model_id):
             if failure == "model_rpc":
                 raise RuntimeError("selection rejected")

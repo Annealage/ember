@@ -1509,7 +1509,7 @@ class OmpSession:
                     else:
                         provider, _, model_id = self._model.partition("/")
                         selected_model = (provider, model_id)
-                resumed = await self._switch_to(self._resume)
+                resumed = await self._switch_to(self._resume, selected_model)
                 if resumed:
                     # Native resume restores model AND thinking from history,
                     # overriding CLI flags. Explicit operator choices win only
@@ -1734,7 +1734,7 @@ class OmpSession:
             self._config_rel = rel
         return None
 
-    async def _switch_to(self, session_file: str) -> bool:
+    async def _switch_to(self, session_file: str, model: Optional[tuple] = None) -> bool:
         """Resume the conversation in ``session_file``; a conversation that
         cannot be resumed is reported (``SessionReset``) and this one goes on
         as a new conversation. A file that does not exist is nothing to
@@ -1754,7 +1754,12 @@ class OmpSession:
             reason = "its file cannot be moved to omp's working directory (%s)" % exc
         if reason is None:
             try:
-                result = await self._run_blocking(self._client.switch_session, session_file)
+                # An explicit model replaces the saved one; without it omp refuses a
+                # conversation whose saved model this profile cannot use.
+                kwargs = {"provider": model[0], "model_id": model[1]} if model else {}
+                result = await self._run_blocking(
+                    self._client.switch_session, session_file, **kwargs
+                )
                 if getattr(result, "cancelled", False):
                     reason = "omp cancelled the switch to %s" % session_file
             except Exception as exc:
