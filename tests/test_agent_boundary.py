@@ -577,6 +577,8 @@ def js_violations(source, path):
 def css_violations(source):
     """The domain words the stylesheet ``source`` uses outside a comment."""
     code = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+    # ``-webkit-touch-callout`` is a CSS property, not the product's callouts.
+    code = code.replace("-webkit-touch-callout", " ")
     return ["uses the product's vocabulary: %r" % w for w in sorted(_domain_words(code))]
 
 
