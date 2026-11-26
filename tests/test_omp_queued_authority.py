@@ -56,6 +56,8 @@ async def _block_barrier(session, fake, kind):
         session.queue_model_profile("example/model", "low")
         task = session._profile_task
     else:
+        fake.context_usage = SimpleNamespace(tokens=150000, context_window=200000, percent=75.0)
+        session._idle_compact_tokens = 100000
         original = fake.get_state
 
         def blocked():
@@ -65,6 +67,7 @@ async def _block_barrier(session, fake, kind):
             return original()
 
         fake.get_state = blocked
+        session._context_tokens = fake.context_usage.tokens
         session._idle_compaction_due()
         task = session._compact_task
     assert task is not None and await asyncio.to_thread(entered.wait, 2)
