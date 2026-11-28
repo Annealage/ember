@@ -186,7 +186,14 @@ async def test_get_lays_out_the_window_from_each_keys_own_section(make_client):
         {"title": "Server", "keys": ["host", "port", "open_browser"]},
         {
             "title": "Agent",
-            "keys": ["model", "effort", "permission_mode", "approval_timeout", "backend"],
+            "keys": [
+                "model",
+                "effort",
+                "permission_mode",
+                "approval_timeout",
+                "backend",
+                "omp_compaction_threshold_tokens",
+            ],
         },
         {"title": "Viewer", "keys": ["units", "tool_cards_collapsed"]},
     ]

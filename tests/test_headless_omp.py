@@ -11,6 +11,7 @@ The rest of ``run_prompt``'s tests, which need neither, are in
 """
 
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -358,6 +359,31 @@ async def test_omp_overrides_reach_the_session(omp_client, tmp_path):
     (client,) = omp_client.instances
     assert client.kwargs["executable"] == str(binary)
     assert client.kwargs["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path / "agent")
+
+
+@pytest.mark.parametrize("threshold", [0, 350000])
+async def test_headless_compaction_threshold_reaches_omp_overlay(omp_client, tmp_path, threshold):
+    overlays = []
+
+    def script(client):
+        args = client.kwargs["extra_args"]
+        overlays.append(json.loads(Path(args[args.index("--config") + 1]).read_text()))
+        client.end()
+
+    omp_client.script = script
+    result = await run_prompt(
+        "go", **make_args(tmp_path, omp_compaction_threshold_tokens=threshold)
+    )
+    assert result.error is None
+    assert overlays[0].get("compaction") == (
+        {"thresholdTokens": threshold, "modelThresholdsEnabled": False} if threshold else None
+    )
+
+
+@pytest.mark.parametrize("threshold", [-1, True, 1.5, "350000", None])
+async def test_headless_rejects_invalid_compaction_threshold(tmp_path, threshold):
+    with pytest.raises(ValueError, match="omp_compaction_threshold_tokens"):
+        await run_prompt("go", **make_args(tmp_path, omp_compaction_threshold_tokens=threshold))
 
 
 async def test_run_prompt_omp_request_timeout_controls_the_rpc_ack_deadline(tmp_path):

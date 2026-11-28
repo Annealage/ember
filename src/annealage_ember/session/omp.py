@@ -487,6 +487,10 @@ class OmpSession:
 
     ``request_timeout`` optionally overrides ``RpcClient``'s per-request wait;
     ``None`` leaves its 30-second default unchanged.
+    ``compaction_threshold_tokens`` overrides omp's automatic compaction trigger
+    through ``compaction.thresholdTokens`` and disables per-model thresholds;
+    zero leaves omp's settings untouched. This trigger is not a hard context
+    limit, and is separate from idle compaction.
 
     ``builtin_tools`` names omp built-in tools to leave enabled, passed as
     ``--tools``; empty (the default) is ``--no-tools``. Only ``headless.run_prompt``
@@ -543,6 +547,7 @@ class OmpSession:
         login_command: Optional[str] = None,
         thinking: Optional[str] = None,
         request_timeout: Optional[float] = None,
+        compaction_threshold_tokens: int = 0,
         on_request_usage: Optional[Callable[[dict], None]] = None,
         builtin_tools: Sequence[str] = (),
         deferred_tools: bool = False,
@@ -551,6 +556,13 @@ class OmpSession:
         idle_compact_tokens: int = IDLE_COMPACT_TOKENS,
         idle_compact_after: float = IDLE_COMPACT_AFTER,
     ):
+        if (
+            isinstance(compaction_threshold_tokens, bool)
+            or not isinstance(compaction_threshold_tokens, int)
+            or compaction_threshold_tokens < 0
+        ):
+            raise ValueError("compaction_threshold_tokens must be a non-negative integer")
+        self._compaction_threshold_tokens = compaction_threshold_tokens
         # omp's own tools to leave enabled (``--tools``); none by default, which
         # is ``--no-tools``. They run inside omp, outside the broker.
         self._builtin_tools = tuple(builtin_tools)
@@ -1410,6 +1422,11 @@ class OmpSession:
             elif instructions:
                 client_kwargs["append_system_prompt"] = instructions
             settings = {key: dict(value) for key, value in _BASE_SETTINGS.items()}
+            if self._compaction_threshold_tokens:
+                settings["compaction"] = {
+                    "thresholdTokens": self._compaction_threshold_tokens,
+                    "modelThresholdsEnabled": False,
+                }
             if self._deferred_tools:
                 for key, value in _XD_SETTINGS.items():
                     settings.setdefault(key, {}).update(value)

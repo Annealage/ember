@@ -20,7 +20,7 @@ def _write(path, text):
 
 
 def test_setting_keys_and_keys_by_name_agree():
-    assert len(settings.SETTING_KEYS) == 12
+    assert len(settings.SETTING_KEYS) == 13
     assert set(settings.KEYS_BY_NAME) == {key.name for key in settings.SETTING_KEYS}
     assert all(settings.KEYS_BY_NAME[key.name] is key for key in settings.SETTING_KEYS)
 
@@ -43,6 +43,21 @@ def test_resolve_with_nothing_set_returns_every_default(tmp_path):
     for key in settings.SETTING_KEYS:
         assert resolved[key.name] == key.default
         assert resolved.provenance(key.name) == settings.DEFAULT
+
+
+def test_compaction_threshold_project_overrides_user(tmp_path):
+    _write(settings.user_settings_path(), "omp_compaction_threshold_tokens = 100000\n")
+    _write(settings.project_config_path(tmp_path), "omp_compaction_threshold_tokens = 350000\n")
+    resolved = settings.resolve(tmp_path)
+    assert resolved["omp_compaction_threshold_tokens"] == 350000
+    assert resolved.provenance("omp_compaction_threshold_tokens") == settings.PROJECT
+
+
+@pytest.mark.parametrize("value", ["-1", "true", "1.5", '"350000"'])
+def test_compaction_threshold_rejects_invalid_values(tmp_path, value):
+    _write(settings.project_config_path(tmp_path), "omp_compaction_threshold_tokens = " + value)
+    with pytest.raises(settings.SettingsError, match="omp_compaction_threshold_tokens"):
+        settings.resolve(tmp_path)
 
 
 def test_resolve_without_a_project_dir_still_returns_defaults():

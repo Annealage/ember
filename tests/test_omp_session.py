@@ -2133,7 +2133,7 @@ async def test_unknown_usage_replaces_an_old_context_snapshot(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _omp_launch(tmp_path, recorder, *, resumed, base_url, effort=None):
+def _omp_launch(tmp_path, recorder, *, resumed, base_url, effort=None, threshold=0):
     """``launch.build_session``'s omp session for ``tmp_path``'s session."""
     sid = sessions.resolve_continue(tmp_path) if resumed else sessions.create_session(tmp_path)
     sessions.record_last_session(tmp_path, sid)
@@ -2154,12 +2154,39 @@ def _omp_launch(tmp_path, recorder, *, resumed, base_url, effort=None):
             "effort": effort,
             "omp_base_url": base_url,
             "omp_api_key": None,
+            "omp_compaction_threshold_tokens": threshold,
             "approval_timeout": 300,
         },
         mcp_host="127.0.0.1",
         mcp_port=8765,
         agent_token="agent-token",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold", [0, 350000])
+async def test_root_compaction_threshold_reaches_omp_overlay(tmp_path, monkeypatch, threshold):
+    clients = []
+
+    def factory(**kwargs):
+        client = FakeRpcClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(omp_module, "RpcClient", factory)
+    session = _omp_launch(
+        tmp_path, EventRecorder(), resumed=False, base_url=None, threshold=threshold
+    )
+    try:
+        await session.start()
+        args = clients[0].kwargs["extra_args"]
+        overlay = json.loads(Path(args[args.index("--config") + 1]).read_text())
+        assert overlay.get("compaction") == (
+            {"thresholdTokens": threshold, "modelThresholdsEnabled": False} if threshold else None
+        )
+        assert overlay["mcp"] == {"enableProjectConfig": False}
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -4109,6 +4136,7 @@ def _hook_launch(tmp_path, swap_product, backend="omp", **hooks):
             "effort": None,
             "omp_base_url": "http://127.0.0.1:11434/v1",
             "omp_api_key": None,
+            "omp_compaction_threshold_tokens": 0,
             "approval_timeout": 300,
             "permission_mode": "default",
         },

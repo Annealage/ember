@@ -782,6 +782,7 @@ def _build_session(
     omp_binary,
     omp_config_dir,
     omp_request_timeout,
+    omp_compaction_threshold_tokens,
     session_id,
     on_request_usage,
     system_mode="append",
@@ -820,6 +821,7 @@ def _build_session(
             config_dir=omp_config_dir,
             binary=omp_binary,
             request_timeout=omp_request_timeout,
+            compaction_threshold_tokens=omp_compaction_threshold_tokens,
             # The conversation file goes under the run's own state, and goes
             # with it.
             session_dir=omp_session_dir or os.path.join(state_dir, "omp"),
@@ -1276,6 +1278,7 @@ async def run_prompt(
     omp_binary=None,
     omp_config_dir=None,
     omp_request_timeout=None,
+    omp_compaction_threshold_tokens=0,
     provider_session_id=None,
     cache_retention=None,
     usage_sink=None,
@@ -1317,6 +1320,8 @@ async def run_prompt(
     ``omp_request_timeout`` is an optional per-request wait for OMP RPC calls,
     including the prompt acknowledgement. ``None`` leaves ``omp_rpc``'s 30-second
     default unchanged; it is separate from the whole-run ``timeout``.
+    ``omp_compaction_threshold_tokens`` sets OMP's automatic compaction trigger;
+    0 leaves OMP's own setting unchanged. It is not a hard context limit.
 
     ``work_timeout`` is an inactivity window for each active turn (startup, prompt
     acknowledgement and tool settlement included): it expires only after that many
@@ -1485,6 +1490,14 @@ async def run_prompt(
     Raises ``ValueError`` for a bad argument, ``CancelledError`` if cancelled
     (the session closed first); never for a model or backend failure.
     """
+    if (
+        isinstance(omp_compaction_threshold_tokens, bool)
+        or not isinstance(omp_compaction_threshold_tokens, int)
+        or omp_compaction_threshold_tokens < 0
+    ):
+        raise ValueError("omp_compaction_threshold_tokens must be a non-negative integer")
+    if omp_compaction_threshold_tokens and backend != "omp":
+        raise ValueError("omp_compaction_threshold_tokens is only supported with backend='omp'")
     _check_arguments(
         prompt,
         tools,
@@ -1648,6 +1661,7 @@ async def run_prompt(
                     omp_binary=omp_binary,
                     omp_config_dir=omp_config_dir,
                     omp_request_timeout=omp_request_timeout,
+                    omp_compaction_threshold_tokens=omp_compaction_threshold_tokens,
                     provider_session_id=provider_session_id,
                     cache_retention=cache_retention,
                     session_id=session_id,

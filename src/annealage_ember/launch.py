@@ -218,6 +218,7 @@ def build_session(
             thinking=settings["effort"],
             base_url=settings["omp_base_url"],
             api_key=settings["omp_api_key"],
+            compaction_threshold_tokens=settings["omp_compaction_threshold_tokens"],
             # Product.omp_base_prompt replaces omp's own base prompt with the
             # product's; ``instructions`` then already begins with it.
             instructions_mode="replace" if base_prompt else "append",

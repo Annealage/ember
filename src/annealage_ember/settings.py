@@ -276,6 +276,17 @@ _AGENT_KEYS = (
         section=AGENT_SECTION,
     ),
     Key(
+        name="omp_compaction_threshold_tokens",
+        type_name="int",
+        default=0,
+        layers=(USER, PROJECT),
+        effect="restart",
+        label="OMP compaction threshold, in tokens",
+        description="Automatic compaction trigger; 0 leaves OMP's own setting unchanged. Not a hard limit.",
+        py_type=int,
+        section=AGENT_SECTION,
+    ),
+    Key(
         name="omp_base_url",
         type_name="str or null",
         default=None,
@@ -487,6 +498,11 @@ def _check_value(key, value, *, layer, source):
         if key.name == "approval_timeout" and value < 1:
             raise SettingsError(
                 "%s sets approval_timeout to %r; it must be at least 1 second" % (source, value)
+            )
+        if key.name == "omp_compaction_threshold_tokens" and value < 0:
+            raise SettingsError(
+                "%s sets omp_compaction_threshold_tokens to %r; it must be non-negative"
+                % (source, value)
             )
         return
     if not isinstance(value, str):
